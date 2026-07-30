@@ -983,7 +983,11 @@ function hlSql(s){
   kws.sort((a,b)=>b.length-a.length).forEach(k=>{h=h.replace(new RegExp('\\b'+k.replace(/ /g,'\\s')+'\\b','g'),m=>`<span class="kw">${m}</span>`);});
   return h;
 }
-const mdBold=s=>(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/\*\*(.+?)\*\*/g,'<b>$1</b>');
+// HTML 转义总入口。模型输出 / SQL 列名 / DB 单元格都要先过它才能进 innerHTML。
+// 连引号一起转:这些文本也会落进 title="…" 这类属性上下文,只转 &< 挡不住 " 逃逸。
+const esc=s=>(s==null?'':String(s)).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+// 先全量转义,再把 **…** 还原成 <b>:$1 已转义,无法造出新标签或属性。
+const mdBold=s=>esc(s).replace(/\*\*(.+?)\*\*/g,'<b>$1</b>');
 const wait=ms=>new Promise(r=>setTimeout(r,ms));
 const stripTags=h=>{const d=document.createElement('div');d.innerHTML=h;return d.textContent;};
 async function typeIn(el,text){el.textContent='';for(let i=0;i<text.length;i++){el.textContent+=text[i];if(i%3===0)await wait(8);}}
@@ -998,7 +1002,7 @@ function newTurn(question){
   log.querySelectorAll('.trace').forEach(t=>t.classList.add('collapsed'));  // 旧轮工作流收起，保持干净
   const turn=document.createElement('div');turn.className='turn';
   turn.innerHTML=`<div class="recall">${t('recall_view')}</div>
-    <div class="q">${question.replace(/</g,'&lt;')}</div>
+    <div class="q">${esc(question)}</div>
     <div class="a"><div class="ava">A</div><div class="body">
       <div class="trace">
         <div class="trace-head"><span class="caret">▾</span><span class="tsum">${t('wf_agent')}</span>
@@ -1120,13 +1124,12 @@ function fmtSchema(text){                     // 把 ## 表名 / - 列: 类型 �
   }).join('');
 }
 function rowPeek(cols,rows){                   // 查询结果头几行预览
-  const head=`<tr>${(cols||[]).map(c=>`<th>${String(c).replace(/</g,'&lt;')}</th>`).join('')}</tr>`;
-  const body=(rows||[]).slice(0,4).map(r=>`<tr>${r.map(c=>`<td>${c==null?'':(typeof c==='number'?fmt(c):String(c).replace(/</g,'&lt;'))}</td>`).join('')}</tr>`).join('');
+  const head=`<tr>${(cols||[]).map(c=>`<th>${esc(c)}</th>`).join('')}</tr>`;
+  const body=(rows||[]).slice(0,4).map(r=>`<tr>${r.map(c=>`<td>${c==null?'':(typeof c==='number'?fmt(c):esc(c))}</td>`).join('')}</tr>`).join('');
   const more=rows.length>4?`<div class="peek-more">${L_peekMore(rows.length)}</div>`:'';
   return `<table class="peek"><thead>${head}</thead><tbody>${body}</tbody></table>${more}`;
 }
 // ——— agent 读到的数据字典文档：渲染成文件查看器 ———
-const esc=s=>(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;');
 const inlineMd=s=>esc(s).replace(/\*\*(.+?)\*\*/g,'<b>$1</b>').replace(/`([^`]+)`/g,'<code>$1</code>');
 function mdDoc(text){
   const lines=(text||'').split('\n');let html='',inCode=false,code='';const tbl=[];
@@ -1164,7 +1167,7 @@ function docViewer(path,text,ok){
 function setChips(chipsEl,items){
   if(!items||!items.length)return;
   chipsEl.style.display='';chipsEl.innerHTML='';
-  items.forEach(t=>{const b=document.createElement('button');b.className='chip';b.innerHTML=`<span class="arr">↳</span>${t.replace(/</g,'&lt;')}`;
+  items.forEach(t=>{const b=document.createElement('button');b.className='chip';b.innerHTML=`<span class="arr">↳</span>${esc(t)}`;
     b.onclick=()=>ask(t);chipsEl.appendChild(b);});
   log.scrollTop=log.scrollHeight;
 }
@@ -1177,17 +1180,19 @@ function renderResult(p){
   const ACC=['var(--brand)','var(--coral)','var(--teal)','var(--gold)'];
   const kpiHTML=(Array.isArray(p.kpis)?p.kpis:[]).map((k,i)=>{
     const isNum=typeof k.value==='number';
-    const delta=(k.delta||k.note)?`<div class="delta ${k.dir||''}">${k.dir?(k.dir==='up'?'▲':'▼'):''} ${k.delta||''}${k.note?` <span class="lab">${k.note}</span>`:''}</div>`:'';
+    // dir 只取白名单值:它落在 class 属性里,不能让模型输出直接写进属性上下文。
+    const dir=(k.dir==='up'||k.dir==='down')?k.dir:'';
+    const delta=(k.delta||k.note)?`<div class="delta ${dir}">${dir?(dir==='up'?'▲':'▼'):''} ${esc(k.delta)}${k.note?` <span class="lab">${esc(k.note)}</span>`:''}</div>`:'';
     // 对比基准(同环比/历史均值/目标值)——方向3:让 KPI 不只是一个孤数
-    const base=(k.baseline||k.baseline_value!=null)?`<div class="kpi-base">${(k.baseline||t('kpi_baseline')).replace(/</g,'&lt;')}${k.baseline_value!=null?`：${typeof k.baseline_value==='number'?fmt(k.baseline_value):k.baseline_value}`:''}</div>`:'';
+    const base=(k.baseline||k.baseline_value!=null)?`<div class="kpi-base">${esc(k.baseline||t('kpi_baseline'))}${k.baseline_value!=null?`：${typeof k.baseline_value==='number'?fmt(k.baseline_value):esc(String(k.baseline_value))}`:''}</div>`:'';
     return `<div class="kpi" style="--accent:${ACC[i%ACC.length]}">
-      <div class="label">${(k.label||'').replace(/</g,'&lt;')}</div>
-      <div class="val" ${isNum?`data-count="${k.value}"`:''}>${isNum?'0':(k.value??'')}${k.unit?`<span class="unit">${k.unit}</span>`:''}</div>
+      <div class="label">${esc(k.label)}</div>
+      <div class="val" ${isNum?`data-count="${Number(k.value)}"`:''}>${isNum?'0':esc(k.value==null?'':String(k.value))}${k.unit?`<span class="unit">${esc(String(k.unit))}</span>`:''}</div>
       ${delta}${base}</div>`;}).join('');
   // findings 洞察面板(方向3):驱动/异常/风险三类要点
   const FK={driver:{ic:'↑',cls:'f-driver',lab:t('find_driver')},anomaly:{ic:'⚠',cls:'f-anomaly',lab:t('find_anomaly')},risk:{ic:'▽',cls:'f-risk',lab:t('find_risk')}};
   const findHTML=(Array.isArray(p.findings)?p.findings:[]).map(f=>{const m=FK[f.kind]||{ic:'•',cls:'',lab:''};
-    return `<div class="finding ${m.cls}"><span class="f-ic">${m.ic}</span><div class="f-body"><span class="f-tag">${m.lab}</span>${mdBold((f.text||'').replace(/</g,'&lt;'))}${f.evidence?`<span class="f-ev">${String(f.evidence).replace(/</g,'&lt;')}</span>`:''}</div></div>`;}).join('');
+    return `<div class="finding ${m.cls}"><span class="f-ic">${m.ic}</span><div class="f-body"><span class="f-tag">${m.lab}</span>${mdBold(f.text)}${f.evidence?`<span class="f-ev">${esc(f.evidence)}</span>`:''}</div></div>`;}).join('');
   // 分析方法面板(方向3·深度):先亮方法/步骤/公式/统计量,再看数据——体现"分析层做了干预"
   // 防御:模型偶发把 steps/formula/stats 写成字符串而非数组(后端已规范化,这里双保险),
   // 字符串有 .length 能骗过外层判断,.map 会抛异常并被误判成"后端连接失败"。
@@ -1197,13 +1202,13 @@ function renderResult(p){
   const mtStats=_arr(mt.stats).filter(x=>x&&typeof x==='object');
   // 只在有真材料(公式 or 统计量)时才展示方法面板——避免常规题挂一个空壳"统计分析方法"。
   if(mtFormula.length||mtStats.length){
-    const stepsHTML=_arr(mt.steps).map(x=>`<li>${String(x).replace(/</g,'&lt;')}</li>`).join('');
-    const formHTML=mtFormula.map(f=>`<div class="m-frow"><div class="m-flab">${(f.label||'').replace(/</g,'&lt;')}</div><div class="m-fexpr">${(f.expr||'').replace(/</g,'&lt;')}</div></div>`).join('');
-    const statsHTML=mtStats.map(st=>{const v=(typeof st.value==='number')?fmt(st.value):(st.value??'');
-      return `<div class="m-stat"><div class="m-sv">${v}${st.unit?`<span class="m-su">${String(st.unit).replace(/</g,'&lt;')}</span>`:''}</div><div class="m-sl">${(st.label||'').replace(/</g,'&lt;')}</div></div>`;}).join('');
+    const stepsHTML=_arr(mt.steps).map(x=>`<li>${esc(x)}</li>`).join('');
+    const formHTML=mtFormula.map(f=>`<div class="m-frow"><div class="m-flab">${esc(f.label)}</div><div class="m-fexpr">${esc(f.expr)}</div></div>`).join('');
+    const statsHTML=mtStats.map(st=>{const v=(typeof st.value==='number')?fmt(st.value):esc(st.value);
+      return `<div class="m-stat"><div class="m-sv">${v}${st.unit?`<span class="m-su">${esc(st.unit)}</span>`:''}</div><div class="m-sl">${esc(st.label)}</div></div>`;}).join('');
     const toolTag=p.statsToolUsed?`<span class="m-tool" title="${t('stats_tool_title')}">${t('stats_tool_tag')}</span>`:'';
     methodHTML=`<div class="method reveal">
-      <div class="m-head"><span class="m-ic">🧮</span><span class="m-name">${(mt.name||t('method_name')).replace(/</g,'&lt;')}</span>${toolTag}<span class="m-tag">${t('method_tag')}</span></div>
+      <div class="m-head"><span class="m-ic">🧮</span><span class="m-name">${esc(mt.name||t('method_name'))}</span>${toolTag}<span class="m-tag">${t('method_tag')}</span></div>
       <div class="m-body">
         ${stepsHTML?`<div class="m-steps-wrap"><div class="m-sec-title">${t('method_steps')}</div><ol class="m-steps">${stepsHTML}</ol></div>`:''}
         ${formHTML?`<div class="m-formula-wrap"><div class="m-sec-title">${t('method_formula')}</div><div class="m-formula">${formHTML}</div></div>`:''}
@@ -1213,19 +1218,20 @@ function renderResult(p){
   }
   // source 治理来源标注(方向2):本数来自哪个治理指标、owner、版本——"与看板一致"
   const s=p.source||{};
-  const srcHTML=(s.metric||s.owner)?`<div class="src-badge" title="${(s['口径声明']||'').replace(/"/g,'&quot;').replace(/</g,'&lt;')}">${t('src_pre')}<b>${(s.metric||'').replace(/</g,'&lt;')}</b>${s.version?` <code>${s.version}</code>`:''}${s.owner?` · owner ${(s.owner).replace(/</g,'&lt;')}`:''}${t('src_post')}</div>`:'';
+  const srcHTML=(s.metric||s.owner)?`<div class="src-badge" title="${esc(s['口径声明'])}">${t('src_pre')}<b>${esc(s.metric)}</b>${s.version?` <code>${esc(s.version)}</code>`:''}${s.owner?` · owner ${esc(s.owner)}`:''}${t('src_post')}</div>`:'';
   // function call 面板(方向2):明确显示本次调用了哪个治理 function、传了什么参数、DB 真正花了多久
   const fc=p.fncall;let fncallHTML='';
   if(fc&&fc.sig){
-    const fn=(fc.metric||'').replace(/</g,'&lt;');
-    const sigHTML=(fc.sig||'').replace(/</g,'&lt;').replace(fn,`<span class="fn">${fn}</span>`);
+    // 先整体转义,再把已转义的函数名替换成高亮片段(fn 本身已转义,不会带进新标签)。
+    const fn=esc(fc.metric);
+    const sigHTML=fn?esc(fc.sig).replace(fn,`<span class="fn">${fn}</span>`):esc(fc.sig);
     const pills=[];
-    if(fc.label)pills.push(`<span class="fc-pill">${t('fc_metric')} <b>${(fc.label).replace(/</g,'&lt;')}</b></span>`);
-    if(fc.owner)pills.push(`<span class="fc-pill">owner <b>${(fc.owner).replace(/</g,'&lt;')}</b></span>`);
-    if(fc.version)pills.push(`<span class="fc-pill">${t('fc_version')} <b>${(fc.version).replace(/</g,'&lt;')}</b></span>`);
-    if(fc.unit)pills.push(`<span class="fc-pill">${t('fc_unit')} <b>${(fc.unit).replace(/</g,'&lt;')}</b></span>`);
+    if(fc.label)pills.push(`<span class="fc-pill">${t('fc_metric')} <b>${esc(fc.label)}</b></span>`);
+    if(fc.owner)pills.push(`<span class="fc-pill">owner <b>${esc(fc.owner)}</b></span>`);
+    if(fc.version)pills.push(`<span class="fc-pill">${t('fc_version')} <b>${esc(fc.version)}</b></span>`);
+    if(fc.unit)pills.push(`<span class="fc-pill">${t('fc_unit')} <b>${esc(fc.unit)}</b></span>`);
     if(fc.exec_ms!=null)pills.push(`<span class="fc-pill">${t('fc_dbexec')} <b>${fmtMs(fc.exec_ms)}</b></span>`);
-    fncallHTML=`<div class="fncall" title="${(fc['口径声明']||'').replace(/"/g,'&quot;').replace(/</g,'&lt;')}">
+    fncallHTML=`<div class="fncall" title="${esc(fc['口径声明'])}">
       <div class="fc-head">${t('fncall_head')}</div>
       <div class="fc-sig">${sigHTML}</div>
       <div class="fc-meta">${pills.join('')}</div>
@@ -1234,19 +1240,20 @@ function renderResult(p){
   const cols=p.columns||(p.table&&p.table.cols)||[];
   const rows=p.rows||(p.table&&p.table.rows)||[];
   const numCols=cols.map((c,i)=>i).filter(i=>rows.length&&typeof rows[0][i]==='number');
-  const thead=`<tr>${cols.map(c=>`<th>${c}</th>`).join('')}</tr>`;
-  const tbody=rows.map(r=>`<tr>${r.map((c,i)=>`<td class="${numCols.includes(i)?'num':''}">${c==null?'':(typeof c==='number'?fmt(c):String(c).replace(/</g,'&lt;'))}</td>`).join('')}</tr>`).join('');
+  // 列名同样来自 SQL 结果(可被 `SELECT 1 AS "<img onerror=…>"` 操纵),必须与 <td> 一样转义。
+  const thead=`<tr>${cols.map(c=>`<th>${esc(String(c))}</th>`).join('')}</tr>`;
+  const tbody=rows.map(r=>`<tr>${r.map((c,i)=>`<td class="${numCols.includes(i)?'num':''}">${c==null?'':(typeof c==='number'?fmt(c):esc(c))}</td>`).join('')}</tr>`).join('');
   // 多图(深度分析)优先用 charts 数组,否则回退单 chart
   const chartList=(Array.isArray(p.charts)&&p.charts.length)?p.charts:(p.chart&&p.chart.type?[p.chart]:[]);
   const title=(chartList[0]&&chartList[0].title)||t('result_title');
   const chartsHTML=chartList.map((c,i)=>`<div class="chart" id="chartEl${i}"></div>`).join('');
 
   canvas.innerHTML=`
-    <div class="interp reveal"><span class="tag">${t('interp_tag')}</span><span class="txt">${(p.interpreted||'').replace(/</g,'&lt;')}</span></div>
+    <div class="interp reveal"><span class="tag">${t('interp_tag')}</span><span class="txt">${esc(p.interpreted)}</span></div>
     ${methodHTML}
     ${kpiHTML?`<div class="kpis reveal">${kpiHTML}</div>`:''}
     <div class="card reveal">
-      <div class="card-head"><h3>${(chartList.length>1?t('multi_title'):title).replace(/</g,'&lt;')}</h3>
+      <div class="card-head"><h3>${esc(chartList.length>1?t('multi_title'):title)}</h3>
         <div class="toggle"><button class="on">${t('toggle_chart')}</button><button>${t('toggle_data')}</button></div></div>
       ${chartsHTML||'<div class="chart" id="chartEl0"></div>'}
       ${p.insight?`<div class="insight"><span class="ic">✦</span><p>${mdBold(p.insight)}</p></div>`:''}
@@ -1342,7 +1349,7 @@ async function askLive(question, deep){
             exec_ms:ev.exec_ms,'口径声明':ev['口径声明']};
           const o=T._steps.metric;
           if(o){o.prev.textContent=`${ev.label||ev.metric} · owner ${ev.owner||''} ${ev.version||''} · DB ${fmtMs(ev.exec_ms)}`;
-            if(ev.compiled_sql)stepDetail(o,`<div style="font:600 11px/1.6 'JetBrains Mono',monospace;color:#7A3FA0;margin-bottom:4px">ƒ ${(ev.sig||ev.metric||'').replace(/</g,'&lt;')}</div><pre class="sql">${hlSql(ev.compiled_sql)}</pre>`);
+            if(ev.compiled_sql)stepDetail(o,`<div style="font:600 11px/1.6 'JetBrains Mono',monospace;color:#7A3FA0;margin-bottom:4px">ƒ ${esc(ev.sig||ev.metric)}</div><pre class="sql">${hlSql(ev.compiled_sql)}</pre>`);
             freezeStep(T,o,{dbMs:ev.exec_ms});}     // 指标 function 步也定格在真实 DB 毫秒
           openReason(T,t('reason_gen'));
         }
@@ -1353,7 +1360,7 @@ async function askLive(question, deep){
           payload.statsToolUsed=true;
           const o=T._steps.stats;
           if(o){o.prev.textContent=ev.summary||ev.method||t('stats_done');
-            stepDetail(o,`<div style="font:600 11px/1.6 'JetBrains Mono',monospace;color:#1a7f5a">${t('stats_detail_pre')}${(ev.method||'').replace(/</g,'&lt;')}</div><pre class="sql">${(JSON.stringify(ev.result,null,1)||'').replace(/</g,'&lt;').slice(0,1400)}</pre>`);
+            stepDetail(o,`<div style="font:600 11px/1.6 'JetBrains Mono',monospace;color:#1a7f5a">${t('stats_detail_pre')}${esc(ev.method)}</div><pre class="sql">${esc(JSON.stringify(ev.result,null,1)).slice(0,1400)}</pre>`);
             freezeStep(T,o);}
           openReason(T,t('reason_gen'));
         }
@@ -1369,7 +1376,7 @@ async function askLive(question, deep){
           if(ev.source&&(ev.source.metric||ev.source.owner))payload.source=ev.source;
           renderResult(payload);rendered=true;
         }
-        else if(ev.type==='error'){addStep(T,'think',t('err_step'));T.summary.style.display='';T.summary.classList.remove('typing');T.summary.innerHTML=`<span style="color:var(--bad)">${(ev.message||t('err_unknown')).replace(/</g,'&lt;')}</span>`;}
+        else if(ev.type==='error'){addStep(T,'think',t('err_step'));T.summary.style.display='';T.summary.classList.remove('typing');T.summary.innerHTML=`<span style="color:var(--bad)">${esc(ev.message||t('err_unknown'))}</span>`;}
       }
     }
     if(!rendered && payload.sql){renderResult(payload);}
@@ -1382,7 +1389,7 @@ async function askLive(question, deep){
   }catch(e){
     finishTrace(T);
     T.summary.style.display='';T.summary.classList.remove('typing');
-    T.summary.innerHTML=L_backendFail(String(e.message||e).replace(/</g,'&lt;'));
+    T.summary.innerHTML=L_backendFail(esc(e.message||e));
   }
   busy=false;$('#send').disabled=false;
 }

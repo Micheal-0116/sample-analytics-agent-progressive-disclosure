@@ -14,6 +14,7 @@ import os
 
 import boto3
 import psycopg
+import psycopg.sql
 from psycopg import pq
 
 S3 = boto3.client("s3")
@@ -78,6 +79,52 @@ def _pg():
     )
 
 
+def _grant_readonly(conn) -> str:
+    """建/刷新 agent 专用的只读角色,并把口令写回 READONLY_SECRET_ARN。
+
+    为什么需要:db.py 的只读事务能挡住写,但挡不住"用超级用户身份读"。Aurora 主用户
+    (analytics_admin)是 rds_superuser,NL→SQL 一旦被诱导,就能读 pg_authid、pg_stat_*、
+    其他库的表,甚至 pg_read_file 之类的高权函数。让 agent 用一个只有 public schema
+    SELECT 权限的角色连库,才是真正的数据边界——即便 SQL 校验被绕过,能读的也只有业务表。
+    """
+    ro_arn = os.environ.get("READONLY_SECRET_ARN", "")
+    if not ro_arn:
+        return "skipped (READONLY_SECRET_ARN unset)"
+    ro = json.loads(SM.get_secret_value(SecretId=ro_arn)["SecretString"])
+    user, pwd = ro["username"], ro["password"]
+    dbname = os.environ["PGDATABASE"]
+
+    ident = psycopg.sql.Identifier(user)      # 角色名 → 安全加引号标识符
+    secret = psycopg.sql.Literal(pwd)         # 口令 → 安全转义字面量(DDL 不支持绑定参数)
+    with conn.cursor() as cur:
+        # 角色可能已存在(重复灌数/轮换口令),故先查 pg_roles 再决定 CREATE / ALTER。
+        # 注意:CREATE ROLE 这类 DDL 不能用 %s 绑定参数,也不能把占位符塞进 DO $$…$$
+        # 的 body(body 是字符串字面量,参数不会被替换,只会报 IndeterminateDatatype)。
+        cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (user,))
+        verb = "ALTER" if cur.fetchone() else "CREATE"
+        cur.execute(
+            psycopg.sql.SQL("{verb} ROLE {u} LOGIN PASSWORD {p}").format(
+                verb=psycopg.sql.SQL(verb), u=ident, p=secret,
+            )
+        )
+        # 只给"连库 + 读 public"三件套,不给 CREATE(挡住建临时表/函数提权)。
+        for stmt in (
+            "REVOKE ALL ON DATABASE {db} FROM {u}",
+            "GRANT CONNECT ON DATABASE {db} TO {u}",
+            "REVOKE ALL ON SCHEMA public FROM {u}",
+            "GRANT USAGE ON SCHEMA public TO {u}",
+            "GRANT SELECT ON ALL TABLES IN SCHEMA public TO {u}",
+            # 未来新建的表也自动带上 SELECT(重新灌数不必再手动 grant)
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO {u}",
+        ):
+            cur.execute(
+                psycopg.sql.SQL(stmt).format(
+                    db=psycopg.sql.Identifier(dbname), u=ident,
+                )
+            )
+    return f"readonly role ready: {user}"
+
+
 def _get(key: str) -> bytes:
     return S3.get_object(Bucket=BUCKET, Key=PREFIX + key)["Body"].read()
 
@@ -117,6 +164,8 @@ def handler(event, context):
         # 4) 序列重置
         _run_script(conn, SETVAL)
         log.append("sequences reset")
+        # 5) agent 专用只读角色(建表灌数之后再 grant,才能覆盖到全部表 + mart)
+        log.append(_grant_readonly(conn))
         # 校验
         with conn.cursor() as cur:
             cur.execute("SELECT (SELECT count(*) FROM users),(SELECT count(*) FROM events),"

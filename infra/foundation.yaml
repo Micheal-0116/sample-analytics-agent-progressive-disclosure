@@ -16,6 +16,12 @@ Parameters:
   DBUsername:
     Type: String
     Default: analytics_admin
+  DBReadonlyUsername:
+    Type: String
+    Default: analytics_ro
+    Description: >
+      Low-privilege role the agent uses at query time (SELECT on public only).
+      The seeder Lambda creates it; never point the runtime at the master user.
 
 Resources:
 
@@ -233,6 +239,20 @@ Resources:
         PasswordLength: 24
         ExcludePunctuation: true
 
+  # agent 运行时用的只读角色口令。Aurora 只认 master 口令做初始化,这个角色由 seeder
+  # Lambda 在灌数后 CREATE ROLE 出来(见 infra/seeder/seed_handler.py::_grant_readonly)。
+  # 把 Runtime 的 PGUSER/PGPASSWORD 指到这里,而不是 DBSecret 的主用户。
+  DBReadonlySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${ProjectTag}/db-readonly"
+      Description: Low-privilege (SELECT-only) DB role for the analytics agent runtime
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username":"${DBReadonlyUsername}"}'
+        GenerateStringKey: password
+        PasswordLength: 24
+        ExcludePunctuation: true
+
   # ------------------------------- Aurora -----------------------------------
   DBSubnetGroup:
     Type: AWS::RDS::DBSubnetGroup
@@ -301,5 +321,7 @@ Outputs:
   AuroraPort: { Value: !GetAtt AuroraCluster.Endpoint.Port }
   DBName: { Value: !Ref DBName }
   DBSecretArn: { Value: !Ref DBSecret }
+  # 灌数 Lambda 用 DBSecretArn(需建表权限);AgentCore Runtime 用下面这个只读的。
+  DBReadonlySecretArn: { Value: !Ref DBReadonlySecret }
   KnowledgeBucket: { Value: !Ref KnowledgeBucket }
   SiteBucket: { Value: !Ref SiteBucket }

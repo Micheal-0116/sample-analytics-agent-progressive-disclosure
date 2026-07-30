@@ -182,8 +182,10 @@ A difficulty-graded list of questions is in [test_questions.md](test_questions.m
 ## Security
 
 - **Read-only SQL boundary.** Every generated query passes through `backend/db.py`, which enforces a single read-only `SELECT`/`WITH` statement (forbidden-keyword guard, read-only connection, statement timeout, row cap).
+- **Least-privilege database role.** The SQL guard stops writes, but it cannot stop *reads made with too much authority*. So the runtime does not connect as the Aurora master user: the seeder Lambda creates a separate `analytics_ro` role holding only `CONNECT` + `USAGE` + `SELECT` on `public` (`infra/seeder/seed_handler.py`), and the runtime secret points at it. Even if the SQL validator were bypassed, that role cannot write, run DDL, read `pg_authid`, call `pg_read_file`, or `COPY` to a server-side file.
+- **Untrusted model output in the UI.** Model-generated text, SQL result column names, and DB cell values are all treated as untrusted and HTML-escaped (`esc()` in `web/index.html`) before reaching `innerHTML`. Column names matter here: a question can steer the agent into `SELECT 1 AS "<img src=x onerror=…>"`, so headers are escaped exactly like cells.
 - **Optional app-layer auth.** The cloud deployment puts Amazon Cognito in front (SRP login, JWKS verification); local development runs open by default (`AUTH_ENABLED` unset).
-- **Static-analysis suppressions.** A small number of known false positives are suppressed inline (`# nosec` / `# nosemgrep`): the data generators use `random` for demo data (non-cryptographic), the metric compiler builds SQL from a trusted registry (filter values are escaped), and the frontend uses `innerHTML` to render app/model-generated content (echoed user text is HTML-escaped). All are reviewed false positives.
+- **Static-analysis suppressions.** A small number of known false positives are suppressed inline (`# nosec` / `# nosemgrep`): the data generators use `random` for demo data (non-cryptographic), and the metric compiler builds SQL from a trusted registry (filter values are escaped). Both are reviewed false positives.
 
 To report a security issue, follow the guidance in [CONTRIBUTING.md](CONTRIBUTING.md#security-issue-notifications) — please do **not** open a public GitHub issue.
 

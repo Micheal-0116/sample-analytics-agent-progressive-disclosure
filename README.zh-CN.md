@@ -179,8 +179,10 @@ sample-analytics-agent-progressive-disclosure/
 ## 安全
 
 - **只读 SQL 边界**:所有生成的查询都经 `backend/db.py`——强制单条只读 `SELECT`/`WITH`(禁写关键字、只读连接、语句超时、行数上限)。
+- **数据库最小权限**:SQL 校验挡得住写,但挡不住「用过高权限去读」。所以运行时不用 Aurora 主用户连库:灌数 Lambda 会另建一个 `analytics_ro` 角色,只有 `public` 上的 `CONNECT` + `USAGE` + `SELECT`(见 `infra/seeder/seed_handler.py`),runtime secret 指向它。即便 SQL 校验被绕过,这个角色也写不了库、跑不了 DDL、读不到 `pg_authid`、调不了 `pg_read_file`、`COPY` 不出文件。
+- **模型输出按不可信处理**:模型生成的文本、SQL 结果的列名和单元格值,进 `innerHTML` 前一律经 `esc()` 转义(`web/index.html`)。列名尤其要注意:提问可以把 agent 引导成 `SELECT 1 AS "<img src=x onerror=…>"`,所以表头和单元格一样转义。
 - **可选 app 层认证**:云上部署前置 Amazon Cognito(SRP 登录 + JWKS 校验);本地默认不开(`AUTH_ENABLED` 不设)。
-- **静态扫描抑制**:少量已知误报用 inline 注释抑制(`# nosec` / `# nosemgrep`):数据生成器用 `random` 造演示数据(非加密用途)、指标编译器从可信注册表拼 SQL(filter 值经转义)、前端 `innerHTML` 渲染 app / 模型生成内容(回显用户文本已 HTML 转义)。均为经审阅的误报。
+- **静态扫描抑制**:少量已知误报用 inline 注释抑制(`# nosec` / `# nosemgrep`):数据生成器用 `random` 造演示数据(非加密用途)、指标编译器从可信注册表拼 SQL(filter 值经转义)。均为经审阅的误报。
 
 上报安全问题请按 [CONTRIBUTING.md](CONTRIBUTING.md#security-issue-notifications) 的指引,**不要**开公开 issue。
 
