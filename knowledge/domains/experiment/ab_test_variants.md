@@ -13,7 +13,6 @@
 | config_json | JSONB | 变体配置参数 |
 | is_control | BOOLEAN | 是否为对照组 |
 | created_at | TIMESTAMP | 记录创建时间 |
-| updated_at | TIMESTAMP | 记录更新时间 |
 
 ## 字段枚举值
 

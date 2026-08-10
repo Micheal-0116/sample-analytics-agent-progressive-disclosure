@@ -1,5 +1,14 @@
-# 云上整套:容器版 Postgres(首启自动灌 35 表 19 万行) + FastAPI agent 应用。
+# ============================ LEGACY —— 不再维护 ============================
+# v1 的自带库形态:容器版 Postgres(首启自动灌 35 表 19 万行) + FastAPI agent 应用。
+#
+# v2 之后正式形态是 Redshift Serverless + Glue Data Catalog + AgentCore Runtime
+# (见 docs/architecture-v2-redshift-glue.md、docs/legacy.md)。这套 compose 起的
+# 是那个约 19 万行的旧数据集,没有 Glue 目录,治理也不在数仓里——UI 的元数据会降级
+# 到 information_schema。留着是为了让"数据在本地容器里"这个旧路径还能跑起来,
+# 但不再随 v2 演进,也不在测试套件覆盖范围内。
+#
 # 在 EC2 上:docker compose -f docker-compose.cloud.yml up -d --build
+# ===========================================================================
 services:
   db:
     image: postgres:16
@@ -29,6 +38,9 @@ services:
       CLAUDE_CODE_USE_BEDROCK: "1"
       AWS_REGION: us-east-1
       ANTHROPIC_MODEL: global.anthropic.claude-opus-4-8
+      # 显式钉住 postgres：这套 compose 自带 db 容器，走的是 v1 路径。
+      # db.py 的默认值已改成 redshift（Aurora 已退役），不钉住这里会连错后端。
+      DB_BACKEND: postgres
       PGHOST: db
       PGPORT: "5432"
       PGDATABASE: app_analytics

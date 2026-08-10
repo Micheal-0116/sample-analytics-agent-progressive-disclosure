@@ -97,3 +97,19 @@
 基建三个栈:`infra/foundation.yaml`(VPC/端点/NAT/Aurora/桶)、`infra/relay.yaml`(ECS+ALB)、`infra/edge.yaml`(CloudFront);Runtime 由 `@aws/agentcore` CDK CLI 部署(`analyticsagent/agentcore/`)。
 
 有意思的是,阶段一最初就跑在 Aurora Serverless v2 + EKS 上,后来为省事退回 EC2;这次是带着 AgentCore 重新走回 serverless。
+
+---
+
+## 阶段六:数据层换代 —— Redshift Serverless + Glue Data Catalog(现行)
+
+> 状态:**已迁移并全链路验收**(对账、一致性、21/21 评测、端点与渲染契约,`bash scripts/test_all.sh`)。Aurora 退役。
+
+阶段五之后 v1 的两个自认短板:35 表 19 万行说服力不足(全 schema 塞 context 也就几千 token),元数据是手写 md、没人验证。这一阶段把两头都换掉,完整设计与踩坑见 [docs/architecture-v2-redshift-glue.md](docs/architecture-v2-redshift-glue.md):
+
+- **数据搬到 Redshift Serverless**(约 8000 万行,`scripts/gen/` 按 v1 数据 427 倍等比放大,业务比例与口径陷阱原样保留)。查询走 **Data API**(HTTPS + IAM):Runtime 不再需要 VPC 连接、连接池和落地密码,workgroup 保持 `publiclyAccessible=false`。
+- **元数据拆成三方并对账**:声明态(`schema_manifest.yaml` + DDL,进 git)/ 实际态(Glue Data Catalog,生成的)/ 语义层(`knowledge/` 卡片),`scripts/glue/reconcile.py` 三方两两比,首跑抓出 5 处真实文档漂移。
+- **治理下沉到数仓**(`database/redshift/04_governance.sql`):最小权限角色 `analytics_agent_ro`(48 张表授 45 张,私信表不授权)+ `users.email`/`users.phone`/`user_profiles.birth_date` 动态脱敏,均实测生效。
+- **UI 读目录**:新增 `GET /api/catalog`(`backend/catalog.py`),前端元数据不再写死在 HTML;线上用部署期快照 `web/catalog.json`(`scripts/deploy/`),带降级闸门。
+- **评测与基线**:`eval/` 21 条金标在 Redshift 上全过;金标保持 Postgres 方言、运行时改写(`scripts/gen/pg_to_redshift.py`);一致性基线由生成器直接吐预期值,对账「生成 → COPY」全链路无损。
+
+v1 的本地 Postgres 路径(`docker-compose.cloud.yml`、`db.py`/`run.sh` 的 postgres 分支、顶层 `database/*.sql`)**保留但不再维护**,边界见 [docs/legacy.md](docs/legacy.md)。

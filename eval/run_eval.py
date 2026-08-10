@@ -75,11 +75,32 @@ def _flat_values(rows: list) -> list:
 
 # ---------------------------------------------------------------- goldens
 
+_pg2rs = None
+
+
+def _adapt_sql(sql: str) -> str:
+    """按后端方言改写金标 SQL。
+
+    `cases.json` 里的金标写的是 Postgres 方言，它是**口径的单一真源**，不为了换库
+    分叉成两份（分叉必然漂移）。Redshift 不支持聚合的 `FILTER (WHERE ...)`
+    （cases.json 里 15 处），运行时用 `scripts/gen/pg_to_redshift.py` 就地改写成
+    `CASE WHEN`——只换语法，口径一个字不动。
+    """
+    if getattr(db, "BACKEND", "postgres") != "redshift":
+        return sql
+    global _pg2rs
+    if _pg2rs is None:
+        sys.path.insert(0, str(HERE.parent / "scripts" / "gen"))
+        import pg_to_redshift
+        _pg2rs = pg_to_redshift
+    return _pg2rs.convert(sql)[0]
+
+
 async def compute_goldens(case: dict) -> list[dict]:
     """执行该题全部 golden SQL，返回 [{label, columns, rows}]。"""
     out = []
     for g in case["golden"]:
-        res = await db.run_query(g["sql"])
+        res = await db.run_query(_adapt_sql(g["sql"]))
         out.append({"label": g["label"], "columns": res["columns"], "rows": res["rows"]})
     return out
 
@@ -250,6 +271,14 @@ async def run_case(case: dict, defaults: dict, dry_run: bool) -> dict:
         return rec
 
     evidence = await run_agent_on(case["question"])
+    # 瞬时 infra 失败重试一次：agent 一条 SQL 都没发就返回（限流/流中断的签名，
+    # 通常 7~15s 即结束）。语义性答错必然带 SQL，不会触发这条，评测口径不变。
+    # 连跑 40+ 次 agent 时每轮随机被砸中 1~2 题，三轮实测 21 题各自都能通过，
+    # 重试比"祈祷某轮全绿"便宜得多。
+    if evidence["n_sql"] == 0 and not evidence["rowsets"]:
+        await asyncio.sleep(20)
+        evidence = await run_agent_on(case["question"])
+        rec["retried_infra"] = True
     rec.update(elapsed_s=evidence["elapsed_s"], n_docs=evidence["n_docs"],
                n_sql=evidence["n_sql"], agent_sqls=evidence["sqls"],
                agent_errors=evidence["errors"],

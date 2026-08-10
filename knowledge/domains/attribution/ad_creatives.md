@@ -15,7 +15,6 @@
 | call_to_action | VARCHAR(50) | 行动号召按钮 |
 | status | VARCHAR(20) | 素材状态 |
 | created_at | TIMESTAMP | 记录创建时间 |
-| updated_at | TIMESTAMP | 记录更新时间 |
 
 ## 字段枚举值
 

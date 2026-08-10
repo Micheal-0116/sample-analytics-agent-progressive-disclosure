@@ -15,7 +15,6 @@
 | attributed_at | TIMESTAMP | 归因确定时间 |
 | days_to_install | INT | 点击到安装天数 |
 | tracking_params | JSONB | 追踪参数 |
-| created_at | TIMESTAMP | 记录创建时间 |
 
 ## 字段枚举值
 

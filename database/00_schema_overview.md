@@ -1,5 +1,12 @@
 # APP Analytics Demo - Database Schema
 
+> **LEGACY —— 不再维护。** 本目录下的顶层 `*.sql` 是 v1 的 PostgreSQL DDL（35 张表、
+> 约 19 万行），已被 `database/redshift/` 取代：v2 的正式形态是 Redshift Serverless，
+> 48 张表、约 9,129 万行（其中 35 张原始表 7,992 万），元数据在 Glue Data Catalog，
+> 治理（GRANT + 动态脱敏）下沉到数仓。
+> 本文里的表数、行数、方言均为 v1 事实，不再随 v2 更新。
+> 现行架构见 `docs/architecture-v2-redshift-glue.md`，取舍与边界见 `docs/legacy.md`。
+
 ## 概览
 
 这是一个模拟 APP 运营分析场景的数据仓库，包含 **35 张表**，分为 **8 个业务域**。

@@ -1,21 +1,21 @@
 # 部署指南
 
-> **云上部署已换代为 AgentCore-native 架构**(AgentCore Runtime + Aurora Serverless v2 + S3 知识库 + Fargate /ask 中继 + CloudFront VPC origin),对应 `infra/` 三个 CloudFormation 栈与 `analyticsagent/`(`@aws/agentcore` CDK CLI),演进脉络与各组件职责见 [PROJECT_STATUS.md](../PROJECT_STATUS.md) 阶段五。本文的「C. 云上部署(EC2)」是上一代形态,留作低成本单机替代路径。
+> **现行架构(v2)**:数据在 **Redshift Serverless**(Data API,HTTPS + IAM),元数据在 **Glue Data Catalog**,应用层是 AgentCore Runtime + S3 知识库 + Fargate /ask 中继 + CloudFront VPC origin(对应 `infra/` 三个 CloudFormation 栈与 `analyticsagent/` 的 `@aws/agentcore` CDK CLI)。v2 改了什么、为什么见 [architecture-v2-redshift-glue.md](architecture-v2-redshift-glue.md);Aurora 已退役,哪些旧路径保留但不再维护见 [legacy.md](legacy.md)。本文的「A. 本地数据库」「C. 云上部署(EC2)」都是 v1 形态,留作参考。
 
-本项目有三种跑法,按需要选:
+本项目的几种跑法,按需要选:
 
 | 场景 | 跑什么 | 怎么跑 |
 |------|--------|--------|
-| **A. 本地数据库** | 只起 Postgres(给 CLI Skill / 看数据用) | `docker compose up -d` |
-| **B. 本地 Web App** | Agent SDK + FastAPI + 前端,跑在本机 | `backend/run.sh` |
-| **C. 云上部署(EC2,上一代)** | 部署到你自己的 EC2 + CloudFront | 见下文「云上部署」 |
-| **D. 云上部署(AgentCore,现行)** | `infra/` 三栈 + `analyticsagent/` Runtime | 见 [PROJECT_STATUS.md](../PROJECT_STATUS.md) 阶段五 |
+| **B. 本地 Web App(现行)** | Agent SDK + FastAPI + 前端跑在本机,数据连 Redshift Serverless | `backend/run.sh` |
+| **D. 云上部署(AgentCore,现行)** | `infra/` 三栈 + `analyticsagent/` Runtime + Redshift | 见 [PROJECT_STATUS.md](../PROJECT_STATUS.md) 阶段五;前端与元数据快照用 `scripts/deploy/deploy_web.sh` 发布 |
+| **A. 本地数据库(v1,legacy)** | 只起容器版 Postgres(35 表、约 19 万行) | `docker compose up -d` |
+| **C. 云上部署(EC2,v1,legacy)** | 部署到你自己的 EC2 + CloudFront | 见下文「云上部署」 |
 
-> 数据库统一用 Docker 容器版 Postgres:本地是 `docker-compose.yml` 的 db 容器,云上是 `docker-compose.cloud.yml` 的 db 容器(带持久卷)。
+> **建 Redshift 数据层**(现行路径的前置,只做一次):DDL 在 `database/redshift/`(01 建表 → 02 mart → 03 派生层 → 04 治理),数据用 `scripts/gen/main.py` 生成 Parquet 传 S3、`scripts/redshift/load_from_s3.py` COPY 进仓,最后 `scripts/glue/register_catalog.py` 注册 Glue federated catalog、`scripts/glue/reconcile.py` 对账。workgroup 记得 `base-capacity 4` + 每月 RPU 用量上限(服务默认 128 RPU)。验收跑 `bash scripts/test_all.sh`(见 [test-plan-v2.md](test-plan-v2.md))。
 
 ---
 
-## A. 本地数据库(Docker)
+## A. 本地数据库(Docker,v1 legacy)
 
 ### 前置
 - Docker / Docker Compose,约 500MB 磁盘。
@@ -45,21 +45,23 @@ docker compose exec db psql -U postgres -d app_analytics -c "SELECT count(*) FRO
 
 ---
 
-## B. 本地 Web App
+## B. 本地 Web App(现行)
 
-跑那套网页问数(Agent SDK + Bedrock + FastAPI + 前端)。后端默认连**本机 brew Postgres(端口 5433,`backend/.pgdata`)**,不是上面那个 Docker 库(5432)。
+跑那套网页问数(Agent SDK + Bedrock + FastAPI + 前端)。后端默认 `DB_BACKEND=redshift`,经 Data API 连 Redshift Serverless(需要可用的 AWS 凭证;`run.sh` 启动时会 `aws sts get-caller-identity` 自检)。资源名不走默认命名时,复制 `.env.local.example` 成 `.env.local` 覆盖。
 
 ```bash
 cd backend
-./run.sh                          # 自动拉起本地 Postgres(5433) + uvicorn(8000)
+./run.sh                          # 凭证自检 → uvicorn(8000)
 # 打开 http://127.0.0.1:8000/
 ```
+
+要走 v1 本地库(legacy):`DB_BACKEND=postgres ./run.sh`,会拉起本机 brew Postgres(端口 5433,`backend/.pgdata`)。
 
 环境变量、Bedrock 配置、自测命令见 [../backend/README.md](../backend/README.md)。本地默认不开认证(`AUTH_ENABLED` 不设)。
 
 ---
 
-## C. 云上部署
+## C. 云上部署(EC2,v1 legacy)
 
 把 Demo 部署到你自己的 AWS 账号(EC2 + CloudFront + Cognito)。前置:一台能跑 Docker 的 EC2、一个 Cognito 用户池 + app 客户端(公共客户端,用 SRP 登录)、一个 CloudFront 分发指向 EC2。EC2 实例角色需有调用 Bedrock 所用模型的权限。
 
@@ -102,9 +104,9 @@ terminate EC2 → 删 SG → 删 instance-profile / role → 删 Cognito 用户�
 
 ## 数据说明
 
-- **时间范围**:静态样本,数据落在 2025-10-27 ~ 2026-01-24。查"最近 N 天"时以表自身时间列的 `max()` 为锚点,**别用 `current_date`/`now()`**。
-- **规模**:35 张表,约 19 万行(各域行数见 [../PROJECT_STATUS.md](../PROJECT_STATUS.md))。
-- **重新生成数据**:`cd scripts && python generate_data.py`,输出到 `data/csv/`。
+- **时间范围**:静态样本,数据落在 2025-10-26 ~ 2026-01-24。查"最近 N 天"时以表自身时间列的 `max()` 为锚点,**别用 `current_date`/`now()`**。
+- **规模(v2 / Redshift)**:Glue 目录 48 张表,35 张原始表约 8000 万行;v1 本地库是 35 张表、约 19 万行。
+- **重新生成数据(v2)**:`scripts/gen/main.py --target-rows 80000000 --out <目录> --s3 s3://<你的数据桶>/raw/`,再 `scripts/redshift/load_from_s3.py` COPY 进仓;v1 的 CSV 生成器是 `cd scripts && python generate_data.py`。
 
 ## 常见问题
 

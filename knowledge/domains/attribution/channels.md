@@ -11,7 +11,6 @@
 | description | TEXT | 渠道描述 |
 | is_active | BOOLEAN | 是否启用 |
 | created_at | TIMESTAMP | 记录创建时间 |
-| updated_at | TIMESTAMP | 记录更新时间 |
 
 ## 字段枚举值
 

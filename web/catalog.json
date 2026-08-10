@@ -1,0 +1,1181 @@
+{
+ "source": "glue",
+ "warning": null,
+ "catalog_id": "analytics_agent_rs",
+ "engine": "Redshift Serverless",
+ "database": "app_analytics",
+ "transport": "Data API",
+ "region": "ap-northeast-1",
+ "totals": {
+  "tables": 48,
+  "rows": 79924448,
+  "rows_all_layers": 96491202,
+  "domains": 10,
+  "columns": 476,
+  "by_layer": {
+   "base": 35,
+   "mart": 4,
+   "dws": 2,
+   "noise": 2,
+   "dwd": 2,
+   "ads": 2,
+   "meta": 1
+  }
+ },
+ "governance": {
+  "role": "analytics_agent_ro",
+  "available": true,
+  "granted_tables": 45,
+  "ungranted_tables": [
+   "orders_backup_20251201",
+   "tmp_campaign_roi_analysis",
+   "user_messages"
+  ],
+  "masked": [
+   {
+    "table": "user_profiles",
+    "columns": [
+     "birth_date"
+    ],
+    "policy": "mask_birthdate"
+   },
+   {
+    "table": "users",
+    "columns": [
+     "email"
+    ],
+    "policy": "mask_email"
+   },
+   {
+    "table": "users",
+    "columns": [
+     "phone"
+    ],
+    "policy": "mask_phone"
+   }
+  ],
+  "error": null
+ },
+ "domains": [
+  {
+   "key": "user",
+   "tables": [
+    {
+     "name": "dws_user_daily",
+     "columns": [
+      "user_id",
+      "dt",
+      "event_cnt",
+      "session_cnt",
+      "order_cnt",
+      "paid_amount"
+     ],
+     "column_count": 6,
+     "rows": 6863106,
+     "layer": "dws",
+     "status": "active",
+     "summary": "用户日汇总：每用户每天的事件数、会话数、下单数、消费额",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "user_devices",
+     "columns": [
+      "device_id",
+      "user_id",
+      "device_type",
+      "os_version",
+      "device_model",
+      "device_brand",
+      "app_version",
+      "push_token",
+      "is_primary",
+      "first_seen_at",
+      "last_seen_at",
+      "created_at"
+     ],
+     "column_count": 12,
+     "rows": 317717,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "user_profiles",
+     "columns": [
+      "user_id",
+      "age",
+      "gender",
+      "birth_date",
+      "city",
+      "province",
+      "country",
+      "interests",
+      "occupation",
+      "income_level",
+      "created_at",
+      "updated_at"
+     ],
+     "column_count": 12,
+     "rows": 213520,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": true,
+     "masked_columns": [
+      "birth_date"
+     ]
+    },
+    {
+     "name": "user_segment_members",
+     "columns": [
+      "user_id",
+      "segment_id",
+      "entered_at",
+      "exited_at"
+     ],
+     "column_count": 4,
+     "rows": 554297,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "user_segments",
+     "columns": [
+      "segment_id",
+      "segment_name",
+      "segment_type",
+      "description",
+      "rules_json",
+      "owner",
+      "status",
+      "created_at",
+      "updated_at"
+     ],
+     "column_count": 9,
+     "rows": 10,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "users",
+     "columns": [
+      "user_id",
+      "username",
+      "email",
+      "phone",
+      "registered_at",
+      "registration_source",
+      "status",
+      "user_level",
+      "is_vip",
+      "last_active_at",
+      "created_at",
+      "updated_at"
+     ],
+     "column_count": 12,
+     "rows": 213520,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": true,
+     "masked_columns": [
+      "email",
+      "phone"
+     ]
+    }
+   ],
+   "table_count": 6
+  },
+  {
+   "key": "behavior",
+   "tables": [
+    {
+     "name": "dwd_events_app",
+     "columns": [
+      "event_id",
+      "user_id",
+      "session_id",
+      "event_name",
+      "event_time",
+      "page_name"
+     ],
+     "column_count": 6,
+     "rows": 8540780,
+     "layer": "dwd",
+     "status": "active",
+     "summary": "事件清洗层：只含可归到具体用户的事件，匿名/爬虫流量已剔除",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "event_definitions",
+     "columns": [
+      "event_name",
+      "event_category",
+      "description",
+      "properties_schema",
+      "owner",
+      "is_core_event",
+      "created_at",
+      "updated_at"
+     ],
+     "column_count": 8,
+     "rows": 25,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "events",
+     "columns": [
+      "event_id",
+      "user_id",
+      "device_id",
+      "session_id",
+      "event_name",
+      "event_time",
+      "properties",
+      "page_name",
+      "referrer",
+      "ip_address",
+      "created_at"
+     ],
+     "column_count": 11,
+     "rows": 8540780,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "page_views",
+     "columns": [
+      "page_view_id",
+      "user_id",
+      "session_id",
+      "page_name",
+      "page_url",
+      "referrer",
+      "duration_seconds",
+      "scroll_depth_pct",
+      "view_time",
+      "created_at"
+     ],
+     "column_count": 10,
+     "rows": 12894870,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "sessions",
+     "columns": [
+      "session_id",
+      "user_id",
+      "device_id",
+      "start_time",
+      "end_time",
+      "duration_seconds",
+      "event_count",
+      "page_view_count",
+      "is_bounce",
+      "entry_page",
+      "exit_page",
+      "traffic_source",
+      "utm_source",
+      "utm_medium",
+      "utm_campaign",
+      "created_at"
+     ],
+     "column_count": 16,
+     "rows": 2135195,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": true,
+     "masked_columns": []
+    }
+   ],
+   "table_count": 5
+  },
+  {
+   "key": "transaction",
+   "tables": [
+    {
+     "name": "dwd_orders_valid",
+     "columns": [
+      "order_id",
+      "order_no",
+      "user_id",
+      "status",
+      "total_amount",
+      "discount_amount",
+      "shipping_fee",
+      "actual_amount",
+      "item_count",
+      "coupon_id",
+      "placed_at",
+      "paid_at"
+     ],
+     "column_count": 12,
+     "rows": 640800,
+     "layer": "dwd",
+     "status": "active",
+     "summary": "订单清洗层：只含有效订单，剔除 pending/cancelled/refunded",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "fin_daily_revenue",
+     "columns": [
+      "dt",
+      "gross_revenue",
+      "refund_amount",
+      "net_revenue"
+     ],
+     "column_count": 4,
+     "rows": 91,
+     "layer": "ads",
+     "status": "active",
+     "summary": "财务日收入：确认收入口径 —— 按 paid_at 记账、扣退款、不含运费",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "growth_daily_gmv",
+     "columns": [
+      "dt",
+      "gmv",
+      "paid_orders",
+      "paying_users",
+      "all_orders"
+     ],
+     "column_count": 5,
+     "rows": 91,
+     "layer": "ads",
+     "status": "active",
+     "summary": "增长日 GMV：下单口径 —— 按 placed_at、含运费、不扣退款，另含下单用户数",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "order_items",
+     "columns": [
+      "item_id",
+      "order_id",
+      "product_id",
+      "product_name",
+      "sku_id",
+      "sku_name",
+      "quantity",
+      "unit_price",
+      "discount_amount",
+      "actual_amount",
+      "created_at"
+     ],
+     "column_count": 11,
+     "rows": 1804240,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "orders",
+     "columns": [
+      "order_id",
+      "order_no",
+      "user_id",
+      "status",
+      "total_amount",
+      "discount_amount",
+      "shipping_fee",
+      "actual_amount",
+      "item_count",
+      "coupon_id",
+      "shipping_address",
+      "remark",
+      "placed_at",
+      "paid_at",
+      "shipped_at",
+      "delivered_at",
+      "cancelled_at",
+      "cancel_reason",
+      "refunded_at",
+      "refund_reason",
+      "created_at",
+      "updated_at"
+     ],
+     "column_count": 22,
+     "rows": 854078,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "orders_backup_20251201",
+     "columns": [
+      "order_id",
+      "order_no",
+      "user_id",
+      "status",
+      "total_amount",
+      "actual_amount",
+      "placed_at"
+     ],
+     "column_count": 7,
+     "rows": 303612,
+     "layer": "noise",
+     "status": "deprecated",
+     "summary": "某次订单表结构变更前的手工备份快照，数据止于 2025-12-01",
+     "granted": false,
+     "masked_columns": []
+    },
+    {
+     "name": "payments",
+     "columns": [
+      "payment_id",
+      "payment_no",
+      "order_id",
+      "user_id",
+      "amount",
+      "payment_method",
+      "payment_channel",
+      "status",
+      "transaction_id",
+      "paid_at",
+      "failure_reason",
+      "refund_amount",
+      "refunded_at",
+      "created_at"
+     ],
+     "column_count": 14,
+     "rows": 691800,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "subscriptions",
+     "columns": [
+      "subscription_id",
+      "user_id",
+      "plan_name",
+      "plan_price",
+      "start_date",
+      "end_date",
+      "auto_renew",
+      "status",
+      "payment_id",
+      "cancelled_at",
+      "cancel_reason",
+      "created_at",
+      "updated_at"
+     ],
+     "column_count": 13,
+     "rows": 21352,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": true,
+     "masked_columns": []
+    }
+   ],
+   "table_count": 8
+  },
+  {
+   "key": "product",
+   "tables": [
+    {
+     "name": "categories",
+     "columns": [
+      "category_id",
+      "parent_id",
+      "category_name",
+      "level",
+      "sort_order",
+      "icon_url",
+      "is_active",
+      "created_at",
+      "updated_at"
+     ],
+     "column_count": 9,
+     "rows": 166,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "product_tags",
+     "columns": [
+      "id",
+      "product_id",
+      "tag_name",
+      "tag_type",
+      "created_at"
+     ],
+     "column_count": 5,
+     "rows": 512,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "products",
+     "columns": [
+      "product_id",
+      "product_name",
+      "category_id",
+      "brand",
+      "description",
+      "price",
+      "original_price",
+      "cost",
+      "stock",
+      "sold_count",
+      "view_count",
+      "favorite_count",
+      "rating_avg",
+      "rating_count",
+      "main_image_url",
+      "image_urls",
+      "status",
+      "is_featured",
+      "created_at",
+      "updated_at"
+     ],
+     "column_count": 20,
+     "rows": 200,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": true,
+     "masked_columns": []
+    }
+   ],
+   "table_count": 3
+  },
+  {
+   "key": "social",
+   "tables": [
+    {
+     "name": "post_comments",
+     "columns": [
+      "comment_id",
+      "post_id",
+      "user_id",
+      "parent_comment_id",
+      "content",
+      "like_count",
+      "status",
+      "created_at"
+     ],
+     "column_count": 8,
+     "rows": 5978546,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "post_likes",
+     "columns": [
+      "user_id",
+      "post_id",
+      "created_at"
+     ],
+     "column_count": 3,
+     "rows": 15231627,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "post_shares",
+     "columns": [
+      "share_id",
+      "user_id",
+      "post_id",
+      "share_channel",
+      "created_at"
+     ],
+     "column_count": 5,
+     "rows": 2989273,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "posts",
+     "columns": [
+      "post_id",
+      "user_id",
+      "content_type",
+      "title",
+      "content",
+      "media_urls",
+      "tags",
+      "location",
+      "product_ids",
+      "view_count",
+      "like_count",
+      "comment_count",
+      "share_count",
+      "status",
+      "is_featured",
+      "published_at",
+      "created_at",
+      "updated_at"
+     ],
+     "column_count": 18,
+     "rows": 427039,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "user_follows",
+     "columns": [
+      "follower_id",
+      "following_id",
+      "created_at"
+     ],
+     "column_count": 3,
+     "rows": 8184202,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "user_messages",
+     "columns": [
+      "message_id",
+      "sender_id",
+      "receiver_id",
+      "content",
+      "message_type",
+      "related_post_id",
+      "related_product_id",
+      "is_read",
+      "sent_at",
+      "read_at"
+     ],
+     "column_count": 10,
+     "rows": 3951392,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": false,
+     "masked_columns": []
+    }
+   ],
+   "table_count": 6
+  },
+  {
+   "key": "marketing",
+   "tables": [
+    {
+     "name": "banners",
+     "columns": [
+      "banner_id",
+      "position",
+      "banner_name",
+      "image_url",
+      "target_url",
+      "target_type",
+      "target_id",
+      "sort_order",
+      "start_date",
+      "end_date",
+      "is_active",
+      "click_count",
+      "impression_count",
+      "created_at",
+      "updated_at"
+     ],
+     "column_count": 15,
+     "rows": 119,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "campaigns",
+     "columns": [
+      "campaign_id",
+      "campaign_name",
+      "campaign_type",
+      "description",
+      "start_date",
+      "end_date",
+      "target_segment_ids",
+      "budget",
+      "status",
+      "owner",
+      "created_at",
+      "updated_at"
+     ],
+     "column_count": 12,
+     "rows": 50,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "coupons",
+     "columns": [
+      "coupon_id",
+      "coupon_code",
+      "coupon_name",
+      "coupon_type",
+      "discount_value",
+      "min_purchase",
+      "max_discount",
+      "valid_days",
+      "start_date",
+      "end_date",
+      "total_quota",
+      "per_user_limit",
+      "applicable_products",
+      "status",
+      "created_at"
+     ],
+     "column_count": 15,
+     "rows": 150,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "push_notifications",
+     "columns": [
+      "push_id",
+      "user_id",
+      "campaign_id",
+      "push_type",
+      "title",
+      "content",
+      "deep_link",
+      "scheduled_at",
+      "sent_at",
+      "delivered_at",
+      "opened_at",
+      "is_delivered",
+      "is_opened",
+      "failure_reason",
+      "created_at"
+     ],
+     "column_count": 15,
+     "rows": 4270390,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "tmp_campaign_roi_analysis",
+     "columns": [
+      "channel_id",
+      "channel_name",
+      "total_cost",
+      "attributed_gmv",
+      "roi"
+     ],
+     "column_count": 5,
+     "rows": 7,
+     "layer": "noise",
+     "status": "deprecated",
+     "summary": "某分析师做活动复盘时留下的一次性 ROI 中间表，未再维护",
+     "granted": false,
+     "masked_columns": []
+    },
+    {
+     "name": "user_coupons",
+     "columns": [
+      "id",
+      "user_id",
+      "coupon_id",
+      "coupon_code",
+      "received_at",
+      "expire_at",
+      "used_at",
+      "order_id",
+      "status",
+      "source"
+     ],
+     "column_count": 10,
+     "rows": 9708732,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": true,
+     "masked_columns": []
+    }
+   ],
+   "table_count": 6
+  },
+  {
+   "key": "attribution",
+   "tables": [
+    {
+     "name": "ad_campaigns",
+     "columns": [
+      "ad_campaign_id",
+      "channel_id",
+      "campaign_name",
+      "campaign_type",
+      "objective",
+      "budget_total",
+      "budget_daily",
+      "start_date",
+      "end_date",
+      "target_audience",
+      "status",
+      "created_at",
+      "updated_at"
+     ],
+     "column_count": 13,
+     "rows": 50,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "ad_creatives",
+     "columns": [
+      "creative_id",
+      "ad_campaign_id",
+      "creative_name",
+      "creative_type",
+      "creative_format",
+      "content_url",
+      "headline",
+      "description",
+      "call_to_action",
+      "status",
+      "created_at"
+     ],
+     "column_count": 11,
+     "rows": 144,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "channel_daily_costs",
+     "columns": [
+      "id",
+      "channel_id",
+      "ad_campaign_id",
+      "creative_id",
+      "date",
+      "impressions",
+      "clicks",
+      "installs",
+      "cost",
+      "currency",
+      "created_at"
+     ],
+     "column_count": 11,
+     "rows": 910,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "channels",
+     "columns": [
+      "channel_id",
+      "channel_name",
+      "channel_type",
+      "platform",
+      "description",
+      "is_active",
+      "created_at"
+     ],
+     "column_count": 7,
+     "rows": 14,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "dws_channel_weekly",
+     "columns": [
+      "channel_id",
+      "channel_name",
+      "week_start",
+      "cost",
+      "installs",
+      "new_users",
+      "weekly_cac"
+     ],
+     "column_count": 7,
+     "rows": 137,
+     "layer": "dws",
+     "status": "active",
+     "summary": "渠道周汇总：每渠道每周的花费、新客数、周 CAC",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "user_attributions",
+     "columns": [
+      "attribution_id",
+      "user_id",
+      "channel_id",
+      "ad_campaign_id",
+      "creative_id",
+      "attribution_type",
+      "click_time",
+      "install_time",
+      "attributed_at",
+      "days_to_install",
+      "tracking_params"
+     ],
+     "column_count": 11,
+     "rows": 149464,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": true,
+     "masked_columns": []
+    }
+   ],
+   "table_count": 6
+  },
+  {
+   "key": "experiment",
+   "tables": [
+    {
+     "name": "ab_test_assignments",
+     "columns": [
+      "id",
+      "user_id",
+      "test_id",
+      "variant_id",
+      "assigned_at",
+      "first_exposure_at"
+     ],
+     "column_count": 6,
+     "rows": 790022,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "ab_test_variants",
+     "columns": [
+      "variant_id",
+      "test_id",
+      "variant_name",
+      "variant_key",
+      "description",
+      "traffic_percentage",
+      "config_json",
+      "is_control",
+      "created_at"
+     ],
+     "column_count": 9,
+     "rows": 30,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "ab_tests",
+     "columns": [
+      "test_id",
+      "test_name",
+      "test_key",
+      "hypothesis",
+      "description",
+      "primary_metric",
+      "secondary_metrics",
+      "target_segment_ids",
+      "traffic_percentage",
+      "min_sample_size",
+      "start_date",
+      "end_date",
+      "status",
+      "conclusion",
+      "winner_variant_id",
+      "owner",
+      "created_at",
+      "updated_at"
+     ],
+     "column_count": 18,
+     "rows": 12,
+     "layer": "base",
+     "status": "active",
+     "summary": "",
+     "granted": true,
+     "masked_columns": []
+    }
+   ],
+   "table_count": 3
+  },
+  {
+   "key": "mart",
+   "tables": [
+    {
+     "name": "mart_channel_daily",
+     "columns": [
+      "dt",
+      "channel_id",
+      "channel_name",
+      "channel_type",
+      "cost",
+      "impressions",
+      "clicks",
+      "installs",
+      "new_users_attributed",
+      "gmv_attributed"
+     ],
+     "column_count": 10,
+     "rows": 1788,
+     "layer": "mart",
+     "status": "active",
+     "summary": "口径已冻结的预聚合表",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "mart_daily_kpi",
+     "columns": [
+      "dt",
+      "dau",
+      "new_users",
+      "orders",
+      "paying_users",
+      "gmv",
+      "refund_amt",
+      "new_subscriptions"
+     ],
+     "column_count": 8,
+     "rows": 91,
+     "layer": "mart",
+     "status": "active",
+     "summary": "口径已冻结的预聚合表",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "mart_daily_revenue",
+     "columns": [
+      "dt",
+      "channel_id",
+      "channel_name",
+      "channel_type",
+      "is_new_user",
+      "order_cnt",
+      "paying_user_cnt",
+      "gmv"
+     ],
+     "column_count": 8,
+     "rows": 2730,
+     "layer": "mart",
+     "status": "active",
+     "summary": "口径已冻结的预聚合表",
+     "granted": true,
+     "masked_columns": []
+    },
+    {
+     "name": "mart_user_summary",
+     "columns": [
+      "user_id",
+      "register_date",
+      "register_channel",
+      "first_paid_date",
+      "paid_order_cnt",
+      "total_gmv",
+      "is_repurchaser_30d",
+      "last_active_date"
+     ],
+     "column_count": 8,
+     "rows": 213520,
+     "layer": "mart",
+     "status": "active",
+     "summary": "口径已冻结的预聚合表",
+     "granted": true,
+     "masked_columns": []
+    }
+   ],
+   "table_count": 4
+  },
+  {
+   "key": "meta",
+   "tables": [
+    {
+     "name": "meta_snapshot",
+     "columns": [
+      "as_of_date",
+      "data_start"
+     ],
+     "column_count": 2,
+     "rows": 1,
+     "layer": "meta",
+     "status": "active",
+     "summary": "数据集「今天」的锚点（静态样本铁律）",
+     "granted": true,
+     "masked_columns": []
+    }
+   ],
+   "table_count": 1
+  }
+ ],
+ "generated_at": "2026-08-04 09:44:36",
+ "snapshot": true,
+ "generated_at_utc": "2026-08-04 01:44:36 UTC"
+}

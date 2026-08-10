@@ -19,7 +19,6 @@
 | applicable_products | JSONB | 适用商品范围配置 |
 | status | VARCHAR(20) | 优惠券状态 |
 | created_at | TIMESTAMP | 记录创建时间 |
-| updated_at | TIMESTAMP | 记录更新时间 |
 
 ## 字段枚举值
 

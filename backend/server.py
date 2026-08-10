@@ -2,7 +2,8 @@
 
 启动：见 backend/run.sh
 路由：
-  GET  /health        —— DB 与配置自检（公开）
+  GET  /health        —— DB 与配置自检（公开）。前端启动探针打的就是这个
+  GET  /api/catalog   —— UI 的元数据来源：表清单/字段/行数/分层/治理现状（见 catalog.py）
   GET  /api/config    —— 前端据此初始化 app 层 Cognito 登录（公开，只含公开值）
   POST /ask           —— body {question, session_id?}，返回 text/event-stream（AUTH_ENABLED 时需 Bearer ID token）
   GET  /              —— 重定向到前端
@@ -23,6 +24,7 @@ from fastapi.responses import StreamingResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
+import catalog
 import db
 from agent import run_agent, MODEL
 
@@ -104,14 +106,36 @@ async def _cache_headers(req: Request, call_next):
 
 @app.get("/health")
 async def health():
+    # db 这一坨原来无条件读 db.PG，于是 DB_BACKEND=redshift 时前端顶栏会显示
+    # 127.0.0.1:5433——库明明在 Redshift 上。改成按后端分派（db.backend_info()），
+    # 并带上 engine，让前端不必自己拼引擎名。
     return JSONResponse({
         "ok": db.ping(),
-        "db": {"host": db.PG["host"], "port": db.PG["port"], "name": db.PG["dbname"]},
+        "db": db.backend_info(),
         "model": MODEL,
         "bedrock": os.getenv("CLAUDE_CODE_USE_BEDROCK") == "1",
         "region": os.getenv("AWS_REGION"),
         "authEnabled": AUTH_ENABLED,
     })
+
+
+@app.get("/api/catalog")
+async def api_catalog(refresh: int = 0):
+    """UI 的元数据来源：表清单 / 字段 / 行数 / 分层 / 治理现状。
+
+    前端原来把这些写死在 HTML 里（39 张表、「~19万行」、「PostgreSQL」），
+    数据一变就全错且不会报警。上 Glue Data Catalog 的意义正是元数据有了机器可读的
+    实际态，所以 UI 应该读它而不是再抄一份。装配逻辑见 backend/catalog.py。
+
+    `?refresh=1` 跳过缓存（默认缓存 5 分钟）；演示中改了库想立刻看到时用。
+    Glue 读不到会降级到 information_schema，并在 `source` 字段里说明，不静默。
+    """
+    try:
+        return JSONResponse(await asyncio.to_thread(catalog.build, bool(refresh)))
+    except Exception as e:
+        # 目录挂了不该让整个页面白屏：回 200 + error，前端退回静态文案。
+        return JSONResponse({"error": f"{type(e).__name__}: {e}",
+                             "source": "unavailable"})
 
 
 @app.get("/api/config")

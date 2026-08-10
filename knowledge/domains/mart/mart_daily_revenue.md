@@ -19,7 +19,7 @@
 
 ## 口径
 
-- 渠道 = **last_touch 归因**。**注意：约六成 GMV 归不到渠道（channel_type='unknown' / channel_name='未归因'）。做渠道归因时必须把这块单列出来，不能当它不存在。**
+- 渠道 = **last_touch 归因**。**注意：约一半 GMV（当前样本实测 50.6%）归不到渠道（channel_type='unknown' / channel_name='未归因'）。做渠道归因时必须把这块单列出来，不能当它不存在。**
 - `is_new_user=true` = 该用户的首笔有效订单。
 - 全表 gmv 合计 = `mart_daily_kpi` 的 gmv 合计（同口径，可交叉校验）。
 

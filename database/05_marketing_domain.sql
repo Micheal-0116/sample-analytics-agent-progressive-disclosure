@@ -66,7 +66,7 @@ CREATE TABLE user_coupons (
     expire_at TIMESTAMP,
     used_at TIMESTAMP,
     order_id BIGINT,  -- 使用时关联的订单
-    status VARCHAR(20) DEFAULT 'available',  -- 'available', 'used', 'expired'
+    status VARCHAR(20) DEFAULT 'unused',  -- 'unused', 'used', 'expired'
     source VARCHAR(50)  -- 'campaign', 'share', 'purchase', 'new_user'
 );
 

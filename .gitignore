@@ -43,3 +43,6 @@ data/events.csv
 .claude/
 # 本地部署参数(含账号相关资源 ID)
 infra/deploy.local.sh
+
+# 本地环境覆盖(真实账号守卫等,见 .env.local.example)
+.env.local
