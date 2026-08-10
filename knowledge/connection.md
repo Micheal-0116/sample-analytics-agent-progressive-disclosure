@@ -11,7 +11,7 @@
 | Namespace | `analytics-agent-ns` |
 | 数据库 | `app_analytics` |
 | 管理员 | `awsuser`，密码由 Secrets Manager 托管（`redshift!analytics-agent-ns-awsuser-*`） |
-| 区域 | `ap-northeast-1`（与 AgentCore Runtime、S3 数据桶同区） |
+| 区域 | `ap-northeast-1`（与 S3 数据桶同区；AgentCore Runtime 在 us-west-2，跨区经 Data API 访问） |
 | 数据桶 | `s3://analytics-agent-data-<账号>-ap-northeast-1/raw/`（初始装载来源，查询不经过它） |
 
 ### 为什么走 Data API 而不是直连
