@@ -1,39 +1,45 @@
 # Eval Report
 
-- 运行时间: 2026-08-06 13:59:09  · 模型: global.anthropic.claude-opus-4-8
-- 通过率: **21/21** (100%)
-- 平均耗时: 40.9s/题 · 平均读文档 2.9 次 · 平均 SQL 1.1 条
+- 运行时间: 2026-08-28 15:47:07  · 模型: global.anthropic.claude-opus-4-8
+- 通过率: **27/27** (100%)
+- 平均耗时: 49.6s/题 · 平均读文档 2.6 次 · 平均 SQL 0.9 条
 
 | Level | 通过 | 总数 |
 |---|---|---|
 | L1 | 7 | 7 |
 | L2 | 6 | 6 |
-| L3 | 4 | 4 |
-| L4 | 2 | 2 |
-| L5 | 2 | 2 |
+| L3 | 7 | 7 |
+| L4 | 4 | 4 |
+| L5 | 3 | 3 |
 
 ## 逐题明细
 
 | # | L | 结果 | 耗时 | 文档 | SQL | 说明 |
 |---|---|---|---|---|---|---|
-| L1-users-count | 1 | ✅ | 27.9s | 3 | 1 | 命中 golden[all users]≈213520.0 |
-| L1-order-count | 1 | ✅ | 30.3s | 3 | 1 | 命中 golden[all orders]≈854078.0 |
-| L1-post-count | 1 | ✅ | 32.1s | 3 | 1 | 命中 golden[all posts]≈427039.0 |
-| L1-campaign-count | 1 | ✅ | 64.9s | 3 | 1 | 命中 golden[all campaigns]≈50.0 |
-| L1-dau-latest | 1 | ✅ | 32.7s | 0 | 0 | 命中 golden[events last day distinct users]≈30162.0 |
-| L1-ab-running | 1 | ✅ | 41.8s | 3 | 1 | 命中 golden[status=running] 键4/4 |
-| L1-channel-list | 1 | ✅ | 33.4s | 3 | 1 | 命中 golden[all channels] 键14/14 |
-| L2-gender-dist | 2 | ✅ | 38.5s | 3 | 1 | 命中 golden[group by gender] 键3/3 |
-| L2-device-dist | 2 | ✅ | 30.9s | 3 | 1 | 命中 golden[device rows] 键3/3 |
-| L2-order-status-dist | 2 | ✅ | 34.7s | 3 | 1 | 命中 golden[group by status] 键6/6 |
-| L2-top-pages-7d | 2 | ✅ | 35.0s | 3 | 1 | 命中 golden[page_views 7d anchored] 10/10 |
-| L2-top-liked-posts | 2 | ✅ | 34.1s | 3 | 1 | 命中 golden[join post_likes] 5/5 |
-| L2-coupon-usage-rate | 2 | ✅ | 33.3s | 3 | 1 | 命中 golden[used/total]≈3.343340819377854 |
-| L3-gmv-30d | 3 | ✅ | 38.2s | 0 | 1 | 命中 golden[actual_amount valid status]≈57231746.23 |
-| L3-top-products-gmv | 3 | ✅ | 41.9s | 4 | 1 | 命中 golden[order_items joined valid orders] 10/10 |
-| L3-churn-30d | 3 | ✅ | 56.8s | 5 | 1 | 命中 golden[no session in 30d]≈93528.0 |
-| L3-coupon-aov-compare | 3 | ✅ | 44.9s | 5 | 1 | 命中 golden[valid status] 两值均匹配 |
-| L4-funnel | 4 | ✅ | 51.9s | 3 | 3 | 命中 golden[all-time distinct users] 4/4 步 |
-| L4-arpu-by-channel | 4 | ✅ | 60.5s | 6 | 1 | 命中 golden[attribution join orders] 3/3 |
-| L5-repurchase-rate | 5 | ✅ | 37.1s | 0 | 0 | 命中 golden[governed mart definition]≈63.3 |
-| L5-wow-gmv | 5 | ✅ | 58.5s | 2 | 4 | 命中 golden[mart_daily_kpi wow] 两值均匹配 |
+| L1-users-count | 1 | ✅ | 33.5s | 3 | 1 | 命中 golden[all users]≈500.0 |
+| L1-order-count | 1 | ✅ | 39.7s | 3 | 1 | 命中 golden[all orders]≈2000.0 |
+| L1-post-count | 1 | ✅ | 56.5s | 3 | 1 | 命中 golden[all posts]≈1000.0 |
+| L1-campaign-count | 1 | ✅ | 54.1s | 3 | 1 | 命中 golden[all campaigns]≈50.0 |
+| L1-dau-latest | 1 | ✅ | 49.5s | 1 | 1 | 命中 golden[events last day distinct users]≈27.0 |
+| L1-ab-running | 1 | ✅ | 65.6s | 3 | 1 | 命中 golden[status=running] 键4/4 |
+| L1-channel-list | 1 | ✅ | 38.6s | 3 | 1 | 命中 golden[all channels] 键14/14 |
+| L2-gender-dist | 2 | ✅ | 49.6s | 3 | 1 | 命中 golden[group by gender] 键2/2 |
+| L2-device-dist | 2 | ✅ | 33.5s | 3 | 1 | 命中 golden[device rows] 键4/4 |
+| L2-order-status-dist | 2 | ✅ | 57.9s | 3 | 1 | 命中 golden[group by status] 键6/6 |
+| L2-top-pages-7d | 2 | ✅ | 37.0s | 3 | 1 | 命中 golden[page_views 7d anchored] 9/10 |
+| L2-top-liked-posts | 2 | ✅ | 51.9s | 4 | 2 | 命中 golden[join post_likes] 4/5 |
+| L2-coupon-usage-rate | 2 | ✅ | 62.0s | 3 | 1 | 命中 golden[used/total]≈49.68990543215307 |
+| L3-gmv-30d | 3 | ✅ | 31.6s | 0 | 0 | 命中 golden[actual_amount valid status]≈2841462.13 |
+| L3-top-products-gmv | 3 | ✅ | 46.0s | 6 | 1 | 命中 golden[order_items joined valid orders] 10/10 |
+| L3-churn-30d | 3 | ✅ | 71.8s | 5 | 1 | 命中 golden[no session in 30d]≈18.0 |
+| L3-coupon-aov-compare | 3 | ✅ | 51.1s | 3 | 1 | 命中 golden[valid status] 两值均匹配 |
+| L4-funnel | 4 | ✅ | 49.8s | 4 | 1 | 命中 golden[all-time subset funnel] 4/4 步 |
+| L4-arpu-by-channel | 4 | ✅ | 66.1s | 4 | 1 | 命中 golden[attribution join orders] 3/3 |
+| L5-retention-cohort | 5 | ✅ | 70.9s | 2 | 1 | 结论已声明数据限制；命中 golden[weekly matrix counts (full-window cohorts)] 20/20 个数值 |
+| L5-repurchase-rate | 5 | ✅ | 71.2s | 2 | 1 | 命中 golden[governed mart definition]≈62.4 |
+| L5-wow-gmv | 5 | ✅ | 52.4s | 2 | 2 | 命中 golden[mart_daily_kpi wow] 两值均匹配 |
+| L3-refund-total | 3 | ✅ | 31.1s | 0 | 0 | 命中 golden[全量退款 (fin_daily_revenue, 按 refunded_at 建轴)]≈963560.92 |
+| L3-channel-cost-total | 3 | ✅ | 50.2s | 4 | 1 | 命中 golden[真实花费 (channel_daily_costs 明细)]≈1449872.13 |
+| L4-cac-lowest-channel | 4 | ✅ | 31.0s | 0 | 0 | 命中 golden[CAC 升序 (成本限制在业务日历轴内)] 2/2 |
+| L4-roi-cac-by-channel | 4 | ✅ | 38.6s | 0 | 0 | 命中 golden[抖音搜索 近30天的 ROI 与 CAC (同锚点、带上界)] 两值均匹配 |
+| L3-cac-overall | 3 | ✅ | 49.1s | 0 | 0 | 命中 golden[全量 CAC (成本限制在业务日历轴内)]≈2880.14 |

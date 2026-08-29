@@ -10,18 +10,33 @@
 ## 用法
 
 ```bash
-# 前置：本地库已就绪（scripts/localpg/up.sh + load.sh），Bedrock 凭证可用
+# 前置：湖仓数据层已就绪（scripts/lakehouse/，见 docs/deployment.md），Bedrock 凭证可用
 cd backend && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
-cd ../eval
-../backend/.venv/bin/python run_eval.py --dry-run     # 先验金标 SQL（不调模型，秒级）
-../backend/.venv/bin/python run_eval.py               # 全量 21 题（每题 25~70s）
-../backend/.venv/bin/python run_eval.py --level 1 2   # 只跑 L1/L2
-../backend/.venv/bin/python run_eval.py --case L4-funnel
+# 从仓库根目录跑（默认 DB_BACKEND=athena，与 agent 走同一条只读边界）
+./backend/.venv/bin/python eval/run_eval.py --dry-run   # 先验金标 SQL（不调模型，约 1 分钟）
+./backend/.venv/bin/python eval/run_eval.py             # 全量 26 题（每题 35~75s）
+./backend/.venv/bin/python eval/run_eval.py --level 1 2 # 只跑 L1/L2
+./backend/.venv/bin/python eval/run_eval.py --case L4-funnel
 ```
 
 产出：`report.md`（通过率汇总 + 逐题明细 + 失败题的 agent SQL）与 `report.json`
-（原始记录，供跨配置横向对比）。
+（原始记录，供跨配置横向对比）。`--dry-run` 写的是 **`report.dryrun.json`**，不碰上面
+两个——两种模式的记录不同构（dry-run 只有 `golden_ok`，没有判定结果和耗时），
+共用一个文件名会让 md 和 json 悄悄脱钩（这事真发生过，见
+`baseline/README.md` 的「这一轮的 JSON 为什么缺」）。
+
+⚠️ **全量跑会覆盖 `report.md` 和 `report.json`**。现行基线归档在
+`eval/baseline/eval.lakehouse-athena.post-funnel-retention-fix.md`+`.json`（27/27）；
+上两轮 `eval.lakehouse-athena.post-anchor-fix.*`（26/26）与 `eval.lakehouse-athena.md`
+（锚点修之前，也是 26/26）**并存保留**。三轮放在一起才读得出两件事：前两轮之间有过一次
+真回归（退款题被默认成近 30 天），而**第二轮到第三轮通过率没变、判分对象变了**——
+`L4-funnel` 上一轮命中的是口径写错的那条 golden。只留最新那份，这两处都看不见。
+
+`report.md` / `report.json` 现在是 **2026-08-23 那次 27/27** 的原件(同一次跑生成,md 与 json 同构)。
+`report.dryrun.json` 是 `--dry-run` 的产物,按真实内容命名——早先两种模式共用过文件名,
+结果一次 dry-run 把全量跑的 json 覆盖掉,md 和 json 说了两件不同的事。
+**别用 `git checkout eval/report.json` 把它"恢复"**:仓库里那一份是 Redshift 时代 21 题的结果。
 
 ## 设计
 
@@ -40,7 +55,7 @@ cd ../eval
 | `set` | 分布/清单题（性别分布、渠道列表） | 键集合 ≥80% 命中；`val_col` 指定时对应数值也须 ≥80% 命中 |
 | `toplist` | 排行题（Top10 页面、Top5 帖子） | 前 K 名命中率 ≥ `min_hit`（默认 60%，模糊排行题放宽） |
 | `pair` | 两值对比题（有券 vs 无券客单价、周环比） | 两个值都须命中 |
-| `funnel` | 漏斗题 | 各步骤数值命中，允许漏 1 步 |
+| `funnel` | 漏斗题 | **先验形态**：交付的 funnel 图必须单调不增，非单调直接判错（理由点明形态，不是"数值没命中"）；再比各步骤数值，允许漏 1 步 |
 
 判分对象是 agent 的**全部数值/文本证据**：`run_sql` 的每个结果集、`call_metric` 的
 权威数、`present_result` 的 kpis 和 chart 标签。这样"SQL 对但只在 KPI 卡片里展示"
@@ -51,9 +66,11 @@ cd ../eval
 - **时间锚点**：静态样本数据（至 2026-01-24），"最近 N 天"必须以 `max(时间列)` 为锚，
   用 `current_date` 会查出空——L1-dau、L2-top-pages、L3-gmv 都在考这个。
 - **有效订单状态**：GMV 类题必须 `status IN ('paid','shipped','delivered')`。
-- **事件名以表文档为准**：漏斗题的真实事件名（`view_product`/`begin_checkout`/
-  `purchase`）与知识库 `metrics/core_metrics.md` 示例里的名字不一致——**读对表文档
-  的枚举值**才写得对，这正是 progressive disclosure 要证明的能力。
+- **事件名以表文档为准**：真实事件名是 `view_product` / `begin_checkout` / `purchase`，
+  而凭常识容易写成 `product_view` / `checkout`——后者在这份数据里**一行都查不到，
+  也不报错**，漏斗直接算出全零。枚举取值只写在 `knowledge/domains/behavior/events.md`
+  里，**读对表文档**才写得对，这正是 progressive disclosure 要证明的能力。
+  （卡片里的枚举取值本身由 `scripts/lakehouse/verify_enums.py` 盯着，防止它自己漂移。）
 
 ### 附带度量
 除对错外每题还记录：**耗时、read_doc 次数、SQL 条数**。要做「文档路由 vs 无路由」的
@@ -64,7 +81,7 @@ cd ../eval
 
 - 判分基于数值/文本证据匹配，是**充分不必要**判定：极端情况下 agent 靠巧合数字蒙对
   会误判为过（数值题都带小数容差，概率很低）；insight 文本质量不在评测范围。
-- `run_eval.py` 顺序执行（每题一个新 session），21 题全量约 15~25 分钟、
-  每题一次 Opus 多轮调用，注意 Bedrock 费用。
+- `run_eval.py` 顺序执行（每题一个新 session），26 题全量约 23 分钟（实测平均
+  51.9s/题）、每题一次 Opus 多轮调用，注意 Bedrock 费用。
 - 用例锚定 schema 而非行数据的具体值，但 `value_hint` 是按当前 CSV 写的注释，
   重新生成数据后 hint 会过时（不影响判分）。

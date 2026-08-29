@@ -14,6 +14,9 @@
   3. 按 judge.mode 比对：scalar（数值容差）/ set（键值集合）/ toplist（前K命中）/
      pair、funnel（多数值逐个容差）。命中任一 golden 变体即判对。
   4. 产出 report.md（逐题明细 + 汇总）与 report.json（原始数据，供横向对比）。
+     `--dry-run` 写的是另一个文件 report.dryrun.json——它跟全量跑的记录不同构
+     （没有 ok/elapsed_s，status 是 golden_ok），混在一个文件名下会让「26/26 通过」
+     和「26/26 金标可执行」看起来是同一件事。这两句话差得很远。
 
 评分之外还记录：每题耗时、读文档次数、SQL 重试次数——These are the numbers
 progressive disclosure 声称要改善的，跑两种配置（有/无文档路由）就能对比。
@@ -39,6 +42,10 @@ import db  # noqa: E402  (backend/db.py — 与 agent 同一个只读边界)
 CASES_PATH = HERE / "cases.json"
 REPORT_MD = HERE / "report.md"
 REPORT_JSON = HERE / "report.json"
+# --dry-run 的产物单独放：它只证明金标 SQL 能在当前后端上跑通，不含 agent 的判定结果。
+# 写进同一个 report.json 会让 md 和 json 悄悄脱钩——md 还是上一次全量跑的 26/26，
+# json 已经被换成 golden_ok 记录，两个文件都"存在且看着正常"。这坑我们踩过一次。
+REPORT_DRYRUN_JSON = HERE / "report.dryrun.json"
 
 
 # ---------------------------------------------------------------- utilities
@@ -75,25 +82,30 @@ def _flat_values(rows: list) -> list:
 
 # ---------------------------------------------------------------- goldens
 
-_pg2rs = None
+_CONVERTERS: dict[str, object] = {}
+
+# 后端 → 改写模块名。缺省（postgres）不改写。
+_ADAPTERS = {"redshift": "pg_to_redshift", "athena": "pg_to_trino"}
 
 
 def _adapt_sql(sql: str) -> str:
     """按后端方言改写金标 SQL。
 
     `cases.json` 里的金标写的是 Postgres 方言，它是**口径的单一真源**，不为了换库
-    分叉成两份（分叉必然漂移）。Redshift 不支持聚合的 `FILTER (WHERE ...)`
-    （cases.json 里 15 处），运行时用 `scripts/gen/pg_to_redshift.py` 就地改写成
-    `CASE WHEN`——只换语法，口径一个字不动。
+    分叉成两份（分叉必然漂移）。语法差异一律在运行时补：
+
+    - Redshift 不支持聚合的 `FILTER (WHERE ...)`（cases.json 里 15 处）→ `CASE WHEN`
+    - Athena（Trino）不认 `x::type` 和 `interval '6 days'`（共 16 处）→ `CAST` / `interval '6' day`
+
+    只换语法，口径一个字不动。所以数据重新生成、或者再换一次引擎，用例都不用动。
     """
-    if getattr(db, "BACKEND", "postgres") != "redshift":
+    mod_name = _ADAPTERS.get(getattr(db, "BACKEND", "postgres"))
+    if not mod_name:
         return sql
-    global _pg2rs
-    if _pg2rs is None:
+    if mod_name not in _CONVERTERS:
         sys.path.insert(0, str(HERE.parent / "scripts" / "gen"))
-        import pg_to_redshift
-        _pg2rs = pg_to_redshift
-    return _pg2rs.convert(sql)[0]
+        _CONVERTERS[mod_name] = __import__(mod_name)
+    return _CONVERTERS[mod_name].convert(sql)[0]
 
 
 async def compute_goldens(case: dict) -> list[dict]:
@@ -143,8 +155,23 @@ async def run_agent_on(question: str) -> dict:
     }
 
 
+# KPI 卡片声明的数量级单位 → 换算成基本单位的倍数。
+# 前端按中文习惯把大数写成「144.99 万」，agent 的 kpi 就带 unit="万"。
+_UNIT_SCALE = {"万": 1e4, "万元": 1e4, "万人": 1e4, "亿": 1e8, "亿元": 1e8, "千": 1e3}
+
+
 def agent_numbers(evidence: dict) -> list[float]:
-    """agent 给出的所有数值证据：查询结果 + kpis。判分时在这里找期望值。"""
+    """agent 给出的所有数值证据：查询结果 + kpis。判分时在这里找期望值。
+
+    kpi 带数量级单位时**同时收原值和换算值**：本项目的 kpi 卡片按中文习惯写
+    `{"value": 144.99, "unit": "万"}`，而金标 SQL 出的是 1449872.13。只收原值的话，
+    「各渠道投放一共花了多少钱」会判 fail —— 但 agent 的 SQL、数据源、明细、总数全对，
+    错的是判分器不认单位。这类漏判比漏抓错数更坏：它会逼着以后写用例的人去放宽容差。
+
+    换算依据是 **agent 自己声明的 unit**，不是猜的，所以不会把两个无关的数凑到一起；
+    容差 0.5% 也足够吸收 144.99 这种两位小数的舍入（差 0.0019%）。
+    judge 里 unit=="pct" 同时接受 want 与 want/100 是同一个思路。
+    """
     nums: list[float] = []
     for rs in evidence["rowsets"]:
         for v in _flat_values(rs["rows"]):
@@ -153,7 +180,11 @@ def agent_numbers(evidence: dict) -> list[float]:
             else:
                 nums.extend(_numbers_from(v))
     for k in (evidence["result"].get("kpis") or []):
-        nums.extend(_numbers_from(k.get("value", "")))
+        raw = _numbers_from(k.get("value", ""))
+        nums.extend(raw)
+        scale = _UNIT_SCALE.get(str(k.get("unit", "")).strip())
+        if scale:
+            nums.extend(n * scale for n in raw)
     return nums
 
 
@@ -239,8 +270,45 @@ def judge_pair(case, goldens, evidence, defaults) -> tuple[bool, str]:
     return False, "两个对比值未同时命中"
 
 
+def _delivered_funnels(evidence: dict) -> list[list[float]]:
+    """agent **交付**的漏斗序列（chart.items 的 value，保留步骤顺序）。
+
+    只看交付的图，不看中间 rowset：中间查询里出现非单调的数列完全正常
+    （比如按渠道拆的明细），拿它去判"非漏斗"就是一个名字比覆盖面大的检查器。
+    """
+    out: list[list[float]] = []
+    res = evidence.get("result") or {}
+    charts = ([res.get("chart")] if res.get("chart") else []) + (res.get("charts") or [])
+    for ch in charts:
+        if not isinstance(ch, dict) or ch.get("type") != "funnel":
+            continue
+        seq = [float(it["value"]) for it in (ch.get("items") or [])
+               if isinstance(it, dict) and isinstance(it.get("value"), (int, float))]
+        if len(seq) >= 3:
+            out.append(seq)
+    return out
+
+
 def judge_funnel(case, goldens, evidence, defaults) -> tuple[bool, str]:
+    """漏斗题判分：**先验形态、再比数值**。
+
+    只比数值是不够的，而这个 mode 叫 `funnel`，名字担保的比它原来做的多。真实
+    代价是：`L4-funnel` 的金标曾经写成每步各 `count(DISTINCT user_id)` 一遍，
+    `value_hint` 就是非单调的 `394/385/396/373`，agent 照这个口径答"漏斗几乎不
+    衰减、是随机种子数据的问题"，判分 PASS，归档基线 26/26。正确口径下是
+    `394/314/258/199`，逐层流失 20%/18%/23%。
+
+    所以这里加一条**不依赖金标对不对**的形态闸：交付的漏斗图必须单调不增。
+    金标哪天又被写错，这条还拦得住。
+    """
     tol = case["judge"].get("tolerance_pct", defaults["tolerance_pct"])
+    for seq in _delivered_funnels(evidence):
+        bad = [i for i in range(1, len(seq)) if seq[i] > seq[i - 1]]
+        if bad:
+            i = bad[0]
+            return False, (f"非漏斗形态：第{i + 1}步 {seq[i]:g} > 第{i}步 {seq[i - 1]:g}"
+                           f"（共 {len(bad)} 处）。每步须约束成上一步的子集，"
+                           f"见 knowledge/analysis/funnel_analysis.md 约束 A")
     nums = agent_numbers(evidence)
     for g in goldens:
         vals = [float(v) for v in _flat_values(g["rows"]) if isinstance(v, (int, float))]
@@ -252,8 +320,72 @@ def judge_funnel(case, goldens, evidence, defaults) -> tuple[bool, str]:
     return False, "漏斗步骤数值命中不足"
 
 
+# 「这份数据算不出留存」的声明方式。**右删失/观测窗不在这里面**——那是另一回事,
+# 也正是那次答错时唯一给出的 caveat：它解释了边缘的 0，没解释中间那片为什么是平的。
+#
+# 每一项都必须指向**机制或定论**（数据为什么算不出、结论因此不能用），不能是
+# 泛化的否定词。第一版里放了「别当」和「不能当作」，结果那份缺陷答案**通过了**——
+# 它的右删失那句写着「别当真实下跌」，于是"本该不算数的 caveat"恰好成了放行凭证。
+# 白名单的每一项都得自己问一遍：它会不会被答案里另一句无关的正确话满足？
+_RETENTION_CREDIBILITY = ("算不出", "不可用", "不可信", "独立抽样", "假象",
+                          "不是真实留存", "无法反映", "没有建模", "数据缺陷",
+                          "不构成业务结论", "样本局限", "与注册生命周期无关")
+
+
+def _delivered_prose(evidence: dict) -> str:
+    """agent 交付的结论散文：interpreted + insight + findings + followups。"""
+    res = evidence.get("result") or {}
+    parts = [str(res.get("interpreted") or ""), str(res.get("insight") or "")]
+    for f in (res.get("findings") or []):
+        if isinstance(f, dict):
+            parts.extend(str(v) for v in f.values())
+        else:
+            parts.append(str(f))
+    parts.extend(str(x) for x in (res.get("followups") or []))
+    return "\n".join(parts)
+
+
+def judge_retention(case, goldens, evidence, defaults) -> tuple[bool, str]:
+    """留存题判分：**先验结论、再比数值**。
+
+    这个 mode 的存在理由和 `funnel` 相反，值得写清楚。漏斗那次是**数值**错了
+    （394/385/396/373，结算 > 浏览），所以形态闸盯的是数值。留存这次数值**全对**
+    ——44.7 / 41.7 / 42.1 与独立实测分毫不差，分子也正确地限定在了 cohort 内——
+    错的只有结论那五个字：「曲线平稳、留得住」。这份数据的活跃度与注册生命周期是
+    独立抽样的，曲线不衰减是项目自己审计出来的 P0，而 agent 把它报成了正面业务发现。
+    纯数值判分会给这种答案判 PASS。
+
+    所以这里的闸是**结论级**的：交付的散文里必须出现"这份数据算不出留存"这个意思。
+    右删失说明**不算**——那次答错时右删失那句是完全正确的，正是它让整段话听起来严谨。
+
+    这条闸的边界要说明白，别让名字比覆盖面大：它是**关键词白名单**，不是"读懂了散文"。
+    一个既说"算不出"又同时下"留得住"结论的答案，它拦不住；换个说法表达同一个错误
+    结论（比如"用户黏性稳定"而不提数据缺陷），只要一个白名单词都没命中就会被拦下——
+    拦得住是因为白名单在**要求**一句话存在，不是在**禁止**某句话存在。禁止型的写法
+    这里刻意没用：正确答案里就写着『别当成"留存好"的正面结论』，任何以「留存好」
+    为特征的黑名单都会把它误杀。
+    """
+    prose = _delivered_prose(evidence)
+    if not any(k in prose for k in _RETENTION_CREDIBILITY):
+        return False, ("结论里没有声明「这份数据算不出留存」：曲线平坦是活跃度与注册"
+                       "生命周期独立抽样的结果（项目 P0），把它答成「留得住/粘性好」"
+                       "就是把数据缺陷报成了业务发现。右删失说明不能替代这一条，"
+                       "见 knowledge/analysis/retention_curve.md 顶部那节")
+    tol = case["judge"].get("tolerance_pct", defaults["tolerance_pct"])
+    min_hit = case["judge"].get("min_hit", 6)
+    nums = agent_numbers(evidence)
+    for g in goldens:
+        vals = [float(v) for v in _flat_values(g["rows"]) if isinstance(v, (int, float))]
+        if not vals:
+            continue
+        hit = sum(1 for v in vals if any(_close(n, v, tol) for n in nums))
+        if hit >= min_hit:
+            return True, f"结论已声明数据限制；命中 golden[{g['label']}] {hit}/{len(vals)} 个数值"
+    return False, f"结论合格但留存矩阵数值命中不足 {min_hit} 个"
+
+
 JUDGES = {"scalar": judge_scalar, "set": judge_set, "toplist": judge_toplist,
-          "pair": judge_pair, "funnel": judge_funnel}
+          "pair": judge_pair, "funnel": judge_funnel, "retention": judge_retention}
 
 
 # ---------------------------------------------------------------- main
@@ -327,12 +459,338 @@ def render_report(records: list[dict], meta: dict) -> str:
     return "\n".join(lines)
 
 
+def selftest() -> int:
+    """离线自测判分器：不连库、不调模型，秒级。进 L0。
+
+    存在的理由很具体：`judge_funnel` 原来只比数值，于是一个非单调的"漏斗"
+    （`394/385/396/373`，结算 > 浏览）判 PASS 并进了归档基线。现在加了形态闸，
+    而**一条没被验证过的断言随时可能变成永远绿的灯**——这里就是验证它的地方。
+
+    同时钉住 `L4-funnel` 金标的口径本身：它一旦被改回"每步各数一遍"，
+    `_looks_like_subset_funnel` 会红。金标是这道题的真源，真源错了下游全错。
+    """
+    fails: list[str] = []
+    ran = 0
+
+    def check(name: str, got, want):
+        nonlocal ran
+        ran += 1
+        if got != want:
+            fails.append(f"{name}: 得到 {got!r}，期望 {want!r}")
+
+    defaults = {"tolerance_pct": 5.0}
+    case = {"judge": {"mode": "funnel", "tolerance_pct": 10.0}}
+    goldens = [{"label": "subset", "rows": [[394, 314, 258, 199]]}]
+
+    def ev(seq, nums=None):
+        """造一份最小 evidence：交付一张 funnel 图 + 对应的 rowset 数值。"""
+        return {"result": {"chart": {"type": "funnel",
+                                     "items": [{"name": f"s{i}", "value": v}
+                                               for i, v in enumerate(seq)]},
+                           "kpis": []},
+                "rowsets": [{"columns": [], "rows": [list(nums or seq)]}]}
+
+    # 1) 正确口径：单调 + 命中金标 → 判对
+    ok, why = judge_funnel(case, goldens, ev([394, 314, 258, 199]), defaults)
+    check("单调且命中金标应判对", ok, True)
+
+    # 2) 历史缺陷本体：非单调 → 必须判错，且理由指向形态而不是"数值没命中"
+    ok, why = judge_funnel(case, goldens, ev([394, 385, 396, 373]), defaults)
+    check("非单调应判错", ok, False)
+    if "非漏斗形态" not in why:
+        fails.append(f"非单调的理由应点明形态，实际: {why}")
+
+    # 3) 形态闸不能越权：单调但数值不对，理由该是数值不命中（不是形态）
+    ok, why = judge_funnel(case, goldens, ev([100, 90, 80, 70]), defaults)
+    check("单调但数值错应判错", ok, False)
+    if "非漏斗形态" in why:
+        fails.append(f"单调序列不该被判成非漏斗形态: {why}")
+
+    # 4) 没交付 funnel 图时形态闸不生效，退回数值比对（别把别的图形当漏斗）
+    line = {"result": {"chart": {"type": "line", "items": [{"name": "a", "value": 1},
+                                                           {"name": "b", "value": 9},
+                                                           {"name": "c", "value": 3}]},
+                       "kpis": []},
+            "rowsets": [{"columns": [], "rows": [[394, 314, 258, 199]]}]}
+    ok, why = judge_funnel(case, goldens, line, defaults)
+    check("非 funnel 图不应触发形态闸", ok, True)
+
+    # 5) stats.funnel 的实时闸：同一个缺陷序列必须报 monotonic=False
+    sys.path.insert(0, str(BACKEND))
+    import stats  # noqa: PLC0415
+    r_bad = stats.funnel([394, 385, 396, 373], labels=["浏览", "加购", "结算", "支付"])
+    check("stats.funnel 应判非单调", r_bad.get("monotonic"), False)
+    check("stats.funnel 应报出违规处数", len(r_bad.get("violations") or []), 1)
+    r_ok = stats.funnel([394, 314, 258, 199])
+    check("stats.funnel 对单调序列应判 True", r_ok.get("monotonic"), True)
+
+    # 6) 金标口径本身：L4-funnel 必须还是子集漏斗（value_hint 单调）
+    spec = json.loads(CASES_PATH.read_text())
+    fc = next((c for c in spec["cases"] if c["id"] == "L4-funnel"), None)
+    if fc is None:
+        fails.append("cases.json 里找不到 L4-funnel")
+    else:
+        for g in fc["golden"]:
+            # 逐步核，不是"某处有就算过"：只核存在性的话，删掉其中一步的约束
+            # 照样绿——那就又是一个名字比覆盖面大的检查器（injection 实测过）。
+            steps = sorted(int(m) for m in re.findall(r"\bs(\d+)\s+AS\s*\(", g["sql"]))
+            if len(steps) < 3:
+                fails.append(f"金标 {g['label']} 认不出分步 CTE（s1/s2/…），无法核约束 A")
+                continue
+            for i in steps[1:]:
+                want = f"IN (SELECT user_id FROM s{i - 1})"
+                if want not in g["sql"]:
+                    fails.append(f"金标 {g['label']} 的 s{i} 缺少 `{want}`："
+                                 f"这一步没约束成上一步的子集，口径退回独立计数")
+        hint = str(fc.get("value_hint", ""))
+        seq = [float(x) for x in re.findall(r"\d+", hint.split("(")[0])]
+        if len(seq) >= 3 and any(seq[i] > seq[i - 1] for i in range(1, len(seq))):
+            fails.append(f"金标 value_hint 非单调: {hint}")
+
+    # 7) knowledge/ 里的参考 SQL 自己得是对的口径。
+    #
+    # 这一组是补一个真实事故的窟窿：前六组全绿、判分器和 stats 都装了闸，
+    # 而 agent 在浏览器上照旧答出 `394/385/396/373`——因为它读的是
+    # `domains/behavior/events.md` 和 `metrics/core_metrics.md`，那两张卡片里的
+    # 「购买漏斗」参考 SQL 本身就是每步各 `COUNT(DISTINCT CASE WHEN ...)` 一遍，
+    # 还配了一句「这份种子数据漏斗不衰减，别当业务结论」。它是照抄的，抄得很忠实。
+    # `verify_doc_sql.py` 只 EXPLAIN 语法，口径它不看，所以这些文件此前零覆盖。
+    FUNNEL_EVENTS = ("view_product", "add_to_cart", "begin_checkout", "purchase")
+    KB = HERE.parent / "knowledge"
+
+    def sql_blocks(text: str) -> list[str]:
+        """取 ```sql 围栏里的 SQL，并**剥掉 `--` 行注释**。
+
+        剥注释不是洁癖，是这两组闸的正确性前提。这些卡片的注释里就写着
+        「不用 CURRENT_DATE」「分子里数的是 c.user_id」这类警告文字，
+        不剥的话：禁止型断言会被警告文字自己触发（误报），
+        而要求型断言会被注释里的示例字符串满足（**永远绿的灯**，更糟）。
+        """
+        out = []
+        for block in re.findall(r"```sql\n(.*?)```", text, re.S):
+            out.append("\n".join(re.sub(r"--.*$", "", ln) for ln in block.splitlines()))
+        return out
+
+    for md in sorted(KB.rglob("*.md")):
+        rel = md.relative_to(KB.parent)
+        for block in sql_blocks(md.read_text()):
+            # 只认「分步各算一个人数」的块。`WHERE event_name IN (…)` 的查表/趋势
+            # 不是漏斗，不该被这条闸拦下（第一版就是这么误报的）。
+            n_indep = len(re.findall(r"(?i)count\s*\(\s*distinct\s+case\s+when\s+event_name",
+                                     block))
+            # 分步 CTE：按 `名字 AS (` 切段，段里 `event_name = '<漏斗事件>'` 的算一步
+            marks = [(m.group(1), m.end()) for m in re.finditer(r"(\w+)\s+AS\s*\(", block)]
+            bounds = [m.start() for m in re.finditer(r"(\w+)\s+AS\s*\(", block)] + [len(block)]
+            step_ctes = []
+            for idx, (name, start) in enumerate(marks):
+                body = block[start:bounds[idx + 1]]
+                if any(re.search(rf"event_name\s*=\s*'{e}'", body) for e in FUNNEL_EVENTS):
+                    step_ctes.append((name, body))
+            if n_indep < 3 and len(step_ctes) < 3:
+                continue
+            # 7a) 每步各数一遍 = 独立计数，四个互不相干的集合，不是漏斗
+            if n_indep >= 3:
+                fails.append(f"{rel} 的漏斗参考 SQL 用了 {n_indep} 个独立 "
+                             f"`count(DISTINCT CASE WHEN event_name…)`：这是独立计数不是漏斗，"
+                             f"照它写会得到「结算 > 浏览」")
+                continue
+            # 7b) 分步 CTE 写法：逐步核子集约束（同约束 A，与金标同一把尺）
+            for (name, body), (prev, _) in zip(step_ctes[1:], step_ctes):
+                want = f"IN (SELECT user_id FROM {prev})"
+                if want not in body:
+                    fails.append(f"{rel} 的漏斗参考 SQL 里 {name} 缺少 `{want}`："
+                                 f"这一步没约束成上一步的子集，口径退回独立计数")
+        ran += 1
+
+    # 7c) 光把卡片改对不够——还得让 agent 走到方法卡。事故的另一半是路由：
+    # 一道朴素的「转化漏斗」取数题只加载了行为域卡片，`analysis/funnel_analysis.md`
+    # 从头到尾没被读过，于是 SOP 里的约束 A/B 一条都没生效。
+    for rel, must in [("knowledge/domains/behavior/_index.md", "analysis/funnel_analysis.md"),
+                      ("knowledge/domains/behavior/events.md", "analysis/funnel_analysis.md"),
+                      ("knowledge/metrics/core_metrics.md", "analysis/funnel_analysis.md")]:
+        ran += 1
+        p = HERE.parent / rel
+        if not p.exists():
+            fails.append(f"{rel} 不存在，无法核漏斗路由")
+        elif must not in p.read_text():
+            fails.append(f"{rel} 没有指向 `{must}`：漏斗题会只读到表卡片、"
+                         f"读不到方法卡，约束 A/B 全部失效")
+
+    # 7d) 口径对了、单调性也对了之后还剩一件事：**绝对值**。这份数据集里漏斗顶端
+    # 「看过就走」的那一侧没按真实比例生成——实测浏览过商品的 394 人里，一次都没
+    # 加购的只有 80 人（20.3%），而 25 种事件各自的行数被抽得近似均匀
+    # （736–866，极差比 1.18），于是顶宽底窄的量级差根本不存在。落到数字上，
+    # 端到端转化全量 199/394 = 50.5%、近 30 天 32/197 = 16.2%，量级上不是业务水平。
+    # 这一组和第 8d 组同一个病、不同的器官：数值全对、形态全对，**结论**仍可以错
+    # ——agent 会把 50.5% 写成「转化表现优异」，也就是把生成器的抽样方式报成了
+    # 业务表现。所以钉的是结论层，不是数值层。
+    #
+    # 注意这条与第 7 组（约束 A）的分工：单调性不成立**永远**是 SQL 的错，不许拿
+    # 「这份数据绝对值偏高」去解释，两张卡片里都写明了这一点。
+    for rel, musts in [
+        ("knowledge/analysis/funnel_analysis.md", ["绝对值不可比", "50.5%"]),
+        ("knowledge/metrics/core_metrics.md", ["绝对值不具参考性"]),
+    ]:
+        p = HERE.parent / rel
+        for must in musts:
+            ran += 1
+            if not p.exists():
+                fails.append(f"{rel} 不存在，无法核漏斗绝对值口径")
+            elif must not in p.read_text():
+                fails.append(f"{rel} 里找不到 `{must}`：漏斗题会读不到"
+                             f"「转化率绝对值不具参考性」这条约束，"
+                             f"50.5% 会被答成正面业务结论")
+
+    # 8) 留存参考 SQL 的口径。跟第 7 组同一个病、不同的器官：`verify_doc_sql.py`
+    # 只 EXPLAIN，而 `users` 上 `created_at` 和 `registered_at` **两列都存在**，
+    # cohort 写错列 EXPLAIN 照样通过、结果照样出——只是分出来的是另一批人
+    # （实测 500/500 行两列不相等）。另外分子若不 JOIN 回 cohort 名单，
+    # 留存率会炸到 509%（见 `analysis/retention_curve.md` 的硬约束）。
+    for md in sorted(KB.rglob("*.md")):
+        rel = md.relative_to(KB.parent)
+        for block in sql_blocks(md.read_text()):
+            m_coh = re.search(r"(?i)cohort\s+AS\s*\(", block)
+            m_act = re.search(r"(?i)activity\s+AS\s*\(", block)
+            if not (m_coh and m_act):
+                continue          # 不是 cohort 留存写法，这组不管
+            ran += 1
+            # 8a) cohort 时间列。cohort 段 = `cohort AS (` 到 `activity AS (` 之间
+            coh_body = (block[m_coh.end():m_act.start()]
+                        if m_act.start() > m_coh.end() else block)
+            # 两条都要：光要求 registered_at "出现过"太松——把 SELECT 里的键换成
+            # created_at、WHERE 里留着 registered_at，这条就照样绿（试过）。
+            if "registered_at" not in coh_body:
+                fails.append(f"{rel} 的留存参考 SQL 里 cohort 不是按 `registered_at` 分的："
+                             f"`users` 上 `created_at` 也存在，写错了 EXPLAIN 照样过，"
+                             f"分出来是另一批 cohort")
+            if "created_at" in coh_body:
+                fails.append(f"{rel} 的留存参考 SQL 的 cohort 段里出现了 `created_at`："
+                             f"这份数据 500/500 行 `created_at != registered_at`，"
+                             f"cohort 键必须整段走 `registered_at`")
+            # 8b) 静态快照上 CURRENT_DATE 会查空
+            if re.search(r"(?i)current_date", block):
+                fails.append(f"{rel} 的留存参考 SQL 用了 `CURRENT_DATE`："
+                             f"本库是静态快照，时间锚要用 "
+                             f"`(SELECT max(as_of_date) FROM meta_snapshot)`")
+            # 8c) 分子必须限定在 cohort 成员内
+            m_join = re.search(r"(?i)join\s+activity\s+(\w+)\s+ON\s+([^\n]+)", block)
+            m_from = re.search(r"(?i)from\s+cohort\s+(\w+)", block)
+            if not (m_join and m_from):
+                fails.append(f"{rel} 的留存参考 SQL 没把 activity 按 user_id 关联回 "
+                             f"cohort 名单：分子会变成「全站活跃人数」，留存率超 100%")
+                continue
+            act_alias, coh_alias, on = m_join.group(1), m_from.group(1), m_join.group(2)
+            if f"{act_alias}.user_id" not in on or f"{coh_alias}.user_id" not in on:
+                fails.append(f"{rel} 的留存参考 SQL 的 JOIN 条件 `{on.strip()}` 没有按 "
+                             f"user_id 把 activity 收进 cohort 名单")
+            bad = {a for a in re.findall(r"(?i)then\s+(\w+)\.user_id", block)
+                   if a != coh_alias}
+            bad |= {a for a in re.findall(r"(?i)count\s*\(\s*distinct\s+(\w+)\.user_id", block)
+                    if a != coh_alias}
+            if bad:
+                fails.append(f"{rel} 的留存参考 SQL 分子数的是 {sorted(bad)} 的 user_id，"
+                             f"不是 cohort 成员 `{coh_alias}.user_id`："
+                             f"实测这么写第 1 周是 219/43 = 509%")
+
+    # 8d) 数字对了、结论仍可以是错的。这一组是 Q3 的窟窿：留存曲线在这份数据上
+    # 平坦（45.0/43.0/42.1/41.1/43.0），agent 把它答成「曲线平稳、留得住」，
+    # 还配了一句完全正确的右删失说明——听起来很严谨，而结论是把项目自己的 P0
+    # 数据缺陷报成了正面业务发现。这条事实此前只写在 `docs/`，agent 从不读。
+    for rel, musts in [
+        ("knowledge/analysis/retention_curve.md",
+         ["算不出留存", "act.user_id = coh.user_id"]),
+        ("knowledge/metrics/core_metrics.md",
+         ["留存结论不可用", "analysis/retention_curve.md"]),
+        ("knowledge/domains/behavior/_index.md", ["analysis/retention_curve.md"]),
+    ]:
+        p = HERE.parent / rel
+        for must in musts:
+            ran += 1
+            if not p.exists():
+                fails.append(f"{rel} 不存在，无法核留存口径/路由")
+            elif must not in p.read_text():
+                fails.append(f"{rel} 里找不到 `{must}`：留存题会读不到"
+                             f"「这份数据算不出留存」这条约束，"
+                             f"平坦曲线会被答成「留得住」")
+
+    # 9) 留存判分器的结论闸。这一组和第 1–5 组对称,但盯的维度相反:
+    # 漏斗那次错在**数值**(结算 > 浏览),留存这次数值**全对**、分子也对、
+    # 右删失说明也对,错的只有结论那五个字「曲线平稳、留得住」。纯数值判分会判 PASS。
+    r_case = {"judge": {"mode": "retention", "tolerance_pct": 5.0, "min_hit": 3}}
+    r_goldens = [{"label": "matrix", "rows": [[41, 18, 19, 19, 17], [37, 18, 16, 18, 14]]}]
+
+    def r_ev(prose: str, nums=(41, 18, 19, 19, 17, 37, 18, 16, 18, 14)):
+        return {"result": {"interpreted": "按注册周分 cohort", "insight": prose,
+                           "kpis": [], "followups": []},
+                "rowsets": [{"columns": [], "rows": [list(nums)]}]}
+
+    # 9a) 事故本体:数字全对,结论把 P0 数据缺陷报成了正面业务发现 → 必须判错
+    BAD = ("留存矩阵已出:首周约 44.7%,到第 2/4 周基本不再衰减,曲线平稳、留得住。"
+           "⚠️ 右下角那几个 0 是观测窗未到(右删失),别当真实下跌。")
+    ok, why = judge_retention(r_case, r_goldens, r_ev(BAD), defaults)
+    check("数字对但结论报成「留得住」应判错", ok, False)
+    if "算不出留存" not in why:
+        fails.append(f"该失败的理由应指向结论而不是数值，实际: {why}")
+
+    # 9b) 修复后的真实答案 → 必须判对。注意它里面写着『别当成"留存好"的正面结论』,
+    # 所以任何以「留存好」为特征的**黑名单**写法都会把正确答案误杀 —— 这就是这道闸
+    # 只用白名单(要求某句话存在)、不用黑名单(禁止某句话出现)的原因。
+    GOOD = ("横向看几乎不衰减,满窗的 4 个 cohort W1→W4 一直在 40–48% 徘徊。这是样本里"
+            "活跃度与注册生命周期独立抽样的假象,别当成\"留存好\"的正面结论。右下三角的 0 "
+            "是右删失。")
+    ok, why = judge_retention(r_case, r_goldens, r_ev(GOOD), defaults)
+    check("声明了数据限制且数值命中应判对", ok, True)
+
+    # 9c) 只给右删失说明**不算**声明数据限制:那句话本身正确,但它只解释边缘的 0,
+    # 不解释中间那片为什么是平的 —— 而且正是它让那段错结论听起来很严谨。
+    ONLY_CENSOR = ("留存矩阵已出。右下角那几个 0 是观测窗未到(右删失),不是真实下跌,"
+                   "近期 cohort 的留存窗口不完整,不能和老 cohort 比。")
+    ok, why = judge_retention(r_case, r_goldens, r_ev(ONLY_CENSOR), defaults)
+    check("只说右删失不应算作声明了数据限制", ok, False)
+
+    # 9d) 结论闸不能越权:结论合格但数值不对时,理由该是数值不命中(同第 3 条的纪律)
+    ok, why = judge_retention(r_case, r_goldens, r_ev(GOOD, nums=(1, 2, 3)), defaults)
+    check("结论合格但数值错应判错", ok, False)
+    if "算不出留存" in why:
+        fails.append(f"数值不命中不该被报成结论问题: {why}")
+
+    # 9e) 金标自己的口径(同第 6 组对金标做的事):留存金标必须按 registered_at 分 cohort、
+    # 且分子 JOIN 回 cohort 名单。真源错了下游全错。
+    rc = next((c for c in spec["cases"] if c["id"] == "L5-retention-cohort"), None)
+    ran += 1
+    if rc is None:
+        fails.append("cases.json 里找不到 L5-retention-cohort：留存题端到端零覆盖")
+    else:
+        if rc["judge"]["mode"] != "retention":
+            fails.append(f"L5-retention-cohort 的判分 mode 是 {rc['judge']['mode']}，"
+                         f"不是 retention：结论闸不生效，答成「留得住」也会 PASS")
+        for g in rc["golden"]:
+            ran += 1
+            if "registered_at" not in g["sql"] or "created_at" in g["sql"]:
+                fails.append(f"留存金标 {g['label']} 的 cohort 列不是 `registered_at`")
+            if not re.search(r"(?i)join\s+activity\s+(\w+)\s+ON\s+\1\.user_id\s*=\s*\w+\.user_id",
+                             g["sql"]):
+                fails.append(f"留存金标 {g['label']} 没把 activity 按 user_id 关联回 "
+                             f"cohort 名单：分子会变成全站活跃，留存率超 100%")
+
+    for f in fails:
+        print("  ✗", f)
+    print(f"判分器自测: {ran} 条断言 + 金标口径核对，"
+          f"{'全部通过 ✅' if not fails else f'{len(fails)} 项失败 ❌'}")
+    return 1 if fails else 0
+
+
 async def main() -> int:
     ap = argparse.ArgumentParser(description="analytics agent eval harness")
     ap.add_argument("--level", type=int, nargs="*", help="只跑这些 level")
     ap.add_argument("--case", nargs="*", help="只跑这些 case id")
     ap.add_argument("--dry-run", action="store_true", help="只验证金标 SQL 可执行")
+    ap.add_argument("--selftest", action="store_true",
+                    help="离线自测判分器（不连库不调模型）")
     args = ap.parse_args()
+
+    if args.selftest:
+        return selftest()
 
     spec = json.loads(CASES_PATH.read_text())
     cases = spec["cases"]
@@ -361,8 +819,9 @@ async def main() -> int:
         "avg_docs": round(sum(r.get("n_docs", 0) for r in done) / len(done), 1) if done else "-",
         "avg_sql": round(sum(r.get("n_sql", 0) for r in done) / len(done), 1) if done else "-",
     }
-    REPORT_JSON.write_text(json.dumps({"meta": meta, "records": records},
-                                      ensure_ascii=False, indent=2, default=str))
+    out_json = REPORT_DRYRUN_JSON if args.dry_run else REPORT_JSON
+    out_json.write_text(json.dumps({"meta": meta, "records": records},
+                                   ensure_ascii=False, indent=2, default=str))
     if not args.dry_run:
         REPORT_MD.write_text(render_report(records, meta))
         print(f"\n通过 {sum(1 for r in done if r['status']=='pass')}/{len(done)}"
@@ -371,6 +830,7 @@ async def main() -> int:
         bad = [r for r in records if r["status"] == "golden_error"]
         print(f"\n金标验证: {len(records)-len(bad)}/{len(records)} OK"
               + (f"；失败: {[r['id'] for r in bad]}" if bad else ""))
+        print(f"（只验金标，未调模型；产物 {out_json.name}，未动 report.md/report.json）")
     return 0 if all(r["status"] in ("pass", "golden_ok") for r in records) else 1
 
 
