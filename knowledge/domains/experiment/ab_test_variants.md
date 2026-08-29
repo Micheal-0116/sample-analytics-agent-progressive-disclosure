@@ -16,13 +16,13 @@
 
 ## 字段枚举值
 
-### variant_key 常见变体标识
-| 值 | 说明 |
-|----|------|
-| control | 对照组，保持原有体验 |
-| treatment_a | 实验组A |
-| treatment_b | 实验组B |
-| treatment_c | 实验组C |
+### variant_key 变体标识
+
+> 这一列**不是枚举**，是「实验名 + 组名」拼出来的键：30 行 30 个不同取值，形如
+> `<test_key>_control` / `<test_key>_treatment_a` / `<test_key>_treatment_b`
+> （例如 `homepage_banner_v2_control`）。**不要**照着 `control` / `treatment_a` 筛，
+> 那样是空集；要认组别就用 `is_control`，或者 `variant_key LIKE '%_control'`。
+> 实测没有 `treatment_c`（旧文档写过）——每个实验最多 3 组。
 
 ### is_control 对照组标识
 | 值 | 说明 |
@@ -85,8 +85,8 @@ ORDER BY t.test_name;
 SELECT
     t.test_name,
     v.variant_name,
-    v.config_json->>'button_color' AS button_color,
-    v.config_json->>'discount_percentage' AS discount
+    json_extract_scalar(v.config_json, '$.button_color') AS button_color,
+    json_extract_scalar(v.config_json, '$.discount_percentage') AS discount
 FROM ab_test_variants v
 JOIN ab_tests t ON v.test_id = t.test_id
 WHERE v.config_json ? 'button_color'

@@ -88,7 +88,7 @@ SELECT
     ROUND(AVG(CASE WHEN status NOT IN ('cancelled')
         THEN actual_amount END), 2) AS avg_order_value
 FROM orders
-WHERE placed_at >= CURRENT_DATE - INTERVAL '30 days'
+WHERE placed_at >= CURRENT_DATE - interval '30' day
 GROUP BY DATE(placed_at)
 ORDER BY order_date DESC;
 ```
@@ -101,7 +101,7 @@ SELECT
     ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(), 2) AS pct,
     SUM(actual_amount) AS total_amount
 FROM orders
-WHERE placed_at >= CURRENT_DATE - INTERVAL '30 days'
+WHERE placed_at >= CURRENT_DATE - interval '30' day
 GROUP BY status
 ORDER BY order_count DESC;
 ```
@@ -116,7 +116,7 @@ SELECT
     ROUND(COUNT(CASE WHEN status = 'cancelled' THEN 1 END) * 100.0 / COUNT(*), 2) AS cancel_rate,
     ROUND(COUNT(CASE WHEN status = 'refunded' THEN 1 END) * 100.0 / COUNT(*), 2) AS refund_rate
 FROM orders
-WHERE placed_at >= CURRENT_DATE - INTERVAL '30 days'
+WHERE placed_at >= CURRENT_DATE - interval '30' day
 GROUP BY DATE(placed_at)
 ORDER BY order_date DESC;
 ```

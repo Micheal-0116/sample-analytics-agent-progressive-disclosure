@@ -21,27 +21,32 @@
 ## 字段枚举值
 
 ### campaign_type 活动类型
-| 值 | 说明 |
-|----|------|
-| awareness | 品牌认知（提升曝光度） |
-| consideration | 兴趣考虑（增加互动） |
-| conversion | 转化获客（促进安装/注册） |
-| retargeting | 再营销（召回流失用户） |
+| 值 | 说明 | 实测行数 |
+|----|------|------|
+| awareness | 品牌认知（提升曝光度） | 21 |
+| retargeting | 再营销（召回流失用户） | 16 |
+| acquisition | 转化获客（促进安装/注册） | 13 |
+
+> 获客类的值是 `acquisition`，**不是** `conversion`；也**没有** `consideration`（旧文档写过）。
 
 ### objective 投放目标
-| 值 | 说明 |
-|----|------|
-| installs | APP 安装量 |
-| registrations | 用户注册量 |
-| purchases | 购买转化 |
+| 值 | 说明 | 实测行数 |
+|----|------|------|
+| engagement | 互动量 | 18 |
+| purchases | 购买转化 | 16 |
+| installs | APP 安装量 | 16 |
+
+> **没有** `registrations`（旧文档写过）。
 
 ### status 活动状态
-| 值 | 说明 |
-|----|------|
-| draft | 草稿（未发布） |
-| active | 投放中 |
-| paused | 已暂停 |
-| completed | 已结束 |
+| 值 | 说明 | 实测行数 |
+|----|------|------|
+| paused | 已暂停 | 21 |
+| active | 投放中 | 18 |
+| ended | 已结束 | 11 |
+
+> 结束态的值是 `ended`，**不是** `completed`；种子数据里也没有 `draft`。
+> 注意这跟 `campaigns.status`（运营活动表）不是同一套枚举——那张表用的是 `completed`。
 
 ### target_audience 目标受众配置
 典型结构：

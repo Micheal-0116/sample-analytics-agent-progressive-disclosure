@@ -130,7 +130,8 @@ WHERE o.order_id = ?;
 SELECT
     p.post_id,
     p.title,
-    COUNT(DISTINCT pl.like_id) AS likes,
+    -- post_likes 没有代理主键，主键是 (user_id, post_id)，所以按 user_id 去重
+    COUNT(DISTINCT pl.user_id) AS likes,
     COUNT(DISTINCT pc.comment_id) AS comments,
     COUNT(DISTINCT ps.share_id) AS shares
 FROM posts p
@@ -142,25 +143,32 @@ GROUP BY p.post_id, p.title;
 
 ### 用户行为归因
 ```sql
+-- user_attributions 里只有 channel_id / ad_campaign_id（没有 channel、
+-- 也没有 first_touch_campaign）；渠道名要 JOIN channels 取
 SELECT
     u.user_id,
-    ua.channel,
-    ua.first_touch_campaign,
+    ch.channel_name,
+    ua.ad_campaign_id,
     COUNT(DISTINCT o.order_id) AS orders,
     SUM(o.total_amount) AS total_gmv
 FROM users u
 JOIN user_attributions ua ON u.user_id = ua.user_id
+JOIN channels ch ON ch.channel_id = ua.channel_id
 LEFT JOIN orders o ON u.user_id = o.user_id
-GROUP BY u.user_id, ua.channel, ua.first_touch_campaign;
+-- 一个用户有多条归因记录（first_touch / last_touch 各一条），不过滤会把订单算重
+WHERE ua.attribution_type = 'first_touch'
+GROUP BY u.user_id, ch.channel_name, ua.ad_campaign_id;
 ```
 
 ## 注意事项
 
-1. **数组字段关联**: `posts.product_ids` 是数组类型，需要使用 `ANY()` 或 `unnest()` 进行关联
+1. **数组字段关联**: `posts.product_ids` 是数组类型，展开用 `CROSS JOIN UNNEST(...)`，
+   只判断"包不包含"用 `contains(arr, v)`（Trino 的 `= ANY` 只接子查询，不接数组）
    ```sql
    SELECT p.*, pr.product_name
-   FROM posts p, unnest(p.product_ids) AS pid
-   JOIN products pr ON pr.product_id = pid;
+   FROM posts p
+   CROSS JOIN UNNEST(p.product_ids) AS t(pid)
+   JOIN products pr ON pr.product_id = t.pid;
    ```
 
 2. **软删除**: 部分表有 `status` 或 `is_deleted` 字段，查询时注意过滤

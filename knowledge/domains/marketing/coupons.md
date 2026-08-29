@@ -23,18 +23,25 @@
 ## 字段枚举值
 
 ### coupon_type 优惠券类型
-| 值 | 说明 | 示例 |
-|----|------|------|
-| fixed | 固定金额减免 | 满100减20，discount_value=20 |
-| percentage | 百分比折扣 | 8折优惠，discount_value=0.8 |
-| shipping | 免运费券 | 免运费，discount_value=0 |
+| 值 | 说明 | 示例 | 实测行数 |
+|----|------|------|------|
+| fixed_amount | 固定金额减免 | 满100减20，discount_value=20 | 78 |
+| percentage | 百分比折扣 | 8折优惠，discount_value=0.8 | 54 |
+| free_shipping | 免运费券 | 免运费，discount_value=0 | 18 |
+
+> 全表 150 行。满减券的值是 `fixed_amount`（**不是** `fixed`）、免邮券是
+> `free_shipping`（**不是** `shipping`）——旧文档两个都写错了，按它筛是空集。
 
 ### status 优惠券状态
-| 值 | 说明 |
-|----|------|
-| active | 可领取、可使用 |
-| inactive | 已下架，不可领取 |
-| exhausted | 已领完 |
+| 值 | 说明 | 实测行数 |
+|----|------|------|
+| active | 可领取、可使用 | 58 |
+| expired | 已过期 | 58 |
+| depleted | 已领完 | 17 |
+| inactive | 已下架，不可领取 | 17 |
+
+> 「已领完」的值是 `depleted`，**不是** `exhausted`；旧文档还漏了 `expired`
+> （占比 39%，是并列最多的一档）。
 
 ### applicable_products JSONB 结构示例
 ```json
@@ -68,7 +75,7 @@ SELECT
     AVG(discount_value) AS avg_discount,
     SUM(total_quota) AS total_issued_quota
 FROM coupons
-WHERE start_date >= '2024-01-01'
+WHERE start_date >= date '2024-01-01'
 GROUP BY coupon_type
 ORDER BY coupon_count DESC;
 ```
@@ -84,7 +91,7 @@ SELECT
     total_quota
 FROM coupons
 WHERE status = 'active'
-  AND end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '7 days'
+  AND end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + interval '7' day
 ORDER BY end_date;
 ```
 
