@@ -1,17 +1,247 @@
 # 部署指南
 
-> **现行架构(v2)**:数据在 **Redshift Serverless**(Data API,HTTPS + IAM),元数据在 **Glue Data Catalog**,应用层是 AgentCore Runtime + S3 知识库 + Fargate /ask 中继 + CloudFront VPC origin(对应 `infra/` 三个 CloudFormation 栈与 `analyticsagent/` 的 `@aws/agentcore` CDK CLI)。v2 改了什么、为什么见 [architecture-v2-redshift-glue.md](architecture-v2-redshift-glue.md);Aurora 已退役,哪些旧路径保留但不再维护见 [legacy.md](legacy.md)。本文的「A. 本地数据库」「C. 云上部署(EC2)」都是 v1 形态,留作参考。
+现行数据层是 **Athena + S3 Tables (Iceberg) + Glue Data Catalog**(v3 湖仓)。
+DDL 在 `database/iceberg/`,建站/装载/对账在 `scripts/lakehouse/`,验收跑
+`bash scripts/test_all.sh`(L0–L6;加 `--l8` 追加 21 个缺陷注入负测)。
+分层含义与**覆盖面缺口**见 [test-plan.md](test-plan.md)。
+
+> **治理层(L4)要单独跑一步才生效**:建完湖仓默认是 Lake Formation admin 全量授权,
+> 也就是**没有列级边界**。跑 `scripts/lakehouse/governance.py --apply` 建 agent 专用角色
+> 并发列级授权,再把 `AGENT_ROLE_ARN` 配给后端——`/health` 的 `identity` 字段是从外面
+> 看它接上没有的唯一处。**在那之前别把真实数据灌进来。**
+>
+> 另外注意这不是"带值级掩码的参考实现":Lake Formation 没有值级掩码原语,PII 列是
+> **不授权**(不可见),不是**掩码**(可见但被替换)。取舍见 `governance.py` 的 docstring。
+
+历史形态:v1 是本地 Docker Postgres,v2 是 Redshift Serverless。**两者都已退役**——
+`database/redshift/`、`scripts/redshift/`、`scripts/glue/` 是死路径,别照着跑。
+v2 的设计与退役原因见 [architecture-v2-redshift-glue.md](architecture-v2-redshift-glue.md),
+其余旧路径见 [legacy.md](legacy.md)。
 
 本项目的几种跑法,按需要选:
 
 | 场景 | 跑什么 | 怎么跑 |
 |------|--------|--------|
-| **B. 本地 Web App(现行)** | Agent SDK + FastAPI + 前端跑在本机,数据连 Redshift Serverless | `backend/run.sh` |
-| **D. 云上部署(AgentCore,现行)** | `infra/` 三栈 + `analyticsagent/` Runtime + Redshift | 见 [PROJECT_STATUS.md](../PROJECT_STATUS.md) 阶段五;前端与元数据快照用 `scripts/deploy/deploy_web.sh` 发布 |
+| **B. 本地 Web App(现行)** | Agent SDK + FastAPI + 前端跑在本机,数据连 **Athena + S3 Tables** | `backend/run.sh` |
 | **A. 本地数据库(v1,legacy)** | 只起容器版 Postgres(35 表、约 19 万行) | `docker compose up -d` |
-| **C. 云上部署(EC2,v1,legacy)** | 部署到你自己的 EC2 + CloudFront | 见下文「云上部署」 |
+| **C. 云上部署(EC2,v1,legacy)** | 部署到你自己的 EC2 + CloudFront | 见下文「C. 云上部署」 |
+| **D. 云上部署(AgentCore)** | Runtime 跑在 AgentCore,数据仍走 Athena + S3 Tables | `cd analyticsagent && agentcore deploy` |
+| **E. 云上前端(AgentCore 版)** | 给 D 配一个能用浏览器登录的入口:CloudFront + Cognito + Fargate 中继 | 见下文「云上前端产生的资源(路径 E)」 |
 
-> **建 Redshift 数据层**(现行路径的前置,只做一次):DDL 在 `database/redshift/`(01 建表 → 02 mart → 03 派生层 → 04 治理),数据用 `scripts/gen/main.py` 生成 Parquet 传 S3、`scripts/redshift/load_from_s3.py` COPY 进仓,最后 `scripts/glue/register_catalog.py` 注册 Glue federated catalog、`scripts/glue/reconcile.py` 对账。workgroup 记得 `base-capacity 4` + 每月 RPU 用量上限(服务默认 128 RPU)。验收跑 `bash scripts/test_all.sh`(见 [test-plan-v2.md](test-plan-v2.md))。
+> **D 的状态**:`analyticsagent/app/analytics/` 原来是 `backend/` 的手工副本(`db.py` 纯 `psycopg`、
+> 退款口径偏低约 4%、提示词还在教错的时间锚点)。现在共享代码是生成物,由
+> `scripts/deploy/sync_agent_code.py` 从 `backend/` 逐字拷来,L0 跑 `--check` 盯着别再分叉。
+> **2026-08-20 首次真部署**,资源清单见下面「AgentCore 部署产生的资源」。
+> 部署前置条件(secret 里的 `AGENT_ROLE_ARN`、知识树上传、`networkMode` 保持 PUBLIC)与
+> 部署后要单独复验的三个数,写在 [analyticsagent/README.md](../analyticsagent/README.md)。
+
+> ⚠️ **`agentcore/cdk/package.json` 里的版本是钉死的,别顺手升**:
+> `aws-cdk-lib` `~2.261.0`、`aws-cdk` `~2.1126.0`。CLI 0.27.1 在 `--yes`(非交互)模式下
+> 遇到高于它测过的版本会**硬报错退出**,而它给的建议是「装最新版 CLI」——那是条死路,
+> 0.27.1 本身就是最新。升 CDK 之前先确认手上的 CLI 版本容忍它。
+
+### 建湖仓数据层(路径 B 的前置,只做一次)
+
+用 `backend/.venv/bin/python`(或任何装了 boto3 的解释器)按顺序跑:
+
+```bash
+python3 scripts/lakehouse/setup.py --verify    # 先只读看一眼现状
+python3 scripts/lakehouse/setup.py             # 建表桶 + namespace + workgroup(幂等)
+
+python3 scripts/lakehouse/gen_ddl.py --check   # 声明态是否跟真源一致
+python3 scripts/lakehouse/athena.py --file database/iceberg/01_tables.sql   # 48 张表
+python3 scripts/lakehouse/load.py              # data/csv/ → Iceberg,35 张基表灌数
+python3 scripts/lakehouse/athena.py --file database/iceberg/02_mart.sql     # 派生/集市层
+
+python3 scripts/lakehouse/verify_load.py       # CSV 真源 ⟷ Athena 现查,逐表比行数/求和
+python3 scripts/lakehouse/reconcile.py --strict   # DDL ⟷ Glue ⟷ 知识库卡片(比表和列)
+python3 scripts/lakehouse/verify_enums.py      # 卡片写的枚举取值 ⟷ 列里实际的值
+python3 scripts/lakehouse/verify_mart_parity.py --numbers   # 集市层口径与基表算的一致
+
+# 治理层(L4)。前两条只读,第三条是这一步唯一会写云的命令。
+python3 scripts/lakehouse/governance.py --selftest        # 离线:策略 ⟷ 验收契约 ⟷ IAM 策略窄度
+python3 scripts/lakehouse/governance.py --verify          # 只读:现在缺什么(角色不存在时 exit 1)
+python3 scripts/lakehouse/governance.py --apply           # 建 IAM 角色 + 发 LF 列级授权(幂等)
+python3 scripts/lakehouse/governance.py --verify          # 再验一遍:以 agent 角色实测 16 条探针
+export AGENT_ROLE_ARN=arn:aws:iam::<账号>:role/analytics-agent-ro   # 或写进 .env.local
+python3 scripts/lakehouse/governance.py --verify-backend  # 后端确实在用这个角色查数
+```
+
+`--apply` 只建不删:给角色打 `Project` 标签,**遇到同名但没这个标签的角色直接拒绝动它**;
+LF 授权只发不撤(LF 权限可叠加,所以多出来的宽授权由 `--verify` 报成漂移,要撤得显式加
+`--revoke-extra`)。跑它的身份必须是 Lake Formation 的 data lake admin,否则发不动授权。
+
+`verify_enums.py` 是上面那条 `reconcile.py` 管不到的那一半:reconcile 比的是表和列,
+卡片写 `status='active'` 而数据里是 `'on_sale'` 时它照样全绿——SQL 语法对、目录对账过、
+**跑出来是空集**,结论直接反过来。所以这两条要一起跑。
+
+`database/0[1-8]_*.sql` 是 DDL 的**唯一真源**,`database/iceberg/01_tables.sql` 由
+`gen_ddl.py` 生成、`--check` 断言逐字节一致——别手改后者。
+`reconcile.py` 的 `--catalog` 默认读 `GLUE_CATALOG_ID`,那个写法**要带账号前缀**
+(`<账号>:s3tablescatalog/<表桶>`),跟 Athena 用的 `s3tablescatalog/<表桶>` 不是一回事,
+见 [knowledge/connection.md](../knowledge/connection.md)。
+云资源名默认 `analytics-agent-tables`(表桶)/ `analytics-agent-wg`(workgroup),
+要改名复制 `.env.local.example` 成 `.env.local` 覆盖。
+
+### AgentCore 部署产生的资源(路径 D)
+
+`agentcore deploy` 走 CDK,所以第一次会先要求 **bootstrap**。标准 bootstrap 的副作用要
+知道再点头:它建一个 `CDKToolkit` 栈、一个 `cdk-hnb659fds-assets-<账号>-<区域>` 桶
+(**桶名里带账号数字,这是 CDK 的固定命名约定,改不掉**——本仓库其他桶都刻意不带,
+这一个是例外)、一个 container-assets ECR 仓库、5 个 IAM 角色,其中 cfn-exec 角色挂的是
+`AdministratorAccess`。这跟最小权限是冲突的;要收紧得用 `--cloudformation-execution-policies`
+指定更窄的策略,代价是每加一类资源就可能要回来补策略。
+
+部署完之后**手工补三样**,少一样就是一个「起得来但答不出数」的 agent:
+
+```bash
+# 1. secret:非敏感坐标(桶名/工作组/目录两种写法/治理角色 ARN/知识桶)
+#    键清单见 analyticsagent/app/analytics/runtime_config.py 的 docstring
+aws secretsmanager create-secret --name analytics-agent/runtime --secret-string '{...}'
+
+# 2. 知识树上传(镜像里没有,冷启动从 S3 拉)
+aws s3 sync knowledge/ s3://<知识桶>/knowledge/ --exclude "*" --include "*.md"
+
+# 3. exec role 的内联策略:读 secret + 读知识桶 + sts:AssumeRole 治理角色。
+#    **刻意不给 athena/glue/s3tables** —— 让 AssumeRole 成为拿到数据的唯一路径,
+#    治理层就不是"可选项"而是入口。exec role 自己零数据面权限。
+#    还要把 exec role 加进 analytics-agent-ro 的信任策略(别覆盖掉原有的开发者 principal)。
+```
+
+⚠️ **exec role 是部署之后才存在的**,所以先起来的那批容器拿不到 secret。补完 IAM
+**旧容器不会自愈**(module 级配置一个容器只跑一次),得让它们换代——重新
+`agentcore deploy` 出一个新版本,或 `update-agent-runtime` bump 版本。
+`agentcore pause` / `resume` 管不到 runtime(只管 online eval 和 A/B test)。
+现在 `runtime_config.py` 对这种情况**硬失败**,那批容器会起不来而不是带着空配置服务;
+排查这类问题要看 CloudWatch 的 **log stream 名字**(一个 microVM 一条流),混着看会
+把不同容器的日志读成同一个。经过见 [analyticsagent/README.md](../analyticsagent/README.md)。
+
+### 云上前端产生的资源(路径 E)
+
+三个 CloudFormation 栈,**必须按序建**,后一个要前一个的输出:
+
+```bash
+R=us-west-2
+# ① foundation:最小 VPC(只为中继)+ Cognito 用户池/客户端 + 中继 ECR 仓库 + 站点桶
+aws cloudformation deploy --region $R --stack-name analytics-agent-foundation \
+  --template-file infra/foundation.yaml
+aws cloudformation describe-stacks --region $R --stack-name analytics-agent-foundation \
+  --query "Stacks[0].Outputs" --output table     # 下面几步的参数都从这里取
+
+# ② 中继镜像:tag = 源码 hash(内容寻址,理由同 AgentCore 镜像),ARM64
+cd functions/ask-relay
+TAG=$(cat Dockerfile package.json server.mjs | shasum -a 256 | cut -c1-16)
+aws ecr get-login-password --region $R | docker login --username AWS --password-stdin <RelayRepositoryUri 的域名部分>
+docker build --platform linux/arm64 -t <RelayRepositoryUri>:$TAG . && docker push <RelayRepositoryUri>:$TAG
+cd ../..
+
+# ③ relay:内网 ALB + Fargate 服务(参数取 ① 的 VpcId/SubnetA/SubnetB + ② 的镜像 + Runtime ARN + Cognito 两项)
+aws cloudformation deploy --region $R --stack-name analytics-agent-relay \
+  --template-file infra/relay.yaml --capabilities CAPABILITY_IAM \
+  --parameter-overrides VpcId=... SubnetA=... SubnetB=... ImageUri=... \
+                        AgentRuntimeArn=... CognitoUserPoolId=... CognitoClientId=...
+
+# ④ edge:CloudFront(S3 OAC 服务静态页 + VPC origin 回源到 ③ 的 ALB)
+aws cloudformation deploy --region $R --stack-name analytics-agent-edge \
+  --template-file infra/edge.yaml \
+  --parameter-overrides SiteBucketName=analytics-agent-site RelayAlbArn=... RelayAlbDomain=...
+
+# ⑤ 发前端(自己去 ① 的输出里取桶名和 Cognito,不用手填)
+bash scripts/deploy/deploy_web.sh
+
+# ⑥ 建登录账号(池里 AllowAdminCreateUserOnly,没有自助注册)
+aws cognito-idp admin-create-user --region $R --user-pool-id <UserPoolId> \
+  --username demo --temporary-password '<12 位以上,含大小写和数字>' --message-action SUPPRESS
+```
+
+⑥ 之后账号是 `FORCE_CHANGE_PASSWORD`:前端的 `newPasswordRequired` 分支会在首次登录时
+要求改密。池里**没配邮件投递**,所以必须 `--message-action SUPPRESS`(不加会因为发不出
+邮件而失败),临时口令只能靠这条命令的执行者带出去。
+
+几处刻意的选择,改之前先读注释:**没有 NAT**(Fargate 任务在有 IGW 路由的子网里带公网 IP
+出网,入站仍只有 ALB;理由与"要改回去得改哪三处"见 `infra/foundation.yaml` 顶部注释 ②)、
+**Runtime 不进这个 VPC**(`networkMode` 是 `PUBLIC`,VPC 纯粹为中继存在,注释 ①)、
+**任务是 ARM64**(便宜约两成且本机原生构建;改架构必须连镜像一起重建,不然是
+`exec format error` 反复重启)、**中继用 `X-Id-Token` 而不是 `Authorization`**
+(CloudFront 的 origin request policy 不许白名单 `Authorization`,见 `infra/edge.yaml`)。
+
+`deploy_web.sh` 每次都从 foundation 栈的输出**现算一份 `config.js`** 再传,不再是
+"桶里手工维护、脚本绕开不动"。那个旧做法的失效模式是静默的:池换了而桶里还是旧 ID,
+页面照常打开、登录框照常在,只有点了登录才报 `ResourceNotFoundException`,而部署脚本全绿。
+生成物落 `$TMPDIR`,**故意不落 `web/config.js`** —— 本地页面靠"这份文件不存在"来
+回退 `/api/config`,它一存在本地就开始拿线上池登录了。
+
+**这条路径按小时花钱**(和只有 D 的时候不同,D 是按调用):ALB 常驻 + Fargate 一个
+0.25vCPU/0.5GB 任务常驻 + 任务那个公网 IPv4 地址 + CloudFront 流量。
+量级参考(us-west-2,以官方定价页为准):ALB 约 $0.0225/小时 ≈ $16/月 + LCU;
+Fargate ARM 约 $0.0099/小时 ≈ $7/月;公网 IP 约 $0.0050/小时 ≈ $3.6/月;
+CloudFront 这种用量基本在永久免费额度内。
+
+**不想计费不必拆栈**,三档:
+
+| 档 | 做什么 | 省掉 | 恢复代价 |
+|---|---|---|---|
+| A | `aws ecs update-service --cluster analytics-agent-relay --service ask-relay --desired-count 0` | Fargate + 公网 IP | 改回 `1`,约 1 分钟(拉镜像 + 健康检查)。域名/密码/前端全不变 |
+| B | 删 `analytics-agent-edge` 与 `analytics-agent-relay` 两个栈,**保留 foundation** | 上面全部 + ALB + CloudFront | 两条 `cloudformation deploy`,十几分钟(大头是 CloudFront 铺开)。⚠️ **CloudFront 域名会变** |
+| C | 连 foundation 一起删 | 剩下的几分钱 | 要重建 Cognito 池 —— **用户和密码一起没了**,站点桶也要重传 |
+
+**B 档下次起服务不用重装任何东西**:镜像还在 ECR、Cognito 池和用户还在、站点桶里的
+`index.html` / `config.js` / `vendor/` 都还在。所以 B 是长期闲置的推荐档,C 只在真的要
+彻底清账号时用 —— 它比 B 多省的钱可以忽略,多付的代价是一整套账号重建。
+
+### 日常开关(档 A,URL 不变)
+
+档 A 的做法是把 `ask-relay` 的 `desiredCount` 降到 0,ALB 和 CloudFront 都留着,
+所以 CloudFront 分发域名**不会变**,下次开机 URL 照旧。
+
+```bash
+R=us-west-2
+# 开(约 1 分钟:拉镜像 + ALB 健康检查转 healthy)
+aws ecs update-service --cluster analytics-agent-relay --service ask-relay \
+  --desired-count 1 --region $R --query "service.desiredCount"
+# 等到 running=1 再去点页面
+aws ecs wait services-stable --cluster analytics-agent-relay --services ask-relay --region $R
+
+# 关
+aws ecs update-service --cluster analytics-agent-relay --service ask-relay \
+  --desired-count 0 --region $R --query "service.desiredCount"
+```
+
+**关着的样子要认得**:站点 `index.html` 照旧 **200**(CloudFront 直接从 S3 出静态页),
+只有 `POST /ask` 变 **503**(ALB 后面没有健康目标)。所以"页面能打开"**不等于**服务开着 ——
+在浏览器上表现为登录进去、一提问就报错。
+
+Runtime(AgentCore)这一侧**不用开关**:它按调用计费,闲置不花钱,`agentcore pause/resume`
+也管不到它(只管 online eval 和 A/B test)。数据层(S3 Tables / Glue / Athena)只有存储和
+按查询的钱,量级是分币。所以"关云上"实际只有上面这一条命令要跑。
+
+### 拆除云资源
+
+**云上前端那条(路径 E)**:按建栈的**反序**删 —— 删 `analytics-agent-edge` 栈
+(CloudFront 分发要先 disable 再 delete,CFN 会自己做,但**耗时十几分钟**)
+→ 删 `analytics-agent-relay` 栈 → 清空并删站点桶 `analytics-agent-site`
+→ 删 ECR 仓库 `analytics-agent-ask-relay` 里的镜像 → 删 `analytics-agent-foundation` 栈。
+⚠️ 顺序反了会卡:edge 还在的时候 relay 的 ALB 被 VPC origin 引用着删不掉;
+站点桶非空时 foundation 栈删不动(`BucketNotEmpty`)。
+Cognito 用户池随 foundation 栈一起删,**里面的用户一并没了**,这是刻意的(demo 账号)。
+
+**AgentCore 那条(路径 D,只在部署过才有)**:删 `AgentCore-analyticsagent-default` 栈
+→ 删 `analytics-agent/runtime` secret → 清空并删知识桶 `analytics-agent-knowledge`
+(**开了版本控制,要删所有版本才删得掉桶**)→ 删 exec role 上的 `lakehouse-runtime-access`
+内联策略 → 把 `analytics-agent-ro` 信任策略里的 exec role 摘掉(**别整份覆盖,开发者
+principal 还在里面**)→ 删 ECR 里的镜像。
+CDK bootstrap 的那套(`CDKToolkit` 栈 + assets 桶 + container-assets ECR + 5 个角色 +
+SSM 版本参数)**是账号级共享的**,这个账号还有别的 CDK 项目就别删。
+
+**湖仓那条**:撤治理层授权(`aws lakeformation revoke-permissions`,principal 是
+`arn:aws:iam::<账号>:role/analytics-agent-ro`;`governance.py --verify` 会列出当前有哪些)
+→ 删那个 IAM 角色(先 `delete-role-policy --policy-name lakehouse-read` 再 `delete-role`)
+→ 删 S3 Tables 表桶 `analytics-agent-tables`(先删表再删 namespace 再删桶)→ 删 Athena
+workgroup `analytics-agent-wg` → 清空并删 Athena 查询结果暂存桶 → 撤掉 Lake Formation
+里给本账号加的授权。**没有 Redshift workgroup 要拆**(v2 遗留说法,已不适用)。
+
+删角色前先把后端的 `AGENT_ROLE_ARN` 清掉,否则它启动时 AssumeRole 失败会直接报错
+(那是刻意的:配了却 assume 不到,静默退回 admin 凭证比报错危险得多)。
 
 ---
 
@@ -47,7 +277,10 @@ docker compose exec db psql -U postgres -d app_analytics -c "SELECT count(*) FRO
 
 ## B. 本地 Web App(现行)
 
-跑那套网页问数(Agent SDK + Bedrock + FastAPI + 前端)。后端默认 `DB_BACKEND=redshift`,经 Data API 连 Redshift Serverless(需要可用的 AWS 凭证;`run.sh` 启动时会 `aws sts get-caller-identity` 自检)。资源名不走默认命名时,复制 `.env.local.example` 成 `.env.local` 覆盖。
+跑那套网页问数(Agent SDK + Bedrock + FastAPI + 前端)。后端默认 `DB_BACKEND=athena`,
+经 Athena 查 S3 Tables 上的 Iceberg 表(需要可用的 AWS 凭证;`run.sh` 启动时会
+`aws sts get-caller-identity` 自检)。资源名不走默认命名时,复制 `.env.local.example`
+成 `.env.local` 覆盖。
 
 ```bash
 cd backend
@@ -55,7 +288,12 @@ cd backend
 # 打开 http://127.0.0.1:8000/
 ```
 
-要走 v1 本地库(legacy):`DB_BACKEND=postgres ./run.sh`,会拉起本机 brew Postgres(端口 5433,`backend/.pgdata`)。
+`run.sh` 的 `.env.local` 加载器会**跳过已在环境里的变量**,所以命令行传的优先:
+`AWS_REGION=us-east-1 ./run.sh` 真的会走 us-east-1。健康检查 `curl :8000/health`
+会回当前 backend、region 和目录名,连错地方一眼能看出来。
+
+要走 v1 本地库(legacy):`DB_BACKEND=postgres ./run.sh`,会拉起本机 brew Postgres
+(端口 5433,`backend/.pgdata`)——需要装了 `postgresql@16`,没装就只能用下面 A 的 Docker 方式。
 
 环境变量、Bedrock 配置、自测命令见 [../backend/README.md](../backend/README.md)。本地默认不开认证(`AUTH_ENABLED` 不设)。
 
@@ -104,9 +342,18 @@ terminate EC2 → 删 SG → 删 instance-profile / role → 删 Cognito 用户�
 
 ## 数据说明
 
-- **时间范围**:静态样本,数据落在 2025-10-26 ~ 2026-01-24。查"最近 N 天"时以表自身时间列的 `max()` 为锚点,**别用 `current_date`/`now()`**。
-- **规模(v2 / Redshift)**:Glue 目录 48 张表,35 张原始表约 8000 万行;v1 本地库是 35 张表、约 19 万行。
-- **重新生成数据(v2)**:`scripts/gen/main.py --target-rows 80000000 --out <目录> --s3 s3://<你的数据桶>/raw/`,再 `scripts/redshift/load_from_s3.py` COPY 进仓;v1 的 CSV 生成器是 `cd scripts && python generate_data.py`。
+- **时间范围**:静态样本,业务日历落在 2025-10-26 ~ 2026-01-24。查"最近 N 天"时统一以
+  `(SELECT max(as_of_date) FROM meta_snapshot)` 为锚点,**别用 `current_date`/`now()`**,
+  也**别用各表自己的 `max(dt)`**(`fin_daily_revenue` 到 2026-02-02,
+  `channel_daily_costs`/`mart_channel_daily` 到 2026-09-01,按各自 max 取窗口会互相错位)。
+- **规模(现行 / 湖仓)**:Glue 目录 **48 张表、约 22 万行**(35 张基表 189,672 +
+  8 张派生 27,982 + 4 张集市 2,432 + 1 张 meta)。数据源是仓库里的 `data/csv/`。
+- **重新灌数**:改完 `data/csv/` 后 `python3 scripts/lakehouse/load.py`,再
+  `verify_load.py` 对账。`scripts/gen/main.py --target-rows 80000000` 那条 8000 万行的
+  生成路径是 v2 留下的,**尚未接到湖仓装载链路上**,当前部署跑的不是它。
+- **这是种子数据,不是真实规模**:25 种事件、15 个页面、6 种流量来源的分布几乎完全均匀,
+  漏斗算不出衰减、热门榜排的是噪声。统计形状不可外推——细节见
+  [data-walkthrough.md](data-walkthrough.md) 铁律三。
 
 ## 常见问题
 
