@@ -1,3 +1,7 @@
+# ⚠️ 本文件是**生成物**，不要手改。
+# 由 scripts/deploy/sync_agent_code.py 从 backend/tools.py 逐字拷来（除本横幅）。
+# 要改请改源文件，再跑 `python3 scripts/deploy/sync_agent_code.py --apply`。
+# L0 会跑 `--check`：两侧不一致就红。
 """Agent 的进程内 MCP 工具：read_doc / run_sql / present_result。
 
 - read_doc：progressive disclosure 的核心——按需读取「数据字典」md 文档树
@@ -17,10 +21,15 @@ from claude_agent_sdk import tool, create_sdk_mcp_server
 import db
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# 数据字典文档根。AgentCore-native 形态下**不再打进镜像**：容器冷启动时由
-# knowledge_store.sync_down() 从 S3 同步到 KNOWLEDGE_DIR，read_doc 读这个本地缓存。
-# 默认 /app/knowledge（Dockerfile 已创建并 chown 给运行用户）。
-DOCS_ROOT = os.path.normpath(os.environ.get("KNOWLEDGE_DIR", "/app/knowledge"))
+# 数据字典文档根。两种布局，一个变量搞定：
+#   · 本仓库 / backend 镜像：顶层 knowledge/，与 backend/ 同级（Dockerfile COPY 进 /app/knowledge）。
+#   · AgentCore Runtime：知识树**不烤进镜像**，冷启动时 knowledge_store.sync_down() 从 S3
+#     拉到 KNOWLEDGE_DIR（默认 /app/knowledge），read_doc 读这份本地缓存。
+# 之前这两种写法是**两份 tools.py 各写一行**，于是这个文件成了"只差一行但必须手工同步"的
+# 副本，其余 170 行的改动全靠人记得拷过去。改成读 env 之后两侧逐字相同，
+# scripts/deploy/sync_agent_code.py 才管得住它。
+DOCS_ROOT = os.path.normpath(
+    os.environ.get("KNOWLEDGE_DIR") or os.path.join(HERE, "..", "knowledge"))
 
 
 @tool(
