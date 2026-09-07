@@ -16,86 +16,126 @@
 | ip_address | VARCHAR(45) | IP地址 |
 | created_at | TIMESTAMP | 记录创建时间 |
 
+> ⚠️ **`session_id` 只对 22 种"泛化"事件成立；三种保底事件的 `session_id` 是错的。**
+> `purchase`（647,395）/ `use_coupon`（324,620）/ `register`（213,535）这 118.6 万行
+> 挂的是该用户的**首个会话**，而 `event_time` 取的是订单时刻或注册时刻，
+> 两者可以差到 **90 天**。实测（2026-09-01，全表 854.1 万行）：
+> **118.4 万行（13.9%）的 `event_time` 落在自己 `session_id` 的
+> `[start_time, start_time+duration]` 窗口外**，108.6 万行（12.7%）甚至不在同一天。
+>
+> 由此产生两条纪律：
+> - **不要按 `session_id` 归因这三种事件**（"哪个渠道的会话促成了下单"这类问题，
+>   走 `orders` / `user_attributions`，别走 `events.session_id`）。会话级的
+>   `event_count` 本身是从这份归属回填的，所以计数对得上、时间对不上。
+> - **按天做行为分析时，`events` 的活跃天数比 `sessions` 多**：窗首那批用户人均
+>   事件天数 14.5 天 vs 会话天数 5.1 天，因为订单铺满了整段在库时长。留存题受这条
+>   影响最大，见 `analysis/retention_curve.md` 顶部那张两口径对照表。
+>
+> `page_views` 没有这个问题（全部挂在自己会话的窗口内，L5 `pv_in_session` 判据
+> 通过线是 0 行）。同一条性质在 `events` 侧**当前没有判据**——这是已登记的缺口，
+> 清除条件是下一次全量重灌。
+
 ## 字段枚举值
 
 ### event_name 事件名称（全 25 种，实测）
-| 值 | 说明 | 所属分类 | 实测行数 |
-|----|------|----------|------|
-| begin_checkout | 发起结算 | conversion | 866 |
-| register | 用户注册 | acquisition | 843 |
-| add_to_cart | 加入购物车 | conversion | 838 |
-| view_profile | 查看个人主页 | engagement | 825 |
-| view_post | 查看帖子 | engagement | 824 |
-| view_product | 商品浏览 | engagement | 823 |
-| receive_push | 收到推送 | engagement | 822 |
-| share | 分享 | retention | 820 |
-| view_home | 浏览首页 | engagement | 807 |
-| use_coupon | 使用优惠券 | conversion | 804 |
-| search | 搜索 | engagement | 804 |
-| app_close | APP 关闭 | retention | 804 |
-| comment_post | 评论帖子 | social | 803 |
-| remove_from_cart | 移出购物车 | engagement | 800 |
-| like_post | 点赞帖子 | social | 796 |
-| add_favorite | 加收藏 | engagement | 796 |
-| edit_profile | 编辑资料 | engagement | 791 |
-| click_banner | 点击 banner | engagement | 788 |
-| logout | 用户登出 | retention | 784 |
-| login | 用户登录 | retention | 784 |
-| follow_user | 关注用户 | social | 780 |
-| purchase | 完成购买 | conversion | 772 |
-| app_open | APP 打开 | retention | 752 |
-| view_category | 浏览分类页 | engagement | 738 |
-| click_push | 点击推送 | engagement | 736 |
+| 值 | 说明 | 所属分类 | 实测行数 | 占比 |
+|----|------|----------|------|------|
+| view_home | 浏览首页 | engagement | 1,393,869 | 16.32% |
+| view_product | 商品浏览 | engagement | 1,140,840 | 13.36% |
+| add_to_cart | 加入购物车 | conversion | 928,350 | 10.87% |
+| app_open | APP 打开 | retention | 857,348 | 10.04% |
+| begin_checkout | 发起结算 | conversion | 750,188 | 8.78% |
+| purchase | 完成购买 | conversion | 647,395 | 7.58% |
+| app_close | APP 关闭 | retention | 608,208 | 7.12% |
+| use_coupon | 使用优惠券 | conversion | 324,620 | 3.80% |
+| view_post | 查看帖子 | engagement | 285,779 | 3.35% |
+| login | 用户登录 | retention | 250,211 | 2.93% |
+| register | 用户注册 | acquisition | 213,535 | 2.50% |
+| search | 搜索 | engagement | 213,505 | 2.50% |
+| view_category | 浏览分类页 | engagement | 185,040 | 2.17% |
+| logout | 用户登出 | retention | 157,428 | 1.84% |
+| like_post | 点赞帖子 | social | 142,833 | 1.67% |
+| receive_push | 收到推送 | engagement | 113,872 | 1.33% |
+| add_favorite | 加收藏 | engagement | 71,004 | 0.83% |
+| click_banner | 点击 banner | engagement | 57,327 | 0.67% |
+| remove_from_cart | 移出购物车 | engagement | 49,700 | 0.58% |
+| comment_post | 评论帖子 | social | 42,929 | 0.50% |
+| view_profile | 查看个人主页 | engagement | 35,742 | 0.42% |
+| share | 分享 | retention | 28,765 | 0.34% |
+| follow_user | 关注用户 | social | 21,610 | 0.25% |
+| click_push | 点击推送 | engagement | 14,248 | 0.17% |
+| edit_profile | 编辑资料 | engagement | 7,054 | 0.08% |
 
 > ⚠️ **旧文档里这几个名字数据里根本不存在**，照着写 WHERE 就是空集：
 > `product_view`（真名 `view_product`）、`checkout`（真名 `begin_checkout`）、
 > `registration`（真名 `register`）、`app_install`、`first_open`、`button_click`。
 >
-> 全表 20,000 行、25 种事件，**分布几乎是均匀的**（736–866，最高/最低 = 1.18）。
+> 全表 8,541,400 行、25 种事件，**分布是漏斗形的**：头部 `view_home` 16.32%，
+> 尾部 `edit_profile` 0.08%，最高/最低 = 197.6 倍。上面的行数是 2026-09-01 那一版
+> 全量数据的实测值；重灌会等比例变化，**占比那一列才是稳定的**，写结论时优先引占比。
+>
+> 有三种事件的行数是**按定义等于另一张表的**，可以拿来做跨表自检：
+> `register` = `users` 行数（213,535，每个用户恰好一条）、
+> `purchase` = 有效订单数（647,395，`orders.status IN ('paid','shipped','delivered')`）、
+> `use_coupon` = `user_coupons` 里 `status = 'used'` 的行数（324,620）。
+> 这三条对不上就是装载漏了分区，不是业务波动。
 >
 > ⚠️ **上面这张是「每种事件各数一遍」的行数表，它不是漏斗，也不能用来判断漏斗衰不衰减。**
 > 漏斗要求第 i+1 步的用户集是第 i 步的**子集**（见下面「购买漏斗转化分析」的写法）。
-> 把每步各数一遍排在一起，会得到 `394/385/396/373` 这种「结算人数比浏览人数还多」的
-> 东西——那只说明口径错了，**不说明数据没有漏斗形态**。同一份数据按子集口径算是
-> `394 → 314 → 258 → 199`（全量去重用户），逐层流失 20%/18%/23%，单调递减、很正常。
-> 所以**不要**写「这份种子数据均匀分布，所以转化率不衰减／别当业务结论」——
-> 这句话本身就是把自己的口径错误归因给了数据。
->
-> `purchase` 事件数(772)**不等于**有效订单数(1,601)，两者是各自独立生成的，
-> 跨表核对请用 `dwd_orders_valid`。
+> 按「每步各数一遍」的去重人数排出来是 `92,800 / 87,737 / 82,447 / 98,745`（近 30 天），
+> 这种「购买人数比浏览人数还多」的东西只说明口径错了，**不说明数据没有漏斗形态**。
+> 同一个窗口按子集口径算是 `92,800 → 75,676 → 63,781 → 24,052`，逐层留存
+> 81.5%/84.3%/37.7%，单调递减、很正常。所以**不要**写「这份种子数据分布均匀，
+> 所以转化率不衰减／别当业务结论」——这句话本身就是把自己的口径错误归因给了数据。
 
 ### properties 事件属性（实测形状）
 
 ⚠️ **25 种事件里只有 4 种带属性，其余 21 种全是 `{}`**（空 JSON，不是 NULL）。
 所以「按属性下钻」这条路在这份数据上只有下面 4 个事件走得通：
 
-**view_product 商品浏览事件**（823 行）
+**view_product 商品浏览事件**（1,140,840 行）
 ```json
-{"product_id": 143, "product_name": "经典戴森 洗衣机"}
+{"product_id": 1822, "product_name": "富安娜 毛巾 双人款"}
 ```
 
-**add_to_cart 加购事件**（838 行）
+`product_id` 接得回 `products`，`product_name` 就是该 `product_id` 在 `products` 里的名字，
+所以「按属性里的名字分组」和「JOIN `products` 再分组」给出同一个答案，用哪个都行
+（属性里的那个省一次 JOIN）。
+
+**add_to_cart 加购事件**（928,350 行）
 ```json
-{"quantity": 1, "product_id": 143}
+{"quantity": 2, "product_id": 3089}
 ```
 
-**purchase 购买事件**（772 行）
+`quantity` 只有 1 / 2 / 3 三个值，分布基本均匀。`product_id` 同样接得回 `products`，
+但这里**没有** `product_name`——要商品名得自己 JOIN。
+
+**purchase 购买事件**（647,395 行）
 ```json
-{"amount": 1820.29, "order_id": 43811}
+{"amount": 1236.58, "order_id": 2}
 ```
 
-**search 搜索事件**（804 行）
+**search 搜索事件**（213,505 行）
 ```json
-{"keyword": "手机"}
+{"keyword": "海鲜"}
 ```
 
 只有 `keyword` 一个键，**没有** `result_count` / `filter_applied`（旧文档写过）——
 按它们取值会得到整列 NULL，`AVG()` 出来是 NULL 而不是 0。
+词池就是 `categories` 的 120 个叶子类目名（不是自由文本），213,505 次搜索把 120 个词
+全都覆盖到了，热度是长尾：头部 `腮红` 3.84%、第十位 `燃气灶` 1.99%、头尾差约 13 倍。
+所以「搜索词 TOP N 里哪些类目缺货」这类问题可以直接把 `keyword` 和
+`categories.category_name` 对上，不会出现站内不存在的词。
 
-> ⚠️ **`purchase.properties.order_id` 接不上 `orders.order_id`**：772 个 purchase 事件
-> 按这个键去 JOIN `orders`，**匹配到 0 行**。这一列是独立生成的小整数（例如 43811），
-> 而 `orders.order_id` 是 12 位数（例如 105575697563）。这不是声明的外键，DDL 里也没约束，
-> 所以查询不报错、只是静默返回空——**要把行为和交易关联起来，走 `user_id`，不要走这个 order_id**。
+> ✅ **`purchase.properties.order_id` 是接得上 `orders.order_id` 的真外键**：647,395 个
+> purchase 事件的单号互不重复，逐个命中 `orders` 里状态为 `paid`/`shipped`/`delivered`
+> 的那 647,395 单，一一对应、无落空。并且 `properties.amount` 逐条等于该单的
+> `orders.actual_amount`（精确到分），所以「按事件属性求 GMV」和「按 `orders` 求 GMV」
+> 结果相同（全量 151,333,127.30）。要把行为和交易关联起来，这个键和 `user_id` 都能走；
+> 需要单粒度（订单金额、下单商品）就走 `order_id`。
+>
+> 这一条 2026-09-01 反过来了：在此之前 `order_id` 是一列独立生成的随机数，JOIN 匹配 0 行，
+> 卡片这里原本写着「接不上、请走 user_id」。旧结论现在是错的。
 
 其余 21 种事件（`app_open` / `login` / `click_banner` / `like_post` / `use_coupon` …）
 的 `properties` 都是 `{}`：能算触发次数和触发人数，但没有可下钻的维度。
@@ -143,7 +183,8 @@ SELECT (SELECT count(*) FROM s1) AS step1_view,
        (SELECT count(*) FROM s4) AS step4_purchase
 ```
 
-实测：全量 `394 → 314 → 258 → 199`（整体 50.5%），近 30 天 `197 → 101 → 58 → 32`。
+实测：全量 `177,644 → 151,924 → 131,677 → 77,681`（整体 43.7%），
+近 30 天 `92,800 → 75,676 → 63,781 → 24,052`（整体 25.9%）。
 两个都是合法口径，**必须在 method 里写明算的是哪一个**。
 要按天/渠道切分，把维度带进 `w` 并**在每个维度内部**保持子集约束——
 不要先 `GROUP BY date` 再各步分别计数，那样又退回独立计数了。

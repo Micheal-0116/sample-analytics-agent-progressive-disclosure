@@ -413,11 +413,18 @@ def check_metric_layer(c) -> int:
          第 1 条单独存在时，把整个指标改成恒返回 NULL 也能通过。
       3. cac/roi 的**全量**值 ≡ 只算业务日历轴内的值（clamp_to_anchor 生效）。
          成本表铺到 2026-09-01、归因止于 2026-01-24，不 clamp 就是拿轴外的成本
-         除轴内的人：实测「哪个渠道获客成本最低」被答成"微博KOL 938 元/人最低"，
-         而那个渠道轴内一分钱没花（成本行全在 2026-05-01~05-09）。
-      4. refund_amount 的全量值 **≠** 它的轴内值 —— 反向钉住 clamp 不是全局规则。
-         退款轴外那 9 天是轴内订单真实产生的退款，一起 clamp 掉就退回 925471.33
-         那个已修掉的 bug。这条红了说明有人把 clamp 提成了全局开关。
+         除轴内的人：全量成本 435.2 万 / 轴内 307.7 万，CAC 被从 17.07 抬到 58.25
+         （3.41 倍）。**这份数据上排名不变**——成本在轴内外的分布对九个有投放的渠道
+         几乎同比例——错的是量级，而量级正是拿去和客单价 118 元比的那个东西。
+         旧数据集里连排名都是反的（「哪个渠道获客成本最低」被答成"微博KOL 938 元/人
+         最低"，而它轴内一分钱没花，成本行全在 2026-05-01~05-09），那是这条当初的由来。
+      4. refund_amount 取自 fin_daily_revenue 而不是 mart_daily_kpi —— 反向钉住
+         clamp 不是全局规则。**2026-09-01 重灌后两个源恰好相等（都是 9,897,495.82）**：
+         生成器把订单生命周期时间戳全截在 as_of_date 内，退款轴和订单轴同止于
+         2026-01-24，没有退款落在 mart_daily_kpi 的轴外。所以这条现在只能校验
+         **取数源**、校验不了数值差额（旧数据集上退款轴比订单轴长 9 天，
+         那 9 天值 38,089.59，换源就退回 925471.33 那个 bug）。少的是能暴露差额的
+         数据，不是缺陷本身——所以这条判据留着，别因为两边相等就把源换回 mart。
     """
     sys.path.append(os.path.join(ROOT, "backend"))
     from metric_layer import compile_metric
@@ -471,8 +478,21 @@ def check_metric_layer(c) -> int:
          f"SELECT CAST(sum(refund_amount) AS decimal(20,2)) "
          f"FROM fin_daily_revenue WHERE {IN_AXIS}"),
     ]
+    # 先钉**编译产物**里 clamp 谓词的有无，再比数值。两步分开是 2026-09-01 的教训：
+    # 只比数值时，「轴外没有数据」和「clamp 把轴外砍了」给出同一个结果，而这一条判据
+    # 会把前者报成后者。新生成器的 `refunded_at` 不越过 as_of_date（`as_of_date` =
+    # max(mart_daily_kpi.dt)，两边同一天收尾），于是退款那条的数值比对当场失去区分力，
+    # 报出来的却是「已修掉的那个偏低 4% 的 bug 回来了」——结论和事实相反。
+    # 谓词那一步不依赖数据形状，是这三条真正想问的东西：clamp 是按指标声明的，不是全局开关。
     for name, metric, want_equal, rhs in clamp_cases:
         lhs = compile_metric(metric, time_window="all")["sql"]
+        has_clamp = IN_AXIS.lower() in " ".join(lhs.lower().split())
+        if has_clamp != want_equal:
+            what = "该带 clamp 却没带" if want_equal else "不该带 clamp 却带上了"
+            print(f"  ❌ {metric} 的编译 SQL {what}\n        {lhs}")
+            bad += 1
+            continue
+        print(f"  ✅ {('编译 SQL 里 clamp 谓词' + ('在' if want_equal else '不在')):<48} {metric}")
         try:
             a = c.execute(lhs, timeout=600)["rows"][0][0]
             b = c.execute(rhs, timeout=600)["rows"][0][0]
@@ -489,9 +509,12 @@ def check_metric_layer(c) -> int:
                   f"\n        clamp_to_anchor 没生效：轴外成本没有归因可配，会静默给错数")
             bad += 1
         else:
-            print(f"  ❌ {name:<48} 全量 {a} 竟等于轴内值"
-                  f"\n        退款尾巴被 clamp 掉了 —— 这正是已修掉的那个偏低 4% 的 bug")
-            bad += 1
+            # 走到这里只剩一种可能：上面那步已经确认编译 SQL 里没有 clamp，所以两值相等
+            # 只能是数据里根本没有轴外的量。判据在这批数据上无区分力，说清楚，别判红也
+            # 别假装绿——恢复区分力的条件是数据里出现越过 as_of_date 的退款。
+            print(f"  ⚠️  {name:<48} 全量 {a} == 轴内 {b}")
+            print(f"        这批数据里没有越过 as_of_date 的 {metric}，数值比对无区分力。")
+            print(f"        clamp 的有无已由上一条（编译 SQL 里没有 {IN_AXIS}）钉住。")
     return bad
 
 

@@ -4,6 +4,16 @@
 SQL，贴的输出全部抄自实跑结果（2026-08-19，在 S3 Tables + Athena 上重跑，**当时湖里装的是
 仓库里那份约 22 万行的种子数据**）。
 
+> **数据批次说明（2026-09-01）**：正文里的每个数字都来自 `data/csv/` 那批种子数据
+> （约 22 万行）。**线上现在装的不是这批**——2026-08-31 用新生成器全量重灌，
+> 云上是 **79,943,758 行**（scale 427.07 / seed 42 / 业务轴止 2026-01-24，
+> 记录在 `data/loaded_row_counts.json`）。**结构性结论仍然成立**（表关系、口径陷阱、
+> 反例清单、三条铁律），**具体行数和金额全部作废**，别拿正文的数字去对线上查询结果。
+> 当前数字的真源是 `knowledge/domains/**` 的卡片；这份文档留着是因为它讲的是
+> 「怎么把一个库读明白」，那套读法换批数据也一样用。另有几处重灌后被推翻的规律
+> （地址列从整列 NULL 变成单一假常量、取消/退款原因各只剩一个取值、
+> `channel_daily_costs` 的轴伸到业务锚点之后）记在对应卡片和 `docs/test-plan.md` 里。
+>
 > **重跑说明**：这份文档最初写在 v2 的 8000 万行放大数据集上。v3 湖仓化之后装载的是
 > 仓库里提交的 `data/csv/` 种子数据（约 22 万行），**不是同一批数据**——不只是数字变小，
 > 原文里好几条写成「恒成立」的规律在种子数据上并不成立（首事件早于注册、计数器回填、
@@ -27,7 +37,7 @@ SQL，贴的输出全部抄自实跑结果（2026-08-19，在 S3 Tables + Athena
 所有查询走 Athena（S3 Tables / Iceberg），客户端封装在 `scripts/lakehouse/athena.py`：
 
 ```bash
-cd ~/Desktop/sample-analytics-agent-progressive-disclosure
+cd ~/Documents/sample-analytics-agent-progressive-disclosure
 AWS_REGION=us-west-2 backend/.venv/bin/python - <<'PY'
 import sys; sys.path.insert(0, "scripts/lakehouse")
 from athena import Client

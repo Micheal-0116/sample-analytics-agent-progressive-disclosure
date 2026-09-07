@@ -337,6 +337,100 @@ def combine(rng: np.random.Generator, n: int, *pools: np.ndarray) -> np.ndarray:
     return out
 
 
+# 后缀数字的空间：4 位数 1000~9999。STRIDE 是素数且不整除 SPAN=9000（=2³·3²·5³），
+# 于是「组内序次 ↦ 数字」在一组内是单射——唯一性靠这条，不靠随机不撞。
+_SUF_LO, _SUF_SPAN, _SUF_STRIDE, _SUF_SKEW = 1000, 9000, 7919, 4093
+
+
+def _group_rank(vals: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """→ (每行在「同值组」内的序次, 组号)。序次 0 给组内行号最小的那行。
+
+    实现是一次稳定排序 + 相邻比较，O(n log n)、无 Python 循环：`users` 在 8000 万
+    规模上是 21 万行，逐行 dict 计数也跑得动，但这个函数是给"任何列"用的。
+    """
+    n = len(vals)
+    if n == 0:
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
+    order = np.argsort(vals, kind="stable")        # stable ⇒ 组内保持行号升序
+    srt = vals[order]
+    head = np.empty(n, dtype=bool)
+    head[0] = True
+    head[1:] = srt[1:] != srt[:-1]
+    idx = np.arange(n)
+    rank, gid = np.empty(n, dtype=np.int64), np.empty(n, dtype=np.int64)
+    rank[order] = idx - np.maximum.accumulate(np.where(head, idx, 0))
+    gid[order] = np.cumsum(head) - 1
+    return rank, gid
+
+
+def combine_unique(rng: np.random.Generator, n: int, *pools: np.ndarray,
+                   sep: str = "_") -> np.ndarray:
+    """组合式词池 + 「先到先得」数字后缀，产出**全列唯一**的字符串。
+
+    `combine` 的基数是各池之积，多样性够，但**不保证唯一**：n 行落进 M 种组合，
+    期望撞掉的行数约 n²/2M。users 在 scale 427 上是 213,500 行落进 24,576 种昵称
+    组合，88.5% 的行与别人同名；邮箱本地部分只有 6,000 种，72.7%（P1-6/7）。
+    真实系统在注册那一刻就查重，所以「9 个用户叫同一个名字」是一眼可见的假数据，
+    而且 `COUNT(DISTINCT username)` 会比用户数少一大截。
+
+    机制照抄真实注册流程：**先到先得**。同一个组合里 user_id 最小的那个人拿干净的
+    名字（`小鱼干88`），后来的人在后面接一串四位数（`小鱼干88_2049`）——这正是国内
+    社交平台昵称的实际形态。数字由组内序次经乘性置换得到，不是随机抽的，所以
+    「组内不撞」是算术保证；跨组不撞则由最后那道 np.unique 兜住（词池里带 `_`
+    的尾巴让前缀切分不再显然，不适合靠手工推导）。
+
+    调用方必须整列一次算完——唯一性是全列的性质，分块抽拼不出来。
+    """
+    base = combine(rng, n, *pools)
+    if n == 0:
+        return base
+    rank, gid = _group_rank(base)
+    top = int(rank.max())
+    if top >= _SUF_SPAN:
+        raise ValueError(
+            f"combine_unique：最大同名组有 {top + 1} 行，超出四位后缀的 {_SUF_SPAN} 个"
+            f"取值，唯一性无法保证。要么扩词池（当前 {len(base)} 行 / "
+            f"{len(np.unique(base))} 种组合），要么改宽后缀")
+    num = _SUF_LO + ((rank - 1) * _SUF_STRIDE + gid * _SUF_SKEW) % _SUF_SPAN
+    suffixed = np.char.add(base, np.char.add(sep, num.astype("U4")))
+    out = np.where(rank == 0, base, suffixed)
+    if len(np.unique(out)) != n:
+        raise ValueError(
+            f"combine_unique：加完后缀仍有 {n - len(np.unique(out))} 行重复。"
+            f"词池里某个尾巴与分隔符 {sep!r} 撞出了同一个串，换分隔符或改词池")
+    return out
+
+
+def unique_digits(rng: np.random.Generator, n: int, prefixes: np.ndarray,
+                  width: int) -> np.ndarray:
+    """前缀池 + 定宽数字尾，**全列唯一**（碰撞重抽）。
+
+    手机号这类列不能走 `combine_unique`：加后缀会破坏 11 位定长，`^1[3-9]\\d{9}$`
+    立刻不合规。所以改成抽完查重、只把撞了的那几行重抽。号段 40 × 10⁸ 的空间对
+    21 万行来说期望撞 6 行左右，一两轮收敛；空间不够时抛错而不是死转。
+    """
+    space = len(prefixes) * 10 ** width
+    if n > space:
+        raise ValueError(f"unique_digits：{n} 行放不进 {len(prefixes)} × 10^{width} "
+                         f"= {space} 的空间")
+    hi = 10 ** width - 1
+
+    def draw(k: int) -> np.ndarray:
+        seg = np.asarray(from_pool(rng, k, prefixes), dtype=str)
+        tail = np.char.zfill(int_uniform(rng, k, 0, hi).astype(f"U{width}"), width)
+        return np.char.add(seg, tail)
+
+    out = draw(n)
+    for _ in range(64):
+        _, first = np.unique(out, return_index=True)
+        if len(first) == n:
+            return out
+        dup = np.setdiff1d(np.arange(n), first)   # 每组留第一行，其余重抽
+        out[dup] = draw(len(dup))
+    raise ValueError(f"unique_digits：重抽 64 轮后仍有 {n - len(np.unique(out))} 行重复，"
+                     f"空间 {space} 对 {n} 行太挤")
+
+
 _HEX = np.array(list("0123456789abcdef"), dtype="U1")
 
 

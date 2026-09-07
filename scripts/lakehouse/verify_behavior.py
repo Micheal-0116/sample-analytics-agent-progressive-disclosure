@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""L5 分布真实性 · 四张行为大表：`post_likes` / `page_views` / `user_follows` / `push_notifications`。
+"""L5 分布真实性 · 行为大表：`post_likes` / `page_views` / `user_follows` /
+`push_notifications`，外加 `events` 的一条窗口判据（2026-09-01 加，理由见 `ev_in_session`）。
 
 ## 为什么要单独有这一组
 
@@ -134,7 +135,15 @@ Poisson(μ)，μ = 子行总数 / 父行数，于是
 各只在一侧绿）。**这 4 条要留着**：它们是本文件里唯一「现有数据这件事做对了」的正向
 结论，删掉就没人证明它还成立。
 
-`--selftest` 不依赖上面这张表，它用构造夹具把「有区分力」对 27 条逐一钉住：同一条判据，
+**上面这张表是 2026-08 的实测，判据当时是 27 条。2026-09-01 加了第 28 条**
+（`events` 的 `ev_in_session`），加它的理由不是又发现一个缺陷，而是**覆盖的不对称**：
+同一条「子行时刻必须落在父会话窗口内」的性质，在 `page_views` 上是通过线为 0 的硬闸
+（上表倒数第 11 行），在 `events` 上零覆盖——而 `events` 全量 854 万行，比 `page_views`
+大得多，且是留存 / 漏斗 / 活跃这几类分析的活跃源。实测越界 13.86%，其中 99.996%
+来自三种保底事件；细节写在 `TH["ev_in_session"]` 里。**教训是**：报告全绿只说明
+「登记在案的那些性质成立」，一条性质在 A 表上有闸不等于在 B 表上也有。
+
+`--selftest` 不依赖上面这张表，它用构造夹具把「有区分力」对每一条逐一钉住：同一条判据，
 均匀夹具必须红、重尾夹具必须绿，两侧都验（只验一侧证明不了判据有方向）。
 
 **两条路跑出来的 27 个结论逐位相同**（不带 `--from-csv` 查 Athena vs `--from-csv
@@ -146,9 +155,14 @@ CSV ⟷ Athena 等值是 `verify_load.py` 的事，不在这里重复。
 ## 不接进 scripts/test_all.sh
 
 同 `verify_literals.py` / `verify_semantics.py` / `verify_resolution.py` /
-`verify_correlation.py`：现行库不会重灌（决定已定），本文件对它跑必然一片红，而默认
-流程里挂一盏永远红的灯，等于把所有人训练成无视红灯。只有 `--selftest` 那一支
-（不连云、不读库、纯判据）挂在 L0 上。
+`verify_correlation.py`：本文件对现行库跑必然一片红，而默认流程里挂一盏永远红的灯，
+等于把所有人训练成无视红灯。只有 `--selftest` 那一支（不连云、不读库、纯判据）挂在 L0 上。
+
+**这一段原来的理由是「现行库不会重灌（决定已定）」，2026-08-31 那个决定被推翻了**
+（为架构对比测试全量重灌了 7,994 万行）。理由换成上面那一句而**结论不变**：重灌换掉的是
+分布形状那一批红，不是全部——`ev_in_session` 这条现在必红，成因在生成器，
+只有下一次重新生成才可能变绿。把这类判据接进闸门，等于让一个已知且已登记的缺陷
+天天挡住所有人的路。
 
 ## 顺带发现（本批只加检查，一律不修，记录在此）
 
@@ -349,6 +363,28 @@ TH: dict[str, Th] = {
         就不可能发生在这个会话之外。现行库 1,508 行越界（5.0%），意味着任何「会话内
         路径 / 页面停留序列」查询（page_views.md 里就有一条这样的示例 SQL）会把
         窗口外的行也算进去。"""),
+    # ---------------- events ----------------
+    "ev_in_session": Th(0.0, """
+        `events.event_time` 必须落在 `session_id` 所指会话的
+        [start_time, start_time+duration] 窗口内（放 1 秒容差），违规 0 行。
+        与上面 `pv_in_session` 是**同一条**定义性判据，只是换成 events——加它的理由就是
+        这个不对称：同一条性质在 page_views 上是通过线为 0 的硬闸，在旁边那张大得多的
+        events 上此前**零覆盖**，而报告上两张表都是绿的。2026-09-01 实测 854.1 万行里
+        118.4 万行越界（13.9%，41.1 万早于会话开始 / 77.2 万晚于结束），108.6 万行
+        （12.7%）连日期都不同天，最大偏差 90 天。成因在生成器：`purchase` /
+        `use_coupon` / `register` 三种保底事件被挂到用户的**首个会话**，时刻却取
+        `orders.placed_at` / 注册时刻（`tables.py` 的 `res_sess.append(first_sess[...])`）。
+        后果不止「关联不上」：事件口径的活跃天数因此随账龄增长（数据窗首那批人均
+        14.5 天 vs 腹地 8.3 天，而两者的会话口径都是 5 天左右），于是按 events 分
+        cohort 时窗首 D1 虚高约 21pp，按 sessions 分则看不出这个边缘。
+        **越界几乎全部就是这三种**：实测 1,183,518 行越界里 1,183,472 行来自
+        purchase (647,230/647,395) + use_coupon (322,707/324,620) + register
+        (213,535/213,535)，22 种通用事件合计只有 **46 行**（view_product 10、app_open 8、
+        …）。所以这条判据按 event_name 分组报——它要区分的正是「全表的毛病」和
+        「三种事件的毛病」，而两者的修法完全不同。顺带：v1 种子数据（`data/csv`）
+        在这条上也红，但成因不同（274/20,000 = 1.37%，均匀散在通用事件上），
+        所以这不是一条「只对新生成器红」的灯。**当前必红，清除条件是下一次全量重灌**
+        （修生成器只能在重新生成时生效）。"""),
     # ---------------- push_notifications ----------------
     "push_funnel": Th(0, """
         推送漏斗必须逐级收窄且嵌套：总数 ≥ 送达 ≥ 打开，且「打开但未送达」= 0，
@@ -534,6 +570,13 @@ class Facts:
     dwell_scroll: tuple = (0, 0.0, 0.0, 0.0, 0.0, 0.0)
     pv_session_checkable: int = 0
     pv_out_of_session: int = 0
+    # events
+    ev_total: int = 0
+    ev_session_checkable: int = 0
+    ev_out_of_session: int = 0
+    # event_name -> (可判行数, 越界行数)。分名字存是因为越界**不是均匀分布**在事件上的：
+    # 三种保底事件占了几乎全部越界量，只报一个总比例会让人以为要全表重造。
+    ev_oob_by_name: dict = field(default_factory=dict)
     # push_notifications
     push_total: int = 0
     push_delivered: int = 0
@@ -734,6 +777,21 @@ def judge_pv_in_session(f: Facts) -> tuple[str, str]:
                f"窗口 = [start_time, start_time+duration]，1s 容差）")
 
 
+def judge_ev_in_session(f: Facts) -> tuple[str, str]:
+    if f.ev_session_checkable == 0:
+        return "NOINPUT", "没有能关联到会话的事件行"
+    v = "PASS" if f.ev_out_of_session <= 0 else "FAIL"
+    rate = f.ev_out_of_session / f.ev_session_checkable
+    # 越界最多的三个名字带上去：这条红了以后第一件要知道的事就是「是全表的毛病，还是
+    # 某几种事件的毛病」，而这两种情况的修法完全不同。
+    worst = sorted(((oob, name, ck) for name, (ck, oob) in f.ev_oob_by_name.items() if oob),
+                   reverse=True)[:3]
+    detail = "；".join(f"{name} {oob}/{ck}" for oob, name, ck in worst) or "无"
+    return v, (f"event_time 落在会话窗口外 {f.ev_out_of_session}/{f.ev_session_checkable} 行"
+               f" = {rate:.2%}（通过线 0 行，窗口 = [start_time, start_time+duration]，"
+               f"1s 容差）；越界最多：{detail}")
+
+
 def judge_push_funnel(f: Facts) -> tuple[str, str]:
     if f.push_total == 0:
         return "NOINPUT", "没有推送行"
@@ -844,6 +902,7 @@ CHECKS: list[tuple[str, str, str, object]] = [
     ("page_views", "停留时长与滚动深度正相关", "pv_dwell_scroll_corr",
      judge_pv_dwell_scroll_corr),
     ("page_views", "view_time 落在会话窗口内", "pv_in_session", judge_pv_in_session),
+    ("events", "event_time 落在会话窗口内", "ev_in_session", judge_ev_in_session),
     ("push_notifications", "漏斗单调 + 标记⟷时间戳一致", "push_funnel", judge_push_funnel),
     ("push_notifications", "时间戳逐级递增", "push_ts", judge_push_ts),
     ("push_notifications", "未送达必须有 failure_reason", "push_fail_reason",
@@ -945,6 +1004,20 @@ def load_athena(client) -> Facts:
     pv_ck, pv_oob = int(r[0] or 0), int(r[1] or 0)
     pv_total = int(q("SELECT count(*) FROM page_views")["rows"][0][0] or 0)
 
+    # events ⟷ sessions 的窗口判据。按 event_name 分组取回，理由见 Facts.ev_oob_by_name：
+    # 越界集中在三种保底事件上，一个总比例读不出这件事。
+    ev_by_name = {str(a): (int(b or 0), int(c or 0)) for a, b, c in
+                  q("SELECT e.event_name, count(*), "
+                    "  sum(CASE WHEN date_diff('second', s.start_time, e.event_time) < 0 "
+                    "    OR date_diff('second', s.start_time, e.event_time) "
+                    "       > s.duration_seconds + 1 "
+                    "    THEN 1 ELSE 0 END) "
+                    "FROM events e JOIN sessions s ON s.session_id = e.session_id "
+                    "GROUP BY e.event_name")["rows"]}
+    ev_ck = sum(v[0] for v in ev_by_name.values())
+    ev_oob = sum(v[1] for v in ev_by_name.values())
+    ev_total = int(q("SELECT count(*) FROM events")["rows"][0][0] or 0)
+
     r = q("SELECT count(*), "
           "  sum(CASE WHEN is_delivered THEN 1 ELSE 0 END), "
           "  sum(CASE WHEN is_opened THEN 1 ELSE 0 END), "
@@ -1001,6 +1074,8 @@ def load_athena(client) -> Facts:
         bounce_flagged=bounce_flag, bounce_mismatch=mism,
         page_name_counts=pn, dwell_hist=dwell, dwell_scroll=moments,
         pv_session_checkable=pv_ck, pv_out_of_session=pv_oob,
+        ev_total=ev_total, ev_session_checkable=ev_ck,
+        ev_out_of_session=ev_oob, ev_oob_by_name=ev_by_name,
         push_total=p_total, push_delivered=p_del, push_opened=p_open,
         push_opened_undelivered=p_ou, push_flag_ts_mismatch=p_mis,
         push_undelivered=p_und, push_undelivered_reasoned=p_undr,
@@ -1037,7 +1112,7 @@ def _rows(src: Path, name: str):
     p = src / f"{name}.csv"
     if not p.exists():
         raise SystemExit(f"缺 {p}。本文件要 users / posts / post_likes / user_follows / "
-                         f"sessions / page_views / push_notifications 七张表。")
+                         f"sessions / page_views / events / push_notifications 八张表。")
     with p.open(newline="", encoding="utf-8") as fh:
         yield from csv.DictReader(fh)
 
@@ -1167,6 +1242,26 @@ def load_csv(src: Path) -> Facts:
                 col_cnt[c] += 1
                 col_seen[c].add(val)
 
+    # events ⟷ sessions 的窗口判据。与上面 page_views 那一段是同一条判据的另一半，
+    # 逐行判、按 event_name 累计；`sess_start` 已经在上面按 sessions.csv 建好了。
+    ev_total = ev_ck = ev_oob = 0
+    ev_name_ck: collections.Counter = collections.Counter()
+    ev_name_oob: collections.Counter = collections.Counter()
+    for r in _rows(src, "events"):
+        ev_total += 1
+        st = sess_start.get(r["session_id"])
+        if st is None:
+            continue
+        ev_ck += 1
+        name = r.get("event_name") or ""
+        ev_name_ck[name] += 1
+        t = _ts(r.get("event_time"))
+        if t is None or not (st <= t <= st + dt.timedelta(
+                seconds=sess_dur.get(r["session_id"], 0) + 1)):
+            ev_oob += 1
+            ev_name_oob[name] += 1
+    ev_by_name = {n: (c, ev_name_oob.get(n, 0)) for n, c in ev_name_ck.items()}
+
     pv_sess_hist: collections.Counter = collections.Counter()
     single = bounce_flag = mism = 0
     for sid in sess_start:
@@ -1238,6 +1333,8 @@ def load_csv(src: Path) -> Facts:
         page_name_counts=dict(pn), dwell_hist=dict(dwell),
         dwell_scroll=(n, float(sx), float(sy), float(sxx), float(syy), float(sxy)),
         pv_session_checkable=pv_ck, pv_out_of_session=pv_oob,
+        ev_total=ev_total, ev_session_checkable=ev_ck,
+        ev_out_of_session=ev_oob, ev_oob_by_name=ev_by_name,
         push_total=p_total, push_delivered=p_del, push_opened=p_open,
         push_opened_undelivered=p_ou, push_flag_ts_mismatch=p_mis,
         push_undelivered=p_und, push_undelivered_reasoned=p_undr,
@@ -1299,10 +1396,11 @@ def main() -> int:
         import athena                                   # noqa: PLC0415  只有云路径要
         f = load_athena(athena.Client())
     print(f"=== L5 分布真实性 · post_likes / page_views / user_follows / "
-          f"push_notifications · {f.src} ===")
+          f"push_notifications (+ events 一条窗口判据) · {f.src} ===")
     print(f"    规模：赞 {f.likes_total} · 关注 {f.follow_rows} · 浏览 {f.pv_total} · "
           f"推送 {f.push_total}，合计 "
-          f"{f.likes_total + f.follow_rows + f.pv_total + f.push_total} 行")
+          f"{f.likes_total + f.follow_rows + f.pv_total + f.push_total} 行"
+          f"；另 events {f.ev_total} 行只判窗口那一条")
     print("    口径：集中度一律 LEFT JOIN（零度父行进分母），通过线写成**自算随机基线**"
           "的倍数，不写死绝对数")
     fails, weaks = run(f, a.why)
@@ -1313,8 +1411,10 @@ def main() -> int:
               + (f" · {weaks} 项 WEAK（判不动）" if weaks else "")
               + f" / 共 {len(CHECKS)} 项")
         if not a.from_csv:
-            print("  现行库是 v1 生成器那批数据，项目已决定不重灌，所以这些 FAIL 是对现状"
-                  "的记录。\n  生成侧：verify_behavior.py --from-csv <生成目录>。")
+            print("  这些 FAIL 是对现状的记录，不是闸门。现行库 2026-08-31 已全量重灌，\n"
+                  "  分布形状那一批红换掉了一部分；ev_in_session 仍必红，成因在生成器，\n"
+                  "  清除条件是下一次重新生成。\n"
+                  "  生成侧：verify_behavior.py --from-csv <生成目录>。")
     elif weaks:
         print(f"L5 行为大表：0 项 FAIL，但 {weaks} 项 WEAK —— **这不是全绿**。"
               f"\n  WEAK 的意思是这批数据分辨不出通过线那么大的差异，加样本量再判。")
@@ -1328,7 +1428,7 @@ def main() -> int:
 def selftest() -> int:
     """判据自测。四组，每组都必须**两侧都验**。
 
-    只验一侧证明不了判据有区分力（Batch 1 的教训）。这里对 27 条判据里的每一条都要求
+    只验一侧证明不了判据有区分力（Batch 1 的教训）。这里对 CHECKS 里的每一条都要求
     「一份夹具红、一份夹具绿」，另外单独验三件容易悄悄坏掉的事：
       · concentration() 的统计量与逐行朴素实现在随机直方图上逐位相等；
       · baseline_top_share() 与蒙特卡洛无关，是解析式——用**审计实测值**核它；
@@ -1393,7 +1493,7 @@ def selftest() -> int:
 
     # ---- 三、每条判据：坏夹具必须红、好夹具必须绿 ----
     # 夹具刻意造得极端（均匀 vs 强重尾），因为要验的是**判据的方向**，不是它的精度。
-    print("\n---- 27 条判据各自的红/绿两侧 ----")
+    print(f"\n---- {len(CHECKS)} 条判据各自的红/绿两侧 ----")
 
     def flat_hist(nparent: int, deg: int) -> dict[int, int]:
         """完全均匀：每个父行同一个度数。集中度必然 = 基线以下。"""
@@ -1427,6 +1527,9 @@ def selftest() -> int:
                       30196 * (62.6 ** 2 + 1100.0), 30196 * (60.0 ** 2 + 700.0),
                       30196 * 62.6 * 60.0),                       # 协方差 = 0
         pv_session_checkable=30196, pv_out_of_session=1508,
+        ev_total=100_000, ev_session_checkable=90_000, ev_out_of_session=12_500,
+        ev_oob_by_name={"purchase": (7000, 6800), "use_coupon": (3500, 3400),
+                        "register": (2500, 2300), "page_view": (77_000, 0)},
         push_total=10000, push_delivered=9530, push_opened=1435,
         push_opened_undelivered=5, push_flag_ts_mismatch=3,
         push_undelivered=470, push_undelivered_reasoned=0,
@@ -1461,6 +1564,8 @@ def selftest() -> int:
                       30196 * (60.0 ** 2 + 400.0), 30196 * (50.0 ** 2 + 400.0),
                       30196 * (60.0 * 50.0 + 240.0)),             # r = 0.6
         pv_session_checkable=30196, pv_out_of_session=0,
+        ev_total=100_000, ev_session_checkable=90_000, ev_out_of_session=0,
+        ev_oob_by_name={"purchase": (7000, 0), "page_view": (83_000, 0)},
         push_total=10000, push_delivered=8800, push_opened=900,
         push_opened_undelivered=0, push_flag_ts_mismatch=0,
         push_undelivered=1200, push_undelivered_reasoned=1200,

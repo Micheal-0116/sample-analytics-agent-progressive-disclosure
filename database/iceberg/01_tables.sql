@@ -7,6 +7,12 @@
  * 真源：database/01_user_domain.sql, database/02_behavior_domain.sql, database/03_attribution_domain.sql, database/04_social_domain.sql, database/05_marketing_domain.sql, database/06_experiment_domain.sql, database/07_transaction_domain.sql, database/08_product_domain.sql
  * 类型映射、主键为何消失、注释为何不用 --，见 scripts/lakehouse/gen_ddl.py。
  *
+ * 其中 events（day(event_time)）、page_views（day(view_time)）、post_likes（day(created_at)）、orders（day(placed_at)）、user_coupons（day(received_at)）、user_follows（day(created_at)）、post_comments（day(created_at)） 带分区。
+ * 分区只对**已存在的表不生效**：CREATE TABLE IF NOT EXISTS 不会改已建好的表，
+ * 给旧表加分区要先 DROP。DROP 会连带掉 Lake Formation 授权，重建后必须重跑
+ * scripts/lakehouse/governance.py。粒度是量出来的，数据见 gen_ddl.py 的
+ * PARTITION_SPEC 上方。
+ *
  * 执行方式（catalog 名带斜杠，不能写进 SQL，必须走 QueryExecutionContext）：
  *     python3 scripts/lakehouse/athena.py --file database/iceberg/01_tables.sql \
  *         --tolerate 'already exists'
@@ -102,7 +108,8 @@ CREATE TABLE IF NOT EXISTS events (
     referrer   string    COMMENT 'pg: VARCHAR(200)',
     ip_address string    COMMENT 'pg: VARCHAR(50)',
     created_at timestamp
-);
+)
+PARTITIONED BY (day(event_time));
 
 CREATE TABLE IF NOT EXISTS sessions (
     session_id       bigint,
@@ -134,7 +141,8 @@ CREATE TABLE IF NOT EXISTS page_views (
     scroll_depth_pct int       COMMENT '0-100',
     view_time        timestamp COMMENT 'NOT NULL（Iceberg 侧不强制）',
     created_at       timestamp
-);
+)
+PARTITIONED BY (day(view_time));
 
 
 /* ========== 来自 database/03_attribution_domain.sql ========== */
@@ -212,7 +220,8 @@ CREATE TABLE IF NOT EXISTS user_follows (
     follower_id  bigint,
     following_id bigint,
     created_at   timestamp
-);
+)
+PARTITIONED BY (day(created_at));
 
 CREATE TABLE IF NOT EXISTS posts (
     post_id       bigint        COMMENT 'pg: BIGSERIAL',
@@ -239,7 +248,8 @@ CREATE TABLE IF NOT EXISTS post_likes (
     user_id    bigint,
     post_id    bigint,
     created_at timestamp
-);
+)
+PARTITIONED BY (day(created_at));
 
 CREATE TABLE IF NOT EXISTS post_comments (
     comment_id        bigint    COMMENT 'pg: BIGSERIAL',
@@ -250,7 +260,8 @@ CREATE TABLE IF NOT EXISTS post_comments (
     like_count        int,
     status            string    COMMENT '\'visible\', \'hidden\', \'deleted\'; pg: VARCHAR(20)',
     created_at        timestamp
-);
+)
+PARTITIONED BY (day(created_at));
 
 CREATE TABLE IF NOT EXISTS post_shares (
     share_id      bigint    COMMENT 'pg: BIGSERIAL',
@@ -337,7 +348,8 @@ CREATE TABLE IF NOT EXISTS user_coupons (
     order_id    bigint    COMMENT '使用时关联的订单',
     status      string    COMMENT '\'unused\', \'used\', \'expired\'; pg: VARCHAR(20)',
     source      string    COMMENT '\'claim\', \'gift\', \'reward\', \'system\'（旧注释的 campaign/share/purchase/new_user 一个都不存在）; pg: VARCHAR(50)'
-);
+)
+PARTITIONED BY (day(received_at));
 
 CREATE TABLE IF NOT EXISTS banners (
     banner_id        int       COMMENT 'pg: SERIAL',
@@ -426,7 +438,8 @@ CREATE TABLE IF NOT EXISTS orders (
     refund_reason    string        COMMENT 'pg: VARCHAR(200)',
     created_at       timestamp,
     updated_at       timestamp
-);
+)
+PARTITIONED BY (day(placed_at));
 
 CREATE TABLE IF NOT EXISTS order_items (
     item_id         bigint        COMMENT 'pg: BIGSERIAL',

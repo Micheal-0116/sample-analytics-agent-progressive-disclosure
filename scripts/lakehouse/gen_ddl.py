@@ -142,6 +142,124 @@ _TABLE_CONSTRAINT = re.compile(
     r"^\s*(PRIMARY\s+KEY|UNIQUE|FOREIGN\s+KEY|CHECK|CONSTRAINT|EXCLUDE)\b",
     re.IGNORECASE)
 
+# ---------------------------------------------------------------- 分区
+#
+# `{表: (Iceberg 变换, 列)}`。**只有列在这张表里出现过的表才分区**，别的表不写进来，
+# 而不是给所有表配一条默认规则——分区是拿存储和写入换扫描，不是白送的。
+#
+# 这份名单和它的粒度是**量出来的**，不是按行数拍的。2026-09-01 拿 scale=100 的
+# page_views（302 万行）和 orders（20 万行）在真表上比过 flat / month / day 三种：
+#
+#     page_views     文件数   行/文件    存储     7 天窗口扫描   全表聚合扫描
+#     不分区              2  1,509,800  36.4 MB      15.01 MB        1.26 MB
+#     month(view_time)    4    754,900  36.6 MB       5.83 MB        1.38 MB
+#     day(view_time)     91     33,182  42.5 MB       2.84 MB        2.27 MB
+#
+#     orders         文件数   行/文件    存储    7 天扫描  30 天扫描  全表按状态
+#     不分区              1    200,000   8.1 MB   1.71 MB    1.71 MB     0.63 MB
+#     day(placed_at)     91      2,197   8.4 MB   0.15 MB    0.56 MB     0.57 MB
+#
+# 三条结论决定了下面的选择：
+#
+# 1. ~~**`day()` 的剪枝在子查询边界上也成立。**~~ **这条 2026-09-01 复测不成立了，
+#    别再按它做判断。** 原文记的是 scale=100 上「字面量少扫 80.2%、子查询少扫 81.1%，
+#    两者几乎相同」，并留了一句「改这份名单前先确认这条还成立」。加那三张表时照做了确认，
+#    结论是反的：**全量（scale=427）下七张分区表无一例外，子查询锚点比字面量锚点多扫
+#    1.9×–7.8×**，同一个答案、同一份数据，重复三轮字节数完全一致（不是缓存也不是噪声）。
+#
+#        表              全表 MB   字面量 MB   子查询 MB   子查询/字面量
+#        events            10.07       1.37       6.36        4.63×
+#        page_views         6.15       1.00       7.78        7.77×
+#        post_likes        47.26      16.73      31.39        1.88×
+#        orders             2.70       0.27       0.70        2.58×
+#        user_coupons      32.04       9.17      19.19        2.09×
+#        user_follows      29.32      11.75      22.22        1.89×
+#        post_comments     19.03       1.99       5.02        2.53×
+#
+#    `page_views` 那一行是最刺眼的证据：子查询形态扫 7.78 MB，**比全表聚合的 6.15 MB
+#    还多**——说明分区一点没剪，Trino 是把 `max(as_of_date)` 当成运行期才知道的值，
+#    没有折成常量拿去挑分区文件。复现命令（把 `page_views/view_time` 换成任意一行）：
+#
+#        SELECT count(distinct user_id) FROM page_views
+#         WHERE view_time >= DATE '2026-01-24' - interval '7' day;          -- 1.00 MB
+#        SELECT count(distinct user_id) FROM page_views WHERE view_time >=
+#              (SELECT max(as_of_date) FROM meta_snapshot) - interval '7' day;  -- 7.78 MB
+#
+#    **后果分两头，都不是"把分区撤掉"。** 撤掉只会更差：字面量那一列证明剪枝本身是好的，
+#    卡片将来改写成两段式（先取锚、再代入字面量）就立刻拿到 1.9×–7.8×。真正要记住的是
+#    **别拿分区当已经生效的优化去解释查询耗时**，尤其在三种架构对比里：Redshift 的
+#    SORTKEY 区块裁剪是运行期按实际值做的，子查询锚照样裁得动，而 Iceberg 这边的分区
+#    在同一条 SQL 上裁不动——这是一处**真实存在、对 Iceberg 两个 arm 不利**的引擎差异，
+#    要在报告里写成结论，不能当噪声抹掉。
+#
+#    附带量到的一件事，跟分区无关但会误导读数：`user_follows` 最后 7 天占全表 **39.55%**、
+#    `user_coupons` 占 **26.48%**（均匀的话应是 7.7%）。所以这两张表上"七天窗口只少扫 40%"
+#    不是剪枝没生效——字面量锚实测 11.75/29.32 = 40.1%，和行数占比对得上，是**满效**。
+#    看剪枝效果要先看窗口里到底装了多少行。
+# 2. **粒度选 day 而不是 month。** 主流窗口是 7 天，month 只能剪到 1/3
+#    （15.01→5.83），day 能剪到 1/5（→2.84）。
+# 3. **小文件的代价是有的，但落在计费下限以下。** day 分区把全表聚合的扫描量抬高了
+#    （page_views 1.26→2.27 MB），代价随「行/文件」变差；orders 反而略降（0.63→0.57），
+#    所以这个惩罚不是普适的。但两边的绝对值都是 1~2 MB，而 Athena 按查询有 10 MB
+#    的计费下限——这个量级的差别根本进不了账单。真正进账单的是 7 天窗口那一列，
+#    全量下 page_views 是 64 MB 对 12 MB。
+#
+# 全量（scale=427）下一个 day 分区约 9 千（orders）到 17 万行（post_likes），
+# 比上面量的还大一档，所以小文件只会更轻。
+#
+# 下面三张 2026-09-01 补上（在此之前它们按同一条判据够格却没写进来，理由是那一轮的
+# 改动范围只限 P2-14 点名的四张表）。补的动因不是它们自己的查询变快，而是**三种架构
+# 对比测试的公平性**：`redshift_ddl.DIST_SORT` 给 **21 张事实表全部**配了时间 SORTKEY，
+# 而这份名单当时只有 4 张有 `day()` 分区。同一个七天窗口的问题，Redshift arm 靠 SORTKEY
+# 的区块裁剪只读该窗口，Iceberg arm（Athena 与 DuckDB 都是）要全表扫——量出来的差距里
+# 混着一份纯粹的物理布局差异，而这不是要比的东西。**偏向是对着 Iceberg 两个 arm 去的**，
+# 所以补分区是把偏差抹平，不是给 Iceberg 开后门。
+#
+# 只补这三张、不补剩下 14 张，判据仍是上面那条体量线：这三张全量 970 万 / 818 万 /
+# 598 万行，比 orders（85 万）大一个数量级；剩下的够不到，加了只多摊小文件的账。
+#
+# 分区是**装载期**的决定，不是生成期的：改这个 dict 之后不需要重新生成数据，
+# 只要 `load.py --recreate --only <表>` 把这几张重建再灌一遍，然后 `governance.py --apply`
+# 重新授权。要加就在这个 dict 里加一行，`--check` 会把生成物拉着一起变。
+PARTITION_SPEC: dict[str, tuple[str, str]] = {
+    "events":        ("day", "event_time"),
+    "page_views":    ("day", "view_time"),
+    "post_likes":    ("day", "created_at"),
+    "orders":        ("day", "placed_at"),
+    "user_coupons":  ("day", "received_at"),
+    "user_follows":  ("day", "created_at"),
+    "post_comments": ("day", "created_at"),
+}
+
+# Iceberg 的时间变换。`day` 之外都没在本仓库用上，列出来是为了让 `--selftest`
+# 能挡住手滑写成 `days` / `date` 这类不存在的变换名。
+_TIME_TRANSFORMS = ("year", "month", "day", "hour")
+
+
+def partition_clause(table: str, cols: list) -> str:
+    """→ `PARTITIONED BY (day(view_time))`，没配分区的表返回空串。
+
+    这里**校验列真的存在且是时间类型**，而不是把字符串直接拼进 DDL。理由是失败位置：
+    列名写错的话，拼进去要等到云上 `CREATE TABLE` 才报，而 S3 Tables 那条报错是
+    通用的 `Exception encountered when executing Iceberg query`，不提列名（见模块
+    docstring 最后那个坑）。在这里抛，`--selftest` 和 `--check` 就都能拦住。
+    """
+    spec = PARTITION_SPEC.get(table)
+    if not spec:
+        return ""
+    transform, col = spec
+    if transform not in _TIME_TRANSFORMS:
+        raise ValueError(f"{table}: 不认识的分区变换 {transform!r}，"
+                         f"可用的是 {_TIME_TRANSFORMS}")
+    kinds = {c: map_type(pg) for c, pg, _, _ in cols}
+    if col not in kinds:
+        raise ValueError(f"{table} 没有列 {col!r}，分区配置写错了"
+                         f"（该表的列：{sorted(kinds)}）")
+    if kinds[col] not in ("timestamp", "date"):
+        raise ValueError(f"{table}.{col} 是 {kinds[col]}，"
+                         f"{transform}() 变换只能用在 timestamp / date 上")
+    return f"PARTITIONED BY ({transform}({col}))"
+
 
 def map_type(pg: str) -> str:
     """Postgres 类型 → Iceberg 类型。未知类型抛错，不静默降级成 string。
@@ -304,6 +422,14 @@ def render(tables: list[tuple[str, str, list]]) -> str:
         f" * 真源：{', '.join('database/' + f for f in src_files)}",
         " * 类型映射、主键为何消失、注释为何不用 --，见 scripts/lakehouse/gen_ddl.py。",
         " *",
+        " * 其中 " + "、".join(f"{t}（{tr}({c})）"
+                              for t, (tr, c) in PARTITION_SPEC.items())
+        + " 带分区。",
+        " * 分区只对**已存在的表不生效**：CREATE TABLE IF NOT EXISTS 不会改已建好的表，",
+        " * 给旧表加分区要先 DROP。DROP 会连带掉 Lake Formation 授权，重建后必须重跑",
+        " * scripts/lakehouse/governance.py。粒度是量出来的，数据见 gen_ddl.py 的",
+        " * PARTITION_SPEC 上方。",
+        " *",
         " * 执行方式（catalog 名带斜杠，不能写进 SQL，必须走 QueryExecutionContext）：",
         " *     python3 scripts/lakehouse/athena.py --file database/iceberg/01_tables.sql \\",
         " *         --tolerate 'already exists'",
@@ -326,7 +452,12 @@ def render(tables: list[tuple[str, str, list]]) -> str:
                 # COMMENT 必须在逗号**之前**：`a bigint COMMENT 'x',`
                 piece = f"{piece.ljust(5 + width + typew)} COMMENT {sql_str(note)}"
             lines.append(piece + ("," if i < len(body) - 1 else ""))
-        lines.append(");")
+        # PARTITIONED BY 在列清单的 `)` 之后、结尾分号之前。分区表的表名后面不能
+        # 再有别的子句（本文件没有 LOCATION / TBLPROPERTIES，见本函数 docstring）。
+        part = partition_clause(name, cols)
+        lines.append(")" if part else ");")
+        if part:
+            lines.append(part + ";")
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
@@ -467,6 +598,48 @@ def selftest() -> int:
                 print(f"  ❌ {name}.{col}: {e}")
                 bad += 1
 
+    # ---- 分区配置 ----
+    # PARTITION_SPEC 里的每张表都要真存在，列也要真存在且是时间类型。这三条错
+    # 在云上都只报一句不提列名的 `Exception encountered when executing Iceberg
+    # query`，所以必须在本地拦住。
+    by_name = {n: c for _, n, c in tables}
+    for tbl in PARTITION_SPEC:
+        if tbl not in by_name:
+            print(f"  ❌ PARTITION_SPEC 配了 {tbl!r}，但真源里没有这张表")
+            bad += 1
+            continue
+        try:
+            got = partition_clause(tbl, by_name[tbl])
+        except ValueError as e:
+            print(f"  ❌ {e}")
+            bad += 1
+            continue
+        if not got.startswith("PARTITIONED BY ("):
+            print(f"  ❌ {tbl} 的分区子句渲染成了 {got!r}")
+            bad += 1
+    # 反向：没配的表不能凭空长出分区子句
+    unpart = [n for _, n, c in tables
+              if n not in PARTITION_SPEC and partition_clause(n, c)]
+    if unpart:
+        print(f"  ❌ 这些表没配分区却渲染出了子句：{unpart}")
+        bad += 1
+    # 三种写错法都必须抛错，而不是拼进 DDL 等云上报错：列不存在、列不是时间类型、
+    # 变换名不存在（`days` 是最容易手滑的一个）。
+    _probe_cols = [("order_id", "BIGINT", False, ""),
+                   ("placed_at", "TIMESTAMP", False, "")]
+    for bogus, why in ((("day", "no_such_column"), "列不存在"),
+                       (("day", "order_id"), "列不是 timestamp/date"),
+                       (("days", "placed_at"), "变换名不存在")):
+        PARTITION_SPEC["_probe"] = bogus
+        try:
+            partition_clause("_probe", _probe_cols)
+            print(f"  ❌ 分区配置 {bogus} 本该抛错（{why}）")
+            bad += 1
+        except ValueError:
+            pass
+        finally:
+            PARTITION_SPEC.pop("_probe", None)
+
     # 渲染产物的三条回归闸。每一条都会让整份 DDL 在 Athena 上直接语法失败，
     # 而失败信息（`no viable alternative at input`）指向的位置离真因很远
     # ——第 3 条那次报在「第 13 行的 `)`」，而第 13 行是空行。
@@ -492,6 +665,17 @@ def selftest() -> int:
     if "COMMENT '" not in text:
         print("  ❌ 生成结果里没有 COMMENT 子句，列注释可能被丢掉了"
               "（它是要落进 Glue 元数据的，不是装饰）")
+        bad += 1
+    # 分区子句的位置：必须是 `)` 换行 `PARTITIONED BY (...);`，且这一段之前**没有**
+    # 分号。写成 `);` 再跟 PARTITIONED BY 会让后者变成一条独立语句，Athena 报的是
+    # 一句和分区毫无关系的语法错。
+    npart = len(re.findall(r"^\)\nPARTITIONED BY \(\w+\(\w+\)\);$", text, re.M))
+    if npart != len(PARTITION_SPEC):
+        print(f"  ❌ 生成结果里有 {npart} 条格式正确的 PARTITIONED BY，"
+              f"期望 {len(PARTITION_SPEC)}（要么位置错了，要么少渲染了）")
+        bad += 1
+    if re.search(r"\);\nPARTITIONED BY", text):
+        print("  ❌ PARTITIONED BY 前面多了分号，它会被当成独立语句")
         bad += 1
     # 转义：反斜杠不是 ''
     if sql_str("'app', 'web'") != r"'\'app\', \'web\''":
@@ -528,7 +712,10 @@ def selftest() -> int:
         print(f"\n{bad} 项失败 ❌")
         return 1
     print(f"  类型映射 {len(_CASES)} 例、拒绝降级 {len(_MUST_FAIL)} 例、"
-          f"列解析 3 项、真源 35 表 388 列、渲染回归 5 项、注释抹除 5 项")
+          f"列解析 3 项、真源 35 表 388 列、渲染回归 7 项、注释抹除 5 项")
+    print(f"  分区 {len(PARTITION_SPEC)} 表（"
+          + "、".join(f"{t} {tr}({c})" for t, (tr, c) in PARTITION_SPEC.items())
+          + "），列存在性/类型/变换名各拒绝 1 例")
     print("全部通过 ✅")
     return 0
 

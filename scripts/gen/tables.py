@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+import budget
 import fillers as F
 import profiles as PROF
 import semantics as SEM
@@ -64,9 +65,18 @@ TRAFFIC = ["referral", "social", "paid", "organic", "direct", "email"]
 # page_views.referrer 的来源池。原来只有两个值 ["", "https://m.example.com/home"]，
 # 于是「非空的 referrer 只有 1 种取值」——按来源页做站内路径分析恒得一行
 # （判据 `col_domain[page_views.referrer]` 要求非空率 ≥ 50% 且不同取值 ≥ 2）。
-# 三类来源都要有，缺哪一类都会让某一整类分析没有输入：直接打开（空串）、
+# 三类来源都要有，缺哪一类都会让某一整类分析没有输入：直接打开（NULL）、
 # 站内跳转（本站页面）、站外引流（搜索引擎 / 社交平台 / 推送）。
-REFERRERS = ["", "https://m.example.com/home", "https://m.example.com/category",
+#
+# 「直接打开」2026-09-01 从空串改成 `None`，原因是**两种产出格式对空串的表达能力不同**：
+# pgcsv 走 Postgres COPY 约定（`QUOTE_MINIMAL`，None 与 "" 都写成不带引号的空字段，
+# COPY 一律读成 NULL），而 Parquet 保留 `''`。于是同一个 seed 产出的两份数据里
+# `referrer` 一边是 NULL、一边是空串——Athena arm（装 CSV）上
+# `WHERE referrer IS NULL` 命中 28%，Redshift arm（COPY Parquet）上命中 0 行，
+# 两边都不报错。三种架构要吃同一份数据，就不能让"取值"依赖于中间格式的引号约定；
+# 「没有来源页」这件事本来也就是 NULL 而不是空串。
+# **不要把空串加回池子里**：加回来的代价是三个 arm 的口径重新分叉。
+REFERRERS = [None, "https://m.example.com/home", "https://m.example.com/category",
              "https://m.example.com/search", "https://m.example.com/post/feed",
              "https://www.baidu.com/s", "https://m.weibo.cn/", "https://www.google.com/",
              "https://mp.weixin.qq.com/s", "app://push"]
@@ -109,8 +119,10 @@ INTEREST_TAGS = ["运动健身", "摄影", "汽车", "美食烹饪", "读书学�
 # `GROUP BY device_model` 出 40 行、`GROUP BY utm_campaign` 出 50 行照样露馅。
 # 判据与回归断言在 scripts/gen/selftest_closures.py 的 check_literals()。
 
-# 用户名：中文昵称，前缀 × 主体 × 可选数字尾。1024 种组合再乘数字尾。
-# DDL 是 VARCHAR(50)，Redshift 按**字节**算长度，中文 3 字节：最长组合约 21 字节，够。
+# 用户名：中文昵称，前缀 × 主体 × 可选数字尾 = 32 × 32 × 24 = 24,576 种组合。
+# 组合数 < 用户数（scale 427 有 213,500 个），所以这三个池只负责**多样性**，
+# 唯一性由 F.combine_unique 的「先到先得 + 四位数后缀」负责（P1-6，见 _prep_users）。
+# DDL 是 VARCHAR(50)，按**字节**算长度，中文 3 字节：最长组合 25 字节 + 后缀 5 字节，够。
 NICK_A = ["小", "大", "阿", "一只", "是", "超级", "甜甜的", "会飞的", "不加冰的", "慢慢的",
           "爱睡觉的", "三分甜", "半糖", "元气", "佛系", "打工人", "隔壁", "楼上", "深夜",
           "清晨", "咸鱼", "躺平", "干饭", "摸鱼", "柠檬味", "西瓜味", "奶油", "星期五",
@@ -124,6 +136,8 @@ NICK_TAIL = ["", "", "", "", "0", "1", "7", "23", "66", "77", "88", "99", "233",
 
 # 邮箱：拼音姓 + 拼音名 + 数字 @ 真实服务商。username 是中文，进不了邮箱本地部分，
 # 所以这里不再由 username 派生（旧版 email = username + "@example.com"）。
+# 本地部分 20 × 20 × 15 = 6,000 种，同样靠 F.combine_unique 补唯一性（P1-7）；
+# 本地部分唯一就够了，域名照旧按份额权重独立抽。
 PY_FAMILY = ["wang", "li", "zhang", "liu", "chen", "yang", "huang", "zhao", "wu", "zhou",
              "xu", "sun", "ma", "zhu", "hu", "guo", "lin", "he", "gao", "luo"]
 PY_GIVEN = ["wei", "fang", "min", "jing", "tao", "lei", "yan", "hui", "na", "bo",
@@ -137,6 +151,8 @@ MAIL_DOMAIN_W = [30, 22, 11, 10, 8, 6, 5, 4, 2, 2]
 
 # 手机号段：工信部实际号段（移动 20 / 联通 11 / 电信 9），全部满足 1[3-9] 开头。
 # 旧版是 "103" + 序号，11 位里第二位是 0，任何号码校验都过不了。
+# 号段 40 × 8 位尾 = 40 亿的空间，21 万行期望仍要撞 6 行左右，所以走 F.unique_digits
+# （碰撞重抽）而不是 combine_unique——加后缀会破坏 11 位定长。
 PHONE_SEGMENTS = ["134", "135", "136", "137", "138", "139", "147", "150", "151", "152",
                   "157", "158", "159", "178", "182", "183", "184", "187", "188", "198",
                   "130", "131", "132", "145", "155", "156", "166", "175", "176", "185",
@@ -194,13 +210,66 @@ POST_OPEN = ["入手一个月了，", "犹豫很久终于买了，", "双十一�
              "朋友推荐的，", "看直播下单的，", "蹲了两个月降价，", "说个反向种草，",
              "新手第一次买，", "换季刚好需要，", "旧的用坏了才换，", "同事都在用的",
              "刷到广告点进去的，", "凑单买的，", "给爸妈买的，", "自用一周后，"]
-POST_OBJ = ["这个吹风机", "这支口红", "这台扫地机器人", "这双跑鞋", "这袋猫粮",
-            "这条牛仔裤", "这只保温杯", "这台空气炸锅", "这套护肤品", "这个背包",
-            "这款洗面奶", "这台显示器", "这副耳机", "这张瑜伽垫", "这盒面膜",
-            "这件冲锋衣", "这个咖啡机", "这袋大米", "这台加湿器", "这双拖鞋",
-            "这瓶精华", "这个键盘", "这条围巾", "这罐奶粉", "这台电饭煲",
-            "这个收纳箱", "这支牙刷", "这件卫衣", "这盒零食", "这台风扇",
-            "这只手表", "这个台灯"]
+# 帖子说的是哪件东西。这一段原来是 32 个手写短语（吹风机 / 口红 / 猫粮 …），与
+# `posts.product_ids` 毫无关系——而那一列当时**整列是空数组**（P1-10）：
+# `knowledge/relationships.md:61` 声明了 products ↔ posts 的 N:N，卡片
+# `domains/social/posts.md` 还写了一整段「商品种草效果分析」的 UNNEST 示例查询，
+# 在那份数据上恒返回 0 行。空数组还有一层更麻烦的地方：`verify_constants.py` 的
+# 全库常量普查**跳过所有数组列**（Trino 的 min/max 在数组上语义不清），所以云上那三列
+# 空了多久都不会有任何一层报出来。
+#
+# 所以对象短语改成从 semantics.yaml 的**叶子类目反推**：量词 + 叶子名。这样每个帖子
+# 天生知道自己说的是哪个品类，`product_ids` 就能指到那个品类里的真实 SKU。反过来
+# （先随机挑 SKU 再写标题）做不到：那会造出「标题说吹风机、关联商品是猫粮」的同帖
+# 自相矛盾，比整列空更糟——同 title/content 共用抽样那条注释里的理由。
+#
+# 键是量词、值是叶子类目名。`_post_objects()` 断言两侧叶子集合**完全相等**：
+# semantics.yaml 增删类目时这里立刻停，而不是静默留下几个"从没人种草过"的品类
+# （空类目在任何聚合结果里都只是**不出现**，正是 D-02 那一类看不见的缺陷）。
+POST_MEASURE: dict[str, tuple[str, ...]] = {
+    "台": ("冰箱", "洗衣机", "空调", "电视", "电饭煲", "电热水壶", "吹风机", "榨汁机",
+           "油烟机", "燃气灶", "热水器", "消毒柜", "扫地机器人", "空气净化器", "加湿器",
+           "笔记本", "台式机", "平板电脑", "智能音箱"),
+    "部": ("智能手机", "老人机", "游戏手机"),
+    "辆": ("婴儿推车", "学步车", "儿童自行车"),
+    "支": ("口红", "眉笔", "牙膏", "洁面", "精华", "防晒"),
+    "盒": ("面膜", "眼影", "腮红", "粉底", "饼干", "糖果", "蜜饯"),
+    "瓶": ("洗发水", "沐浴露", "身体乳", "女士香水", "男士香水", "中性香水", "面霜",
+           "食用油", "调味品", "清洁剂", "矿泉水", "果汁", "碳酸饮料"),
+    "罐": ("婴儿奶粉", "儿童奶粉", "孕妇奶粉"),
+    "袋": ("大米", "面粉", "坚果", "膨化食品", "咖啡", "茶饮", "垃圾袋"),
+    "包": ("婴儿纸尿裤", "拉拉裤", "成人纸尿裤", "纸巾"),
+    "箱": ("水果",),
+    "份": ("蔬菜", "肉类", "海鲜"),
+    "件": ("T恤", "衬衫", "外套", "卫衣", "上衣", "睡衣", "保暖内衣", "文胸", "运动T恤"),
+    "条": ("裤子", "运动裤", "内裤", "毛巾", "连衣裙", "半身裙", "数据线"),
+    "双": ("跑步鞋", "篮球鞋", "足球鞋", "健身鞋"),
+    "套": ("床上用品", "餐具", "锅具", "刀具", "套装", "运动套装"),
+    "副": ("耳机", "窗帘"),
+    "把": ("拖把", "登山杖"),
+    "张": ("瑜伽垫", "地毯"),
+    "只": ("智能手表", "智能手环", "毛绒玩具"),
+    "个": ("手机壳", "充电器", "收纳箱", "收纳袋", "衣架", "置物架", "保鲜盒", "帐篷",
+           "睡袋", "户外背包", "哑铃", "跳绳", "拉力带", "益智玩具", "积木", "遥控玩具"),
+}
+
+# 话题标签池。真实平台的 tags 是「品类词 + 运营话题」的混合，所以每帖必带自己的
+# 叶子类目名（让 tags 与 product_ids 指向同一件事），再从这里补 1~3 个。
+# 元素里不能有逗号 / 空格 / 花括号 / 引号：CSV 走 Postgres 数组字面量 `{a,b}`，
+# 装载侧是 `split(c, ',')`，`load.preflight` 直接拒绝带引号的元素。
+POST_TAGS = ["好物推荐", "平价替代", "踩坑记录", "开箱实拍", "双十一囤货", "618好价",
+             "新手入门", "回购清单", "性价比之王", "居家好物", "通勤日常", "送礼清单",
+             "自用分享", "真实测评", "懒人必备", "学生党必备", "一人食", "小户型",
+             "换季必备", "断舍离"]
+
+# 每种内容形态带几个媒体文件、关联几件商品（左右闭区间）。形态差异来自卡片
+# `domains/social/posts.md` 的 content_type 说明：image 是「1-9 张图片为主」、
+# short_video 是「<60 秒」的单条视频、article 是「长内容，多段文字+图片」、
+# review 是商品评测，必然关联被测的那件商品。
+POST_MEDIA_N = {"article": (1, 5), "image": (1, 9), "short_video": (1, 1),
+                "review": (1, 6)}
+POST_PROD_N = {"article": (0, 3), "image": (0, 2), "short_video": (0, 1),
+               "review": (1, 1)}
 POST_VERDICT = ["真的值", "有点后悔", "闭眼入", "不推荐", "香到起飞", "性价比拉满",
                 "一般般", "回购不犹豫", "翻车了", "超出预期", "智商税", "居然还不错",
                 "劝你别买", "打折时值得", "细节拉分", "比想象中好", "只能说凑合",
@@ -337,6 +406,36 @@ def _pool(items, n=None):
     return np.array(items, dtype=object)
 
 
+_POST_OBJ_CACHE: tuple[np.ndarray, np.ndarray] | None = None
+
+
+def _post_objects() -> tuple[np.ndarray, np.ndarray]:
+    """→ (对象短语数组, 对应叶子类目名数组)。两者同序，下标即"第几个对象"。
+
+    校验两侧叶子集合完全相等（理由见 POST_MEASURE 上方）。memo 一份：
+    每个分块都要用，而 SEM.load() 要读盘解析 yaml。
+    """
+    global _POST_OBJ_CACHE
+    if _POST_OBJ_CACHE is not None:
+        return _POST_OBJ_CACHE
+    leaves = {p.rsplit(SEM.SEP, 1)[-1] for p in SEM.load().tree.leaf_paths}
+    mapped = [lf for lfs in POST_MEASURE.values() for lf in lfs]
+    if len(mapped) != len(set(mapped)):
+        dup = sorted({x for x in mapped if mapped.count(x) > 1})
+        raise ValueError(f"POST_MEASURE 里这些叶子类目挂了多个量词：{dup}")
+    if set(mapped) != leaves:
+        raise ValueError(
+            f"POST_MEASURE 与 semantics.yaml 的叶子类目对不上——"
+            f"没有量词的类目 {sorted(leaves - set(mapped))}；"
+            f"semantics 里不存在的 {sorted(set(mapped) - leaves)}。"
+            f"补全它，别删断言：漏掉的类目会变成"
+            f"「一条种草内容都没有」，而空类目在聚合结果里只是不出现")
+    phrase = [f"这{m}{lf}" for m, lfs in POST_MEASURE.items() for lf in lfs]
+    leaf = [lf for lfs in POST_MEASURE.values() for lf in lfs]
+    _POST_OBJ_CACHE = (np.array(phrase, dtype=object), np.array(leaf, dtype=object))
+    return _POST_OBJ_CACHE
+
+
 # ---------------------------------------------------------------- 上下文
 
 @dataclass
@@ -378,6 +477,49 @@ ORDER_REMARKS = [
     "到货前请电话联系", "周末再送，谢谢", "少放胶带，好拆一点",
 ]
 ORDER_REMARKS_W = [30, 14, 12, 10, 9, 8, 6, 5, 4, 2]
+
+# 收货地址池。原来这一列是 `F.const(n, {"province": "广东", "city": "深圳"})`——85 万单
+# 全在深圳，「各省 GMV 分布」恒得一行，而它**不是 NULL**，所以 verify_literals（JSONB 列
+# 不在它的普查面里）和 verify_enums（这一列没有声明枚举）都拦不住。
+# 只放 province / city / district 三个字段，**故意不放 receiver_name / phone**：
+# L4 治理把 `users.phone` 排除在授权外，若把同一个手机号抄进这张表的 JSONB 里，
+# 列级排除就被绕过去了——地址这一列是授权可读的。
+SHIP_ADDRESSES = [
+    {"province": "广东省", "city": "深圳市", "district": "南山区"},
+    {"province": "广东省", "city": "广州市", "district": "天河区"},
+    {"province": "上海市", "city": "上海市", "district": "浦东新区"},
+    {"province": "北京市", "city": "北京市", "district": "朝阳区"},
+    {"province": "浙江省", "city": "杭州市", "district": "西湖区"},
+    {"province": "江苏省", "city": "南京市", "district": "鼓楼区"},
+    {"province": "四川省", "city": "成都市", "district": "武侯区"},
+    {"province": "湖北省", "city": "武汉市", "district": "洪山区"},
+    {"province": "陕西省", "city": "西安市", "district": "雁塔区"},
+    {"province": "福建省", "city": "厦门市", "district": "思明区"},
+]
+SHIP_ADDRESSES_W = [16, 13, 13, 12, 11, 9, 8, 7, 6, 5]
+
+# 取消 / 退款原因池。这两列原来是 `np.where(mask, "用户取消"/"商品问题", None)`——
+# 7.5 万条取消、4.2 万条退款各自只有一个值，「取消原因 TOP5」这类问题恒得一行。
+# 同 remark：不带 ASCII 句点，避开 verify_literals 的词沙拉判据。
+ORDER_CANCEL_REASONS = [
+    "用户取消", "超时未支付", "不想要了", "地址填错了", "拍错了重新下单",
+    "价格比别处贵", "缺货商家取消", "支付失败",
+]
+ORDER_CANCEL_REASONS_W = [28, 20, 14, 10, 9, 8, 6, 5]
+ORDER_REFUND_REASONS = [
+    "商品问题", "尺码不合适", "与描述不符", "签收时已破损", "物流太慢不想要了",
+    "买重复了", "商家发错货", "无理由退货",
+]
+ORDER_REFUND_REASONS_W = [24, 18, 15, 12, 11, 8, 7, 5]
+
+# 推送失败原因池。原来是 `np.where(delivered, None, "token 失效")`——51 万条失败全是
+# 同一个原因，卡片只好写成「这个问题在这份数据上只有一个桶，做不出分布」。
+# 值取自真实推送通道的常见失败类，仍让 token 失效占大头。
+PUSH_FAILURE_REASONS = [
+    "token 失效", "设备已卸载应用", "用户关闭了通知权限", "通道限流", "网络超时",
+    "厂商通道返回未知错误",
+]
+PUSH_FAILURE_REASONS_W = [42, 20, 15, 10, 8, 5]
 
 # 事件名 → 漏斗权重。权重顺序保证 view_product > add_to_cart > begin_checkout。
 # 权重 0 的三个事件不做泛化抽样，只从事实表反向保底生成（purchase 每有效单一条、
@@ -441,14 +583,10 @@ def prepare_globals(ctx: Ctx) -> None:
     _prep_social(ctx)
     _prep_user_level(ctx)
 
-    # user_attributions：刻意只覆盖部分用户。mart LEFT JOIN 后形成知识库写明的
-    # 「约六成 GMV 落在未归因」——这个缺口是治理发现的素材，不是缺陷。
-    nu = ctx.n("users")
-    ar = ctx.rng("user_attributions", "user_pick")
-    natt = min(ctx.n("user_attributions"), nu)
-    ctx.cache["attributed_users"] = np.sort(ar.choice(np.arange(1, nu + 1), size=natt,
-                                                      replace=False))
-    ctx.rows["user_attributions"] = natt
+    _prep_attributions(ctx)
+    # 必须在 _prep_attributions 之后：成本表的 installs / cost 从「归因到本渠道、
+    # 且当天注册的新客数」派生，那份真值在上一步才落地。
+    _prep_channel_costs(ctx)
 
 
 # ------------------------------------------------------- 商品域（D-02 / D-03）
@@ -709,6 +847,16 @@ def _prep_products(ctx: Ctx) -> None:
         "updated_at": created,
     }
 
+    # 叶子类目名 → 该类目下的 product_id。`build_posts` 用它把 `posts.product_ids`
+    # 指到「标题说的那个品类」的真实 SKU（P1-10）。键用叶子**名**而不是 category_id：
+    # 帖子那边只有一个品类词（`这台吹风机`），重名叶子（裤子/外套…）在这里合并成一个
+    # 键，正是想要的——「这条裤子」不必区分它挂在女装还是男装下。
+    by_lname: dict[str, list[int]] = {}
+    for i, ln in enumerate(lname.tolist()):
+        by_lname.setdefault(ln, []).append(int(pid[i]))
+    ctx.cache["products_by_leaf"] = {k: np.array(v, dtype=np.int64)
+                                     for k, v in by_lname.items()}
+
     # 回写维度 id：build_order_items 的外键与反范式商品名从这里取，不再读 data/csv。
     # 顺序必须在 prepare_globals 的最前面，否则 order_items 会拿到旧的 200 行。
     ctx.dim_ids["products"] = pid
@@ -776,12 +924,42 @@ def build_product_tags(ctx: Ctx, off: int, n: int) -> dict:
 
 
 def _prep_users(ctx: Ctx) -> None:
-    """注册时间 / VIP 全局化。orders、sessions 都要满足「先注册后行为」，
-    user_level 要读 VIP 和注册期，所以这几列不能分块抽。"""
+    """注册时间 / VIP / 三个唯一标识全局化。
+
+    注册时间与 VIP：orders、sessions 都要满足「先注册后行为」，user_level 要读 VIP
+    和注册期，所以这几列不能分块抽。
+
+    username / email / phone（P1-6/7）：**唯一性是全列的性质，分块抽拼不出来**。
+    这三列原来在 `build_users` 里逐块 `F.combine` / `F.from_pool`，组合空间分别是
+    24,576 / 6,000 / 40×10⁸，而 scale 427 有 213,500 个用户——前两列的重复率
+    88.5% / 72.7%，`COUNT(DISTINCT username)` 只有用户数的 11.5%。真实系统注册时
+    就查重，所以这里换成 `F.combine_unique` / `F.unique_digits`（唯一性由它们保证
+    并在里面自查）。判据在 selftest_closures.py::check_literals，负例
+    literal-username-duplicated / literal-phone-duplicated 盯的正是旧形态。
+
+    代价是这三列整列驻留内存：213,500 行 × 三列 U 串约 80MB，在 prepare_globals
+    的量级里可以忽略。
+    """
     nu = ctx.n("users")
     reg = F.ts_window(ctx.rng("users", "registered_at", "global"), nu,
                       ctx.start, ctx.days, trend=0.55)
     ctx.cache["users_registered_at"] = reg
+    # 昵称的分隔符只能是 `_`：用 `.` 会造出「中文字 + ASCII 句点」，正好是
+    # check_literals 认的 Faker 词沙拉指纹（WORD_SALAD_RE）。邮箱本地部分是拼音，
+    # 没有这个问题，那边用 `.` 更像真邮箱。
+    ctx.cache["users_username"] = F.combine_unique(
+        ctx.rng("users", "username", "global"), nu,
+        _pool(NICK_A), _pool(NICK_B), _pool(NICK_TAIL))
+    local = F.combine_unique(ctx.rng("users", "email_local", "global"), nu,
+                             _pool(PY_FAMILY), _pool(PY_GIVEN), _pool(MAIL_TAIL),
+                             sep=".")
+    # 本地部分唯一 ⇒ 整个邮箱唯一，所以域名照旧按份额权重独立抽。
+    domain = F.enum(ctx.rng("users", "email_domain", "global"), nu,
+                    MAIL_DOMAIN, MAIL_DOMAIN_W)
+    ctx.cache["users_email"] = np.char.add(np.char.add(local, "@"),
+                                           np.asarray(domain, dtype=str))
+    ctx.cache["users_phone"] = F.unique_digits(
+        ctx.rng("users", "phone", "global"), nu, _pool(PHONE_SEGMENTS), 8)
     ctx.cache["users_reg_day"] = (
         reg.astype("datetime64[D]") - ctx.start.astype("datetime64[D]")
     ).astype(np.int64)
@@ -952,13 +1130,12 @@ def _prep_orders(ctx: Ctx) -> None:
     ctx.cache["orders_item_count"] = cnt
     ctx.cache["order_items_order_id"] = F.expand_ids(F.pk(no, 1), cnt)
 
-    # 用券订单全局定下来：user_coupons 的核销行要反向对齐到 (user, coupon, order)
+    # 哪些订单用了券，全局定下来：user_coupons 的核销行要反向对齐到 (user, coupon, order)。
+    # **具体是哪张券在这里不定**，由 _prep_user_coupons 回写 ctx.cache["orders_coupon_id"]：
+    # 用户核销的券必须是他持有的那一张，而"持有"要受 coupons.per_user_limit 约束
+    # （P1-11）。方向只能是 user_coupons → orders：在这里先按 150 张券均匀抽的话，
+    # 一个用户在同一张限领 1 张的券上下 26 单也照样"合法"——实测就是这个形态。
     has_cp = ctx.rng("orders", "coupon_id", "global").random(no) < 0.38
-    cp_pick = F.from_pool(ctx.rng("orders", "cid", "global"), no,
-                          ctx.dim_ids["coupons"])
-    coupon = cp_pick.astype(object)
-    coupon[~has_cp] = None
-    ctx.cache["orders_coupon_id"] = coupon
     ctx.cache["orders_coupon_rows"] = np.flatnonzero(has_cp)      # 0-based
 
 
@@ -1091,18 +1268,121 @@ def _prep_payments(ctx: Ctx) -> None:
 
 
 def _prep_user_coupons(ctx: Ctx) -> None:
-    """核销闭环：orders 里带 coupon_id 的每一单，反向生成一行 status='used' 的券，
+    """领券持有 + 核销闭环，整列全局产。
+
+    ## 核销闭环（审计 L4.7，v2 已修）
+
+    orders 里带 coupon_id 的每一单，反向生成一行 status='used' 的券，
     (user_id, coupon_id, order_id) 三元对齐、used_at = 下单时刻；其余行只有
     unused / expired，且 expired 由 expire_at 是否已过窗末决定，不再随机抽。
+    旧版三个数字互相打架：orders 说 32.4 万单用券、user_coupons 说 485 万张已用、
+    还挂到了 85 万个不同订单上（平均 5.7 张/单）。
 
-    旧版三个数字互相打架（审计 L4.7）：orders 说 32.4 万单用券、user_coupons 说
-    485 万张已用、还挂到了 85 万个不同订单上（平均 5.7 张/单）。
+    ## 每人限领（P1-11，这一轮修）
+
+    `coupons.per_user_limit`（取值 {1,2,3,5}，150 张券合计 412）是维表里明写、卡片里
+    明写、DDL 注释里明写的约束，而 v2 完全没管它：券号在 build 里按 150 张均匀抽，
+    实测 10.0% 的 (user, coupon) 配对越限，最糟的一行是**限领 1 张、发了 26 张**。
+    v1 的 `scripts/generators/marketing_domain.py` 是靠逐行拒绝采样守住这条的，
+    向量化重写时丢了——和 device_brand/device_model 配对丢失是同一类回归。
+
+    修法是把"持有"建模成**槽位**：券 c 贡献 limit(c) 个槽位，全库 412 个。每个用户
+    从这 412 个槽位里**无放回**抽 cnt 个，于是同一张券最多拿到 limit(c) 次——限领
+    成了算术保证，不是概率。抽法是"给每个用户抽 412 个随机数、取最小的 cnt 个"，
+    等价于无放回抽样且无偏；一次性做要 21 万 × 412 的随机矩阵（约 700MB），所以按
+    用户分块。
+
+    两处连带后果：
+
+    1. **每个用户最多持有 412 张券**。fk_skewed 的集中度会让头部用户想要 3,331 张
+       （实测 scale 427），所以超出的部分要搬到还有余量的用户身上：1,339 个用户溢出
+       31.6 万行，占全表 3.3%。搬运按剩余余量加权，不是平摊——平摊会在"恰好 412 张"
+       上堆出一个可见的尖峰。
+    2. **订单的券号由这里回写**，方向从 orders → user_coupons 反了过来。用户核销的券
+       必须是他持有的那一张，反方向做不到（见 _prep_orders 里那段注释）。
+
+    内存（scale 427，970 万行）：user_id + coupon_id 两条 int64 约 155MB，
+    槽位下标 int16 约 19MB。
     """
-    n_used = len(ctx.cache["orders_coupon_rows"])
-    if n_used > ctx.n("user_coupons"):
+    n_uc, nu = ctx.n("user_coupons"), ctx.n("users")
+    limits = ctx.dim_ids["_coupon_limits"]
+    # 槽位表：券 c 连续出现 limit(c) 次。排布顺序无关——每个用户拿到的是槽位下标的
+    # 一个**均匀随机子集**，所以券的边际分布本来就是均匀的，不必再打散一遍。
+    slot_coupon = np.concatenate(
+        [np.full(limits[int(c)], int(c), dtype=np.int64) for c in ctx.dim_ids["coupons"]])
+    cap = len(slot_coupon)
+
+    cp_rows = ctx.cache["orders_coupon_rows"]
+    o_uid = ctx.cache["orders_user_id"][cp_rows]
+    n_used = len(cp_rows)
+    if n_used > n_uc:
         raise ValueError(f"用券订单 {n_used} 超过 user_coupons 行预算 "
                          f"{ctx.n('user_coupons')}，先调 budget")
+    used_cnt = np.bincount(o_uid, minlength=nu + 1)[1:]
+    if int(used_cnt.max()) > cap:
+        raise ValueError(f"有用户下了 {used_cnt.max()} 单用券，超过全库槽位总数 {cap}，"
+                         f"限领无论怎么分配都守不住——先调 orders 的用券比例或 budget")
+
+    # 未核销行的用户仍按 fk_skewed 的集中度抽，再把越过 cap 的部分搬走
+    want = np.bincount(F.fk_skewed(ctx.rng("user_coupons", "user_id", "global"),
+                                   n_uc - n_used, 1, nu), minlength=nu + 1)[1:]
+    cnt = used_cnt + want
+    spill = int(np.maximum(cnt - cap, 0).sum())
+    cnt = np.minimum(cnt, cap)
+    sr = ctx.rng("user_coupons", "spill", "global")
+    for _ in range(32):
+        if spill == 0:
+            break
+        room = cap - cnt
+        pick = sr.choice(nu, size=spill, replace=True, p=room / room.sum())
+        add = np.minimum(np.bincount(pick, minlength=nu), room)
+        cnt += add
+        spill -= int(add.sum())
+    if spill:
+        raise ValueError(f"槽位余量搬运 32 轮后仍剩 {spill} 行安置不下（全库容量 "
+                         f"{nu * cap}，需要 {n_uc}）")
+    assert int(cnt.sum()) == n_uc, (int(cnt.sum()), n_uc)
+
+    # 每个用户无放回抽 cnt[u] 个槽位下标
+    start = np.concatenate(([0], np.cumsum(cnt)))
+    slot_of = np.empty(n_uc, dtype=np.int16)
+    r = ctx.rng("user_coupons", "slots", "global")
+    CHUNK = 20_000
+    for a in range(0, nu, CHUNK):
+        b = min(a + CHUNK, nu)
+        k = cnt[a:b]
+        if int(k.max()) == 0:
+            continue
+        rank = np.argsort(r.random((b - a, cap)), axis=1)      # 每行一个随机排列
+        slot_of[start[a]:start[b]] = rank[np.arange(cap)[None, :] < k[:, None]]
+
+    # 核销段：每个用户的前 used_cnt[u] 个槽位配给他的用券订单（订单序）
+    ord_u = np.argsort(o_uid, kind="stable")
+    ustart = np.concatenate(([0], np.cumsum(used_cnt)))
+    off_in_grp = np.arange(n_used) - np.repeat(ustart[:-1], used_cnt)
+    used_slot = np.empty(n_used, dtype=np.int64)
+    used_slot[ord_u] = slot_of[np.repeat(start[:-1], used_cnt) + off_in_grp]
+
+    # 未核销段：每个用户剩下的槽位。按用户顺序摊平后整体打乱——不打乱的话整段
+    # 按 user_id 排好序，`SELECT * FROM user_coupons LIMIT 20` 会全是同一个人。
+    g = cnt - used_cnt
+    n_free = n_uc - n_used
+    off_in_grp = np.arange(n_free) - np.repeat(
+        np.concatenate(([0], np.cumsum(g)))[:-1], g)
+    free_slot = slot_of[np.repeat(start[:-1] + used_cnt, g) + off_in_grp]
+    free_uid = np.repeat(np.arange(1, nu + 1, dtype=np.int64), g)
+    shuf = ctx.rng("user_coupons", "shuffle", "global").permutation(n_free)
+
+    uc_uid = np.concatenate([o_uid, free_uid[shuf]])
+    uc_cp = np.concatenate([slot_coupon[used_slot], slot_coupon[free_slot[shuf]]])
+    ctx.cache["uc_user_id"] = uc_uid
+    ctx.cache["uc_coupon_id"] = uc_cp
     ctx.cache["uc_n_used"] = n_used
+
+    # 回写订单的券号（见本函数与 _prep_orders 的注释：方向是 user_coupons → orders）
+    coupon = np.full(ctx.n("orders"), None, dtype=object)
+    coupon[cp_rows] = slot_coupon[used_slot]
+    ctx.cache["orders_coupon_id"] = coupon
 
 
 def _prep_behavior(ctx: Ctx) -> None:
@@ -1201,6 +1481,17 @@ def _prep_behavior(ctx: Ctx) -> None:
     ev_time = np.concatenate([g_time.astype("datetime64[s]")]
                              + [t.astype("datetime64[s]") for t in res_time])
     ev_time = np.minimum(ev_time, win_end - np.timedelta64(1, "s"))
+    # purchase 段在 events 数组里的位置：泛化段 n_generic 行 + register 段 nu 行之后，
+    # 第 k 行对应 valid_idx[k] 那一单。记下来给 build_events 填 properties——
+    # `{"amount", "order_id"}` 两个键因此指向**真的那一单**，而不是另抽一份
+    # （v1 就是另抽的：order_id 是不接任何表的 12 位随机数，卡片专门写了一段
+    # ⚠️ 说它 JOIN 不上）。order_id 用 valid_idx + 1 是因为 build_orders 的主键是
+    # `F.pk(no, 1)`，即 1..no 与行下标一一对应。
+    ctx.cache["events_purchase"] = {
+        "lo": n_generic + nu,
+        "order_id": (valid_idx + 1).astype(np.int64),
+        "amount": og["actual_amount"][valid_idx],
+    }
     ctx.cache["events"] = {
         "session_id": ev_sess,
         "user_id": np.concatenate([sess_user[g_sess - 1]] + res_uid),
@@ -1393,22 +1684,15 @@ def build_users(ctx: Ctx, off: int, n: int) -> dict:
     sl = slice(off, off + n)
     uid = F.pk(n, off + 1)
     reg = ctx.cache["users_registered_at"][sl]
-    # 三列都是 D-04 占位符（旧：user_N / user_N@example.com / "103"+序号）。
+    # 三列都是 D-04 占位符（旧：user_N / user_N@example.com / "103"+序号），
+    # 现在全部来自全局 cache——它们要**全列唯一**，分块抽做不到（见 _prep_users）。
     # email 不再由 username 派生：username 是中文昵称，进不了邮箱本地部分。
     # 手机号 = 真实号段 + 8 位随机尾，满足 ^1[3-9]\d{9}$（旧版第二位是 0，全不合规）。
-    local = F.combine(ctx.rng("users", "email_local", off), n,
-                      _pool(PY_FAMILY), _pool(PY_GIVEN), _pool(MAIL_TAIL))
-    domain = F.enum(ctx.rng("users", "email_domain", off), n, MAIL_DOMAIN, MAIL_DOMAIN_W)
-    tail8 = np.char.zfill(F.int_uniform(ctx.rng("users", "phone_tail", off), n,
-                                        0, 9999_9999).astype("U8"), 8)
     return {
         "user_id": uid,
-        "username": F.combine(ctx.rng("users", "username", off), n,
-                              _pool(NICK_A), _pool(NICK_B), _pool(NICK_TAIL)),
-        "email": np.char.add(np.char.add(local, "@"), np.asarray(domain, dtype=str)),
-        "phone": np.char.add(np.asarray(F.from_pool(ctx.rng("users", "phone_seg", off), n,
-                                                    _pool(PHONE_SEGMENTS)), dtype=str),
-                             tail8),
+        "username": ctx.cache["users_username"][sl],
+        "email": ctx.cache["users_email"][sl],
+        "phone": ctx.cache["users_phone"][sl],
         "registered_at": reg,
         # 取值与权重都取自 knowledge/domains/user/users.md 的实测表（权重直接用实测
         # 行数，F.enum 不要求归一化——这样每个数字都能在卡片里指回原处）。旧值
@@ -1641,6 +1925,93 @@ def build_sessions(ctx: Ctx, off: int, n: int) -> dict:
     }
 
 
+# 带属性的 4 种事件。其余 21 种是 `{}`（空 JSON，不是 NULL），这一条写在
+# knowledge/domains/behavior/events.md 的「properties 事件属性（实测形状）」里。
+_PROP_EVENTS = ("view_product", "add_to_cart", "purchase", "search")
+
+
+def _search_keywords(ctx: Ctx) -> tuple[np.ndarray, np.ndarray]:
+    """搜索词池与权重。词池就是 semantics.yaml 的 120 个叶子类目名。
+
+    不另立一份关键词表：搜索词必须是站内真的存在的东西，否则「搜索词 TOP 10 里
+    哪些类目缺货」这类问题会拿到一批 `products` 里根本没有的词。v1 的池只有 5 个词
+    （连衣裙 / 运动鞋 / 护肤品 / 零食 / 手机），其中「护肤品」是中间层类目而不是叶子。
+
+    权重按一个平移 Zipf `1/(10+rank)` 打在**打乱后**的顺序上，不用均匀分布：120 个词
+    均匀分下来每个约 0.83%，TOP 10 是哪十个词就完全由抽样噪声决定，而「搜索词 TOP 10」
+    是卡片里的参考查询之一。分母上的 10 是压头部用的：不平移时头部词独占约 18%
+    （调偏移之前实测 507 条搜索里「腮红」92 条），平移后头部约 3.9%、头尾差 12.9 倍，
+    像个长尾而不像一个词把榜霸了。打乱的种子只吃 ctx.seed、不吃 off，所以各分块共用
+    同一套热度——热度表若随分块变，分片数一改 TOP 10 就换一批。
+    """
+    key = "_search_kw"
+    if key not in ctx.cache:
+        pool = _post_objects()[1]
+        order = ctx.rng("events", "keyword_pop").permutation(len(pool))
+        w = 1.0 / (10.0 + np.arange(len(pool), dtype=np.float64))
+        ctx.cache[key] = (pool[order], w / w.sum())
+    return ctx.cache[key]
+
+
+def _event_properties(ctx: Ctx, off: int, n: int, ev_name: np.ndarray) -> np.ndarray:
+    """events.properties：4 种事件填真属性，其余 21 种给 `{}`。
+
+    原来整列是 `F.const(n, {})`。后果是 `events.md` / `event_definitions.md` 里三段
+    `json_extract_scalar(properties, '$.…')` 的参考 SQL 在新数据上**返回空集且不报错**，
+    以及 L2 退化列体检把它报成「整列同一个值 '{}'」。四种形状逐键照卡片抄，键的顺序
+    也照抄——卡片里贴的是实测样例，agent 会按那个样例写下钻 SQL。
+
+    取值一律引用已生成的事实，不另抽一份：product_id / product_name 取 products 缓存
+    （所以 `$.product_id` JOIN 得回 `products`），amount / order_id 取该 purchase 事件
+    对应的那一单（所以按属性金额求和 == 按 orders.actual_amount 求和），keyword 取叶子
+    类目名。判据方向：这四条 JOIN 有任意一条落空，就是这里或 _prep_behavior 的段位算错了。
+    """
+    out = F.const(n, {})                     # 默认 `{}`，同一引用，21 种事件走这条
+    rng = ctx.rng("events", "properties", off)
+    prods = ctx.cache["products"]
+    pid, pname = prods["product_id"], prods["product_name"]
+
+    m = ev_name == "view_product"
+    k = int(m.sum())
+    if k:
+        pick = rng.integers(0, len(pid), k)
+        out[m] = [{"product_id": int(pid[i]), "product_name": str(pname[i])}
+                  for i in pick.tolist()]
+
+    m = ev_name == "add_to_cart"
+    k = int(m.sum())
+    if k:
+        # 件数 1/2/3 权重取 v1 实测（293/299/246，基本均匀，偏向 1~2 件）
+        qty = F.int_weighted(rng, k, [1, 2, 3], [293, 299, 246])
+        pick = rng.integers(0, len(pid), k)
+        out[m] = [{"quantity": int(q), "product_id": int(pid[i])}
+                  for q, i in zip(qty.tolist(), pick.tolist())]
+
+    m = ev_name == "search"
+    k = int(m.sum())
+    if k:
+        pool, w = _search_keywords(ctx)
+        kw = pool[rng.choice(len(pool), size=k, replace=True, p=w)]
+        out[m] = [{"keyword": str(x)} for x in kw.tolist()]
+
+    # purchase 不抽：它在 events 数组里是「每有效单一条」的保底段，第几行对应第几单
+    # 是定死的（见 _prep_behavior 里的 events_purchase）。这里把本分块落在那段里的
+    # 行切出来，逐行填它自己那一单的金额与单号。
+    m = ev_name == "purchase"
+    k = int(m.sum())
+    if k:
+        pu = ctx.cache["events_purchase"]
+        gidx = np.flatnonzero(m) + off - pu["lo"]
+        assert gidx.size and gidx[0] >= 0 and gidx[-1] < len(pu["order_id"]), (
+            f"purchase 事件落在保底段之外：off={off} n={n} "
+            f"段起点={pu['lo']} 段长={len(pu['order_id'])} 命中下标"
+            f"[{gidx[0]}, {gidx[-1]}]。段位算错了，别放宽这条断言——"
+            f"放宽的后果是 properties 里的金额和单号张冠李戴，而且不报错")
+        out[m] = [{"amount": float(pu["amount"][i]), "order_id": int(pu["order_id"][i])}
+                  for i in gidx.tolist()]
+    return out
+
+
 def build_events(ctx: Ctx, off: int, n: int) -> dict:
     # user/session/时间/事件名全部来自 _prep_behavior：事件继承所属会话的用户与
     # 时间窗，事件名按漏斗权重（旧版三者独立抽——漏斗恒 100%、留存不衰减、
@@ -1650,14 +2021,15 @@ def build_events(ctx: Ctx, off: int, n: int) -> dict:
     names = ctx.dim_ids["event_definitions"]
     uid = g["user_id"][sl]
     ev_time = g["event_time"][sl]
+    ev_name = names[g["name_idx"][sl]]
     return {
         "event_id": F.pk(n, off + 1),
         "user_id": uid,
         "device_id": F.opaque_id(uid),          # 与 sessions 同一映射，两表必须一致
         "session_id": g["session_id"][sl],
-        "event_name": names[g["name_idx"][sl]],
+        "event_name": ev_name,
         "event_time": ev_time,
-        "properties": F.const(n, {}),
+        "properties": _event_properties(ctx, off, n, ev_name),
         "page_name": F.from_pool(ctx.rng("events", "page_name", off), n, _pool(PAGES)),
         # 与 page_views 共用同一份来源池：两张表都在描述「用户从哪儿来的」，各自维护
         # 一份取值域的话，同一个来源在两表里拼不起来（events 这边原来只有两个非空值，
@@ -1708,6 +2080,69 @@ def build_page_views(ctx: Ctx, off: int, n: int) -> dict:
 
 
 # ---------------------------------------------------------------- 社交域
+#
+# 下面三个 `_post_*` 是 posts 那三个数组列的产出点（P1-10）。它们都逐行拼 Python
+# list——数组列在 numpy 里只能是 object 数组，向量化拼不出「每行长度不同的列表」。
+# 代价可控：posts 是 FACT×1000，8000 万规模上 42.7 万行，不是千万行级的那几张表。
+
+def _post_n(rng: np.random.Generator, ctype: np.ndarray,
+            spec: dict[str, tuple[int, int]]) -> np.ndarray:
+    """按 content_type 逐行抽个数。spec 是 {类型: (下限, 上限)}，左右闭区间。"""
+    lo = np.array([spec[c][0] for c in ctype.tolist()], dtype=np.int64)
+    hi = np.array([spec[c][1] for c in ctype.tolist()], dtype=np.int64)
+    return lo + (rng.random(len(lo)) * (hi - lo + 1)).astype(np.int64)
+
+
+def _post_media(ctx: Ctx, off: int, pid: np.ndarray, ctype: np.ndarray) -> np.ndarray:
+    """媒体文件 URL。路径形态照抄 products.image_urls，短视频给 .mp4。
+
+    URL 里带 post_id，所以整列天然唯一、也能一眼看出属于哪个帖子。不做「草稿没有
+    媒体」这种区分：草稿是写了没发，图片早就传上去了。
+    """
+    k = _post_n(ctx.rng("posts", "media_urls", off), ctype, POST_MEDIA_N)
+    ext = np.where(ctype == "short_video", "mp4", "jpg")
+    out = np.empty(len(pid), dtype=object)
+    out[:] = [[f"https://cdn.example.com/posts/{p}/{j}.{e}" for j in range(1, m + 1)]
+              for p, m, e in zip(pid.tolist(), k.tolist(), ext.tolist())]
+    return out
+
+
+def _post_tags(ctx: Ctx, off: int, n: int, leaf: np.ndarray) -> np.ndarray:
+    """话题标签。**第一个标签恒为本帖的品类词**，后面接 1~3 个运营话题。
+
+    品类词打头是这一列的用处所在：`tags` 与 `product_ids`、标题三者指向同一件事，
+    「按话题看内容表现」和「按品类看种草效果」才对得上。运营话题无放回抽，
+    免得同一帖出现两个一样的标签。
+    """
+    r = ctx.rng("posts", "tags", off)
+    k = F.int_uniform(r, n, 1, 3)
+    pick = np.argsort(r.random((n, len(POST_TAGS))), axis=1)[:, :3]
+    pool = np.array(POST_TAGS, dtype=object)
+    out = np.empty(n, dtype=object)
+    out[:] = [[lf] + pool[p[:m]].tolist()
+              for lf, p, m in zip(leaf.tolist(), pick, k.tolist())]
+    return out
+
+
+def _post_products(ctx: Ctx, off: int, n: int, ctype: np.ndarray,
+                   leaf: np.ndarray) -> np.ndarray:
+    """关联商品。取值只从**本帖品类**的 SKU 里挑，个数按 content_type（review 恒 1）。
+
+    这是 P1-10 的落点：`knowledge/relationships.md` 声明的 products ↔ posts N:N
+    此前没有任何一行数据兑现，卡片里那段 `UNNEST(product_ids)` 的种草分析恒返回 0 行。
+    同品类内无放回挑，所以「对比了五家」那种多商品帖也讲得通；跨品类不挑，因为那会
+    让标题和关联商品互相打脸。
+    """
+    by_leaf = ctx.cache["products_by_leaf"]
+    r = ctx.rng("posts", "product_ids", off)
+    k = _post_n(r, ctype, POST_PROD_N)
+    out = np.empty(n, dtype=object)
+    out[:] = [[] if m == 0 else
+              r.choice(by_leaf[lf], size=min(m, len(by_leaf[lf])),
+                       replace=False).tolist()
+              for lf, m in zip(leaf.tolist(), k.tolist())]
+    return out
+
 
 def build_posts(ctx: Ctx, off: int, n: int) -> dict:
     pid = F.pk(n, off + 1)
@@ -1723,25 +2158,33 @@ def build_posts(ctx: Ctx, off: int, n: int) -> dict:
     cn = ctx.cache["posts_counters"]
     # D-04：旧版 post_N / 内容正文 N。标题与正文**共用同一次抽样**（core），
     # 各抽一次会造出「标题写加湿器、正文写跑鞋」的同帖自相矛盾——那比占位符更糟。
-    core = F.combine(ctx.rng("posts", "title", off), n,
-                     _pool(POST_OPEN), _pool(POST_OBJ), _pool(POST_VERDICT))
+    # 对象短语单独抽一条流（不再和开场 / 结论挤在 F.combine 的一条流里）：下标 oi
+    # 要留给 tags 和 product_ids 用，那两列必须和标题说的是同一个品类（P1-10）。
+    obj_ph, obj_leaf = _post_objects()
+    oi = F.int_uniform(ctx.rng("posts", "obj", off), n, 0, len(obj_ph) - 1)
+    core = np.char.add(np.char.add(
+        np.asarray(F.from_pool(ctx.rng("posts", "open", off), n, _pool(POST_OPEN)),
+                   dtype=str),
+        np.asarray(obj_ph[oi], dtype=str)),
+        np.asarray(F.from_pool(ctx.rng("posts", "verdict", off), n,
+                               _pool(POST_VERDICT)), dtype=str))
     _t = np.char.add(core, np.asarray(
         F.from_pool(ctx.rng("posts", "title_tail", off), n, _pool(POST_TAIL)), dtype=str))
     _c = np.char.add(np.char.add(core, "。"), np.asarray(
         F.from_pool(ctx.rng("posts", "body", off), n, _pool(POST_BODY)), dtype=str))
+    ctype = F.enum(ctx.rng("posts", "content_type", off), n,
+                   ["article", "short_video", "image", "review"], [20, 32, 28, 20])
     return {
         "post_id": pid,
         "user_id": F.fk_skewed(ctx.rng("posts", "user_id", off), n, 1, ctx.n("users")),
-        "content_type": F.enum(ctx.rng("posts", "content_type", off), n,
-                               ["article", "short_video", "image", "review"],
-                               [20, 32, 28, 20]),
+        "content_type": ctype,
         "title": _t,
         "content": _c,
-        "media_urls": F.const(n, []),
-        "tags": F.const(n, []),
+        "media_urls": _post_media(ctx, off, pid, ctype),
+        "tags": _post_tags(ctx, off, n, obj_leaf[oi]),
         "location": F.from_pool(ctx.rng("posts", "location", off), n,
                                 _pool([c[0] for c in CITIES])),
-        "product_ids": F.const(n, []),
+        "product_ids": _post_products(ctx, off, n, ctype, obj_leaf[oi]),
         "view_count": cn["view_count"][sl],
         "like_count": cn["like_count"][sl],
         "comment_count": cn["comment_count"][sl],
@@ -1906,7 +2349,9 @@ def build_orders(ctx: Ctx, off: int, n: int) -> dict:
         # 用券订单全局定（user_coupons 的核销行要对齐它，审计 L4.7）
         "item_count": ctx.cache["orders_item_count"][sl],
         "coupon_id": ctx.cache["orders_coupon_id"][sl],
-        "shipping_address": F.const(n, {"province": "广东", "city": "深圳"}),
+        # 见 SHIP_ADDRESSES：原来整列同一个深圳地址，且因为非空、又是 JSONB，没有任何判据会拦。
+        "shipping_address": F.enum(ctx.rng("orders", "ship_addr", off), n,
+                                   SHIP_ADDRESSES, SHIP_ADDRESSES_W),
         # null_out 仍用原来那条随机流，所以**哪些行为空一行没动**；变的只是非空行
         # 从「同一句话」换成 ORDER_REMARKS 里的一条（取值用独立流）。
         "remark": F.null_out(ctx.rng("orders", "remark", off),
@@ -1921,10 +2366,17 @@ def build_orders(ctx: Ctx, off: int, n: int) -> dict:
                                  2880, 10080, ctx.as_of_end),
         "cancelled_at": _cond_ts(ctx.rng("orders", "cancelled_at", off), placed, canc_m,
                                  5, 1440, ctx.as_of_end),
-        "cancel_reason": np.where(canc_m, "用户取消", None),
+        # 哪些行非空一行没动（还是 canc_m / refund_m），变的只是非空行的取值不再是同一句话。
+        "cancel_reason": np.where(canc_m,
+                                  F.enum(ctx.rng("orders", "cancel_reason", off), n,
+                                         ORDER_CANCEL_REASONS, ORDER_CANCEL_REASONS_W),
+                                  None),
         "refunded_at": _cond_ts(ctx.rng("orders", "refunded_at", off), placed, refund_m,
                                 1440, 20160, ctx.as_of_end),
-        "refund_reason": np.where(refund_m, "商品问题", None),
+        "refund_reason": np.where(refund_m,
+                                  F.enum(ctx.rng("orders", "refund_reason", off), n,
+                                         ORDER_REFUND_REASONS, ORDER_REFUND_REASONS_W),
+                                  None),
         "created_at": placed,
         "updated_at": placed,
     }
@@ -2035,34 +2487,281 @@ def build_subscriptions(ctx: Ctx, off: int, n: int) -> dict:
 # ---------------------------------------------------------------- 归因域
 
 def build_user_attributions(ctx: Ctx, off: int, n: int) -> dict:
-    users = ctx.cache["attributed_users"][off:off + n]
-    aid = F.pk(n, off + 1)
-    chans = ctx.dim_ids["channels"]
-    click = F.ts_window(ctx.rng("user_attributions", "click_time", off), n, ctx.start,
-                        ctx.days)
-    d2i = F.int_weighted(ctx.rng("user_attributions", "days_to_install", off), n,
-                         [0, 1, 2, 5], [62, 22, 10, 6])
+    """全部列都在 `_prep_attributions` 里算好，这里只切片。
+
+    提到 prep 的理由不是省事：`channel_daily_costs` 的 installs / cost 必须从
+    「归因到本渠道、且当天注册的新客数」派生，否则 CAC = cost / new_users 两边
+    各说各话。builder 里现抽的话，成本表拿不到这份真值。
+    """
+    s = slice(off, off + n)
+    click = ctx.cache["attr_click"][s]
+    d2i = ctx.cache["attr_d2i"][s]
     return {
-        "attribution_id": aid,
-        "user_id": users,
-        "channel_id": F.from_pool(ctx.rng("user_attributions", "channel_id", off), n, chans),
-        "ad_campaign_id": F.null_out(
-            ctx.rng("user_attributions", "ad_campaign_id", off),
-            F.from_pool(ctx.rng("user_attributions", "acid", off), n,
-                        ctx.dim_ids["ad_campaigns"]), 0.35),
-        "creative_id": F.null_out(
-            ctx.rng("user_attributions", "creative_id", off),
-            F.from_pool(ctx.rng("user_attributions", "crid", off), n,
-                        ctx.dim_ids["ad_creatives"]), 0.40),
-        # 卡片：只有 first_touch / last_touch，各 175 行，**没有** linear
+        "attribution_id": F.pk(n, off + 1),
+        "user_id": ctx.cache["attributed_users"][s],
+        "channel_id": ctx.cache["attr_channel"][s],
+        "ad_campaign_id": ctx.cache["attr_acid"][s],
+        "creative_id": ctx.cache["attr_crid"][s],
+        # 卡片：只有 first_touch / last_touch 两种，各占一半，**没有** linear
         # （按 linear 筛是空集）。两种归因分给的是**不同的用户**，不是同一用户的两个视角。
-        "attribution_type": F.enum(ctx.rng("user_attributions", "attribution_type", off),
-                                   n, ["first_touch", "last_touch"], [175, 175]),
+        "attribution_type": ctx.cache["attr_type"][s],
         "click_time": click,
         "install_time": click.astype("datetime64[s]") + (d2i * 86400).astype("timedelta64[s]"),
         "attributed_at": click,
         "days_to_install": d2i,
-        "tracking_params": F.const(n, {"utm_source": "douyin"}),
+        # utm_source 取本行渠道自己的 platform（channels.csv 的那一列），不是常量。
+        # 原来这里是 F.const(n, {"utm_source": "douyin"})：App Store、直接访问这些行
+        # 也写着 douyin，按它统计渠道会得到「100% 来自抖音」而同一行的 channel_id
+        # 就在旁边。这一列是 JSONB，不在 verify_literals 的形态普查面里，也不是 NULL，
+        # 所以没有任何一层会拦——只有 verify_constants 的「整列同一个值」抓得到它。
+        "tracking_params": ctx.cache["attr_tracking"][s],
+    }
+
+
+def _prep_attributions(ctx: Ctx) -> None:
+    """归因表全量落地。规模上限：scale=427 时 14.9 万行，几 MB，可以整表持有。
+
+    user_attributions 刻意只覆盖部分用户。mart LEFT JOIN 后形成知识库写明的
+    「约六成 GMV 落在未归因」——这个缺口是治理发现的素材，不是缺陷。
+    """
+    nu = ctx.n("users")
+    ar = ctx.rng("user_attributions", "user_pick")
+    natt = min(ctx.n("user_attributions"), nu)
+    ctx.cache["attributed_users"] = np.sort(
+        ar.choice(np.arange(1, nu + 1), size=natt, replace=False))
+    ctx.rows["user_attributions"] = natt
+
+    chans = ctx.dim_ids["channels"]
+    ch = F.from_pool(ctx.rng("user_attributions", "channel_id", 0), natt, chans)
+    ctx.cache["attr_channel"] = ch
+    ctx.cache["attr_type"] = F.enum(
+        ctx.rng("user_attributions", "attribution_type", 0), natt,
+        ["first_touch", "last_touch"], [175, 175])
+    ctx.cache["attr_click"] = F.ts_window(
+        ctx.rng("user_attributions", "click_time", 0), natt, ctx.start, ctx.days)
+    ctx.cache["attr_d2i"] = F.int_weighted(
+        ctx.rng("user_attributions", "days_to_install", 0), natt,
+        [0, 1, 2, 5], [62, 22, 10, 6])
+
+    # ad_campaign_id / creative_id 必须落在**本渠道**的活动上。
+    # 旧版从全部 50 个活动里均匀抽再按 35% / 40% 随机置空，于是「归因到抖音信息流的
+    # 用户挂着一个百度搜索的广告活动」大量存在——「按活动看花费」和「按渠道看花费」
+    # 两条口径会互相矛盾，而两边单看都自洽，没有任何一步会报错。
+    #
+    # 现在改成：organic / referral / direct 渠道**必然为 NULL**（自然流量没有广告活动，
+    # 这是语义而不是概率），paid / kol 渠道从本渠道的活动里抽。旧版随机置空率 35%，
+    # 新规则下 5/14 个渠道为空约 36%——量级上没动，但从"随机"变成"有据"。
+    camps = ctx.dim_ids["_campaigns_by_channel"]
+    creas = ctx.dim_ids["_creatives_by_campaign"]
+    r_ac = ctx.rng("user_attributions", "acid", 0)
+    r_cr = ctx.rng("user_attributions", "crid", 0)
+    acid = np.empty(natt, dtype=object)
+    crid = np.empty(natt, dtype=object)
+    for cid, pool in camps.items():
+        m = ch == cid
+        k = int(m.sum())
+        if k == 0:
+            continue
+        picked = np.asarray(pool, dtype=np.int64)[r_ac.integers(0, len(pool), size=k)]
+        acid[m] = picked.tolist()
+        # 素材：有活动才可能有素材，且不是每次归因都能追到素材（约 20% 追不到）。
+        cr = [None if not creas.get(int(p)) else
+              creas[int(p)][int(r_cr.integers(0, len(creas[int(p)])))] for p in picked]
+        drop = r_cr.random(k) < 0.20
+        crid[m] = [None if d else v for v, d in zip(cr, drop)]
+    ctx.cache["attr_acid"] = acid
+    ctx.cache["attr_crid"] = crid
+
+    # tracking_params：utm_source = 本行渠道的 platform。逐行按 channel_id 查表，
+    # 所以这一列和 channel_id JOIN channels 得到的 platform 永远一致——这是它唯一
+    # 该满足的性质。14 个渠道落在 11 个 platform 上（douyin / xiaohongshu / weixin
+    # 各占 2 个渠道），所以这一列的基数是 11，不是 14。
+    plat = ctx.dim_ids["_channel_platforms"]
+    missing = sorted({int(c) for c in np.unique(ch)} - set(plat))
+    if missing:
+        raise ValueError(f"channels.csv 缺 platform 的 channel_id：{missing}")
+    ctx.cache["attr_tracking"] = np.array(
+        [{"utm_source": plat[int(c)]} for c in ch], dtype=object)
+
+
+# ------------------------------------------------------------ 投放成本（P0-5）
+
+# 单客成本乘数：键 = channel_id，值 = 相对本 channel_type 基准 CPI 的倍数。
+#
+# 为什么显式钉一份而不是随机抽：
+#  1. eval 有「CAC 最高 / 最低的渠道是哪个」这类 Top-1 题（#25），答案必须唯一且稳定。
+#     **两端**刻意留 ≥1.55 倍间隔（4.30 vs 2.70、0.63 vs 0.40），Top-1 / Bottom-1 因此
+#     不可能被取整和保底花费翻过去。中间几档只差约 1.25 倍，全序在 scale=20 实测与
+#     乘数序完全一致，但**只有两端是算出来有保证的**——别拿中间的名次当断言。
+#  2. 语义要说得通：搜索类渠道意图强、转化好，CAC 最低；KOL 种草最贵。乘数按这个排，
+#     **不按 channel_id 排**——按 id 单调递增会留下"CAC 随渠道编号递增"这种一眼假的痕迹。
+# 键集合必须恰好等于 channels.csv 里 paid+kol 那 9 个，_prep_channel_costs 有断言。
+CHANNEL_CPI_MULT = {
+    1: 1.30,     # 抖音信息流
+    2: 0.63,     # 抖音搜索
+    3: 2.05,     # 小红书种草
+    4: 0.40,     # 小红书搜索 —— 最低 CAC
+    5: 1.65,     # 微信朋友圈广告
+    7: 1.05,     # 百度搜索
+    8: 0.80,     # 快手信息流
+    9: 4.30,     # 微博 KOL —— 最高 CAC
+    14: 2.70,    # B 站 UP 主
+}
+
+# 按 channel_type 的投放基准。这四个数一起决定漏斗上四列的量级：
+#   impressions --ctr--> clicks --cvr--> installs --reg_rate--> 归因新客
+# cpi 是每次激活的成本（元）。CAC = cpi / reg_rate，两类算下来分别是 16.4 / 15.8，
+# **刻意取得几乎相等**：让渠道之间的 CAC 差异只来自 CHANNEL_CPI_MULT，
+# 不被 channel_type 混进来，否则那张乘数表就不再是 CAC 排序的唯一依据。
+CHANNEL_TYPE_ECON = {
+    "paid": {"cpi": 9.0, "reg_rate": 0.55, "cvr": 0.030, "ctr": 0.020},
+    "kol":  {"cpi": 6.0, "reg_rate": 0.38, "cvr": 0.045, "ctr": 0.012},
+}
+
+# 零新客那天的保底激活量，按该渠道**窗内日均激活量**的比例给。真实投放不会因为
+# 某天没拉到注册就停投；而且这些天是 `cost / nullif(new_users, 0)` 里 NULL 分支的
+# 唯一来源——knowledge/metrics/governed_metrics.md 专门讲了这个分支，数据里必须真有它。
+COST_FLOOR_SHARE = 0.10
+COST_JITTER = 0.12       # 逐日花费抖动 ±12%
+FUNNEL_JITTER = 0.15     # 逐日 clicks / impressions 抖动 ±15%
+
+
+def _prep_channel_costs(ctx: Ctx) -> None:
+    """9 个投放渠道 × 311 天的成本网格；窗内 91 天的 installs / cost 从归因新客反推。
+
+    ## 为什么必须从归因反推
+
+    `mart_channel_daily` 的 CAC 是 `cost / nullif(new_users_attributed, 0)`，分母口径写死在
+    `database/iceberg/02_mart.sql:296-369`：「`attribution_type = 'last_touch'` 归因到本渠道、
+    且 `CAST(users.registered_at AS date)` 落在这一天的用户数」。分子若独立乱抽，CAC 就是
+    两个无关随机数的比值——v1 数据实测 244,774 installs 配全库 500 个用户（490 倍），
+    CAC ¥2,900/人，凡是碰 CAC / ROI 的题全错，而每一层校验都是绿的。
+
+    方向只能是**分母 → 分子**：新客数是 user_attributions 和 users 已经落地的事实，
+    成本是唯一还没落地的那一侧，所以它去适配前者。这也是 `prepare_globals()` 里
+    本函数必须排在 `_prep_attributions` 之后的原因。
+
+    ## 为什么轴仍然铺到 2026-09-01
+
+    见 `budget.COST_AXIS_END` 的注释：那是「禁用每张表自己的 max(时间列)」这条铁律的
+    唯一具体例子，写进了提示词和 8 张卡片。这里只修量，不动轴。
+
+    ## 轴外那 220 天为什么是平的
+
+    轴外每天的激活量 = 该渠道**窗内日均**，只叠 ±12% 抖动，不编趋势。那段没有任何
+    业务事实可对照（没有归因、没有订单），编出来的趋势会被当成真的拿去解读。
+    """
+    paid = ctx.dim_ids["_paid_channels"]
+    ch_type = ctx.dim_ids["_channel_types"]
+    camps = ctx.dim_ids["_campaigns_by_channel"]
+    spans = ctx.dim_ids["_campaign_spans"]
+    nch, naxis, win = len(paid), budget.COST_AXIS_DAYS, ctx.days
+
+    missing = sorted(set(paid.tolist()) - set(CHANNEL_CPI_MULT))
+    extra = sorted(set(CHANNEL_CPI_MULT) - set(paid.tolist()))
+    if missing or extra:
+        raise ValueError(
+            f"CHANNEL_CPI_MULT 与 channels.csv 的 paid/kol 集合不符：缺 {missing}，"
+            f"多 {extra}——改过渠道表就要跟着改乘数表，否则某个渠道的 CAC 无定义")
+    if nch * naxis != ctx.n("channel_daily_costs"):
+        raise ValueError(
+            f"成本网格 {nch} 渠道 × {naxis} 天 = {nch * naxis:,} 行，但 budget 声明 "
+            f"{ctx.n('channel_daily_costs'):,} 行——改 budget.PAID_CHANNELS / "
+            f"COST_AXIS_END（那一项写成两者相乘，不是字面量）")
+    if naxis < win:
+        raise ValueError(f"成本轴 {naxis} 天短于数据窗 {win} 天，窗内会缺成本行")
+
+    # —— 分母：last_touch 归因到各投放渠道的用户，按其**注册日**归集 ——
+    # 用 registered_at 而不是 attributed_at：口径由 mart 那边定，这里只能跟。
+    last = ctx.cache["attr_type"] == "last_touch"
+    uid = ctx.cache["attributed_users"][last]
+    cid = ctx.cache["attr_channel"][last]
+    reg_day = ctx.cache["users_reg_day"][uid - 1]
+    if reg_day.size and (reg_day.min() < 0 or reg_day.max() >= win):
+        raise ValueError(
+            f"注册日偏移越界 [{reg_day.min()}, {reg_day.max()}]，应在 [0, {win - 1}]"
+            f"——users.registered_at 跑出数据窗了")
+    slot = {int(c): i for i, c in enumerate(paid.tolist())}
+    keep = np.isin(cid, paid)          # 自然量渠道的归因不进成本表
+    idx = np.array([slot[int(c)] for c in cid[keep].tolist()], dtype=np.int64)
+    new_users = np.bincount(idx * win + reg_day[keep],
+                            minlength=nch * win).reshape(nch, win)
+
+    # —— 分子：逐渠道由新客数反推激活 → 花费，再由激活上推点击 / 曝光 ——
+    r_cost = ctx.rng("channel_daily_costs", "cost")
+    r_fun = ctx.rng("channel_daily_costs", "funnel")
+    ins = np.empty((nch, naxis), dtype=np.int64)
+    cost = np.empty((nch, naxis), dtype=np.float64)
+    clk = np.empty((nch, naxis), dtype=np.int64)
+    imp = np.empty((nch, naxis), dtype=np.int64)
+    for i, c in enumerate(paid.tolist()):
+        e = CHANNEL_TYPE_ECON[ch_type[c]]
+        cpi = e["cpi"] * CHANNEL_CPI_MULT[c]
+        need = np.ceil(new_users[i] / e["reg_rate"]).astype(np.int64)
+        floor = max(1, int(round(COST_FLOOR_SHARE * need.sum() / win)))
+        ins[i, :win] = np.maximum(need, floor)
+        # 轴外：窗内日均，不带趋势（见 docstring）
+        ins[i, win:] = max(1, int(round(ins[i, :win].mean())))
+        jit = 1.0 + r_cost.uniform(-COST_JITTER, COST_JITTER, naxis)
+        cost[i] = np.round(ins[i] * cpi * jit, 2)
+        clk[i] = np.ceil(ins[i] / e["cvr"]
+                         * (1.0 + r_fun.uniform(-FUNNEL_JITTER, FUNNEL_JITTER, naxis)))
+        imp[i] = np.ceil(clk[i] / e["ctr"]
+                         * (1.0 + r_fun.uniform(-FUNNEL_JITTER, FUNNEL_JITTER, naxis)))
+    # 漏斗单调性是**算出来的**：cvr ≤ 0.045、ctr ≤ 0.020，抖动上限 ±15%，
+    # 所以 clicks ≥ installs × 18、impressions ≥ clicks × 42，抖动不可能翻过来。
+    # 但还是断言一遍——这四个常量以后被人调小了，静默失去单调性的成本太高。
+    if not ((imp > clk).all() and (clk > ins).all() and (ins >= 1).all()):
+        raise ValueError("成本表漏斗不单调：应恒有 impressions > clicks > installs ≥ 1，"
+                         "检查 CHANNEL_TYPE_ECON 的 ctr / cvr 与 FUNNEL_JITTER")
+
+    # —— ad_campaign_id：只挂到**档期覆盖这一天**的本渠道活动上 ——
+    # 多个活动同时在投时按天轮转，让花费摊到更多活动上（取 min 会让一批活动一分钱没有）。
+    # 没有活动覆盖的日子给 NULL，语义是「渠道级投放，未归到具体活动」。
+    day = np.arange(naxis)
+    acid = np.full((nch, naxis), None, dtype=object)
+    for i, c in enumerate(paid.tolist()):
+        pool = sorted(camps[c])
+        for d in range(naxis):
+            live = [a for a in pool if spans[a][0] <= d <= spans[a][1]]
+            if live:
+                acid[i, d] = live[d % len(live)]
+
+    ctx.cache["cost_channel"] = np.repeat(paid, naxis)
+    ctx.cache["cost_date"] = (ctx.start.astype("datetime64[D]")
+                              + np.tile(day, nch).astype("timedelta64[D]"))
+    ctx.cache["cost_acid"] = acid.reshape(-1)
+    ctx.cache["cost_impressions"] = imp.reshape(-1)
+    ctx.cache["cost_clicks"] = clk.reshape(-1)
+    ctx.cache["cost_installs"] = ins.reshape(-1)
+    ctx.cache["cost_cost"] = cost.reshape(-1)
+
+
+def build_channel_daily_costs(ctx: Ctx, off: int, n: int) -> dict:
+    """全部列在 `_prep_channel_costs` 里算好，这里只切片。
+
+    `creative_id` 恒为 NULL：成本按活动汇总，不拆到素材。这一列登记在
+    `scripts/lakehouse/verify_constants.py::ALL_NULL_PINNED` 里，改成有值的话那边会红
+    （要求先把登记删掉），所以不是"忘了填"。
+
+    `created_at` 挂在该行自己那一天的 23:30——「当日汇总，当晚落库」。轴外的行因此
+    created_at 也在锚点之后，这与 `date` 列同源、是一致的；成本表的身份本来就是
+    「轴比业务日历长」。不钉成常量：v1 那 910 行的 created_at 全等于灌数那一瞬。
+    """
+    s = slice(off, off + n)
+    d = ctx.cache["cost_date"][s]
+    return {
+        "id": F.pk(n, off + 1),
+        "channel_id": ctx.cache["cost_channel"][s],
+        "ad_campaign_id": ctx.cache["cost_acid"][s],
+        "creative_id": F.const(n, None),
+        "date": d,
+        "impressions": ctx.cache["cost_impressions"][s],
+        "clicks": ctx.cache["cost_clicks"][s],
+        "installs": ctx.cache["cost_installs"][s],
+        "cost": ctx.cache["cost_cost"][s],
+        "currency": F.const(n, "CNY"),
+        "created_at": d.astype("datetime64[s]") + np.timedelta64(23 * 3600 + 1800, "s"),
     }
 
 
@@ -2087,29 +2786,26 @@ def build_user_coupons(ctx: Ctx, off: int, n: int) -> dict:
                + np.timedelta64(ctx.days * 86400, "s"))
     r = ctx.rng("user_coupons", "recv", off)
 
+    # (user, coupon) 两列整表在 _prep_user_coupons 里定好：per_user_limit 是**全表**
+    # 性质（一个 (user, coupon) 上有几张），分块抽拼不出来（P1-11）。
+    uid = ctx.cache["uc_user_id"][off:off + n]
+    picked = ctx.cache["uc_coupon_id"][off:off + n]
+    reg = reg_all[uid - 1]
+
     # —— 核销段（未用行按 0 号占位算，最后 where 合并，保持向量化）——
     safe = np.minimum(gidx, max(n_used - 1, 0))
     o = ctx.cache["orders_coupon_rows"][safe] if n_used else np.zeros(n, np.int64)
-    uid_u = ctx.cache["orders_user_id"][o]
-    cp_u = ctx.cache["orders_coupon_id"][o].astype(np.int64)   # 用券订单必非空
     placed = og["placed_at"][o].astype("datetime64[s]")
     span = np.minimum(np.maximum(
-        (placed - reg_all[uid_u - 1]).astype("timedelta64[s]").astype(np.int64), 120),
-        30 * 86400)
-    recv_u = np.maximum(
-        placed - (60 + r.random(n) * (span - 60)).astype("timedelta64[s]"),
-        reg_all[uid_u - 1])
+        (placed - reg).astype("timedelta64[s]").astype(np.int64), 120), 30 * 86400)
+    recv_u = np.maximum(placed - (60 + r.random(n) * (span - 60))
+                        .astype("timedelta64[s]"), reg)
 
     # —— 未用段：领券时刻落在 [本人注册, 窗末) ——
-    uid_g = F.fk_skewed(ctx.rng("user_coupons", "user_id", off), n, 1, ctx.n("users"))
-    reg_g = reg_all[uid_g - 1]
     room = np.maximum(
-        (win_end - reg_g).astype("timedelta64[s]").astype(np.int64) - 60, 60)
-    recv_g = reg_g + (r.random(n) * room).astype("timedelta64[s]")
-    cp_g = F.from_pool(ctx.rng("user_coupons", "coupon_id", off), n,
-                       ctx.dim_ids["coupons"])
+        (win_end - reg).astype("timedelta64[s]").astype(np.int64) - 60, 60)
+    recv_g = reg + (r.random(n) * room).astype("timedelta64[s]")
 
-    picked = np.where(used_m, cp_u, cp_g)
     recv = np.where(used_m, recv_u, recv_g).astype("datetime64[s]")
     expire = recv + np.timedelta64(30 * 86400, "s")
     # 枚举取 'unused' 而非 DDL 注释里的 'available'：卡片、示例 SQL、eval 金标、
@@ -2125,7 +2821,7 @@ def build_user_coupons(ctx: Ctx, off: int, n: int) -> dict:
     order_id[~used_m] = None
     return {
         "id": cid,
-        "user_id": np.where(used_m, uid_u, uid_g),
+        "user_id": uid,
         "coupon_id": picked,
         "coupon_code": np.char.add("CP", np.char.zfill(picked.astype("U10"), 6)),
         "received_at": recv,
@@ -2202,7 +2898,10 @@ def build_push_notifications(ctx: Ctx, off: int, n: int) -> dict:
                               opened, 2, 1440, ctx.as_of_end),
         "is_delivered": delivered,
         "is_opened": opened,
-        "failure_reason": np.where(delivered, None, "token 失效"),
+        # 失败率（= ~is_delivered 的比例）一点没变，变的是失败原因不再只有一个桶。
+        "failure_reason": np.where(delivered, None,
+                                   F.enum(ctx.rng("push_notifications", "fail_reason", off),
+                                          n, PUSH_FAILURE_REASONS, PUSH_FAILURE_REASONS_W)),
         "created_at": sched,
     }
 
@@ -2254,6 +2953,7 @@ BUILDERS = {
     "payments": build_payments,
     "subscriptions": build_subscriptions,
     "user_attributions": build_user_attributions,
+    "channel_daily_costs": build_channel_daily_costs,
     "user_coupons": build_user_coupons,
     "push_notifications": build_push_notifications,
     "ab_test_assignments": build_ab_test_assignments,
@@ -2269,7 +2969,10 @@ LOAD_ORDER = [
     "posts", "post_likes", "post_comments", "post_shares", "user_follows",
     "user_messages",
     "orders", "order_items", "payments",
-    "user_attributions", "user_coupons", "push_notifications",
+    # channel_daily_costs 依赖 user_attributions（成本从归因新客反推），
+    # 也依赖 ad_campaigns 那张透传维表（挂活动 id），所以排在归因之后。
+    "user_attributions", "channel_daily_costs",
+    "user_coupons", "push_notifications",
     "ab_test_assignments",
     "subscriptions",          # 依赖 payments
 ]

@@ -60,3 +60,12 @@ eval/report.traps.md
 backend/wheelhouse/
 # 别家 CLI 的本地配置,与本项目的运行无关。
 .codex/
+
+# 测量原始 trace。报告是 trace 的函数,所以文档引用到的那几份要进仓库(见下面的例外),
+# 其余是同一口径下的重复跑,留在本地。
+data/bench/*
+!data/bench/prices-us-west-2.json
+!data/bench/freshness_baseline.json
+!data/bench/correctness-20260903T093133Z.jsonl
+!data/bench/timing-20260903T092605Z.jsonl
+!data/bench/cost-cold-20260907T053407Z.jsonl

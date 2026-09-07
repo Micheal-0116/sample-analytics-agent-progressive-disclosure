@@ -19,8 +19,8 @@ selftest_fillers 测**单个填充函数**的分布形状；本文件测**表与
 
 ## 两侧：正例断言 + 反例注入
 
-    python3 scripts/gen/selftest_closures.py             # 正例：106 条断言全绿，约 1 秒
-    python3 scripts/gen/selftest_closures.py --negative  # 反例：42 个缺陷注入全红，约 7 秒
+    python3 scripts/gen/selftest_closures.py             # 正例：140 条断言全绿，约 1 秒
+    python3 scripts/gen/selftest_closures.py --negative  # 反例：61 个缺陷注入全红，约 9 秒
 
 反例一侧存在的理由是：正例全绿**同时**判据写歪了（比错列、把违例算成 0、条件恒真）
 在这个文件上长得一模一样，而它跑在最前面、绿得最快，后面每一层的"通过"都会被读成
@@ -206,6 +206,11 @@ ENUM_SUPERSET_OK = {
         "D-04：生成器产真实活动名，卡片写的是当前 500 行样本里的 6 个 v1 遗留值。"
         "消除条件是全量重灌后重生卡片，不是缩回生成器。",
 }
+# 刻意**没有** orders.cancel_reason / refund_reason 的豁免条目，尽管它们此刻正是这个形态
+# （线上各只有一个值、生成器已改成八个）：`verify_enums.parse_card` 要求表格 **≥ 2 行**
+# 才算一次枚举声明，所以只剩一个值的列**声明不出来**，这条检查压根看不见它们，
+# 加豁免等于加一条永远"未命中"的死条目。这个缺口记在 docs/test-plan.md
+# 「没有自动化覆盖」那一节；它们的登记在 verify_constants.RELOAD_PENDING 里。
 
 
 def _enum_values(arr) -> set[str]:
@@ -320,6 +325,23 @@ def check_literals(t: dict) -> None:
     bad = sum(1 for x in phone if not CN_MOBILE_RE.match(x))
     ok(bad == 0, f"users.phone 100% 符合 ^1[3-9]\\d{{9}}$"
                  f"（不合规 {bad}/{len(phone)}，例 {phone[0]!r}）")
+
+    # 三个身份标识全列唯一（P1-6/7）。真实系统在注册那一刻就查重，一个昵称对
+    # 9 个用户是一眼可见的假数据，而且 `COUNT(DISTINCT username)` 会比用户数少
+    # 一大截、`JOIN ... ON username` 会莫名膨胀。
+    #
+    # 判据故意写成"全等"而不是"重复率 < x%"：重复率的阈值定多少都是拍的，而唯一
+    # 是这三列的**定义**。它在 scale 1 上就有力——500 行落进 24,576 种昵称组合，
+    # 纯组合式抽样期望撞 5 行，邮箱本地部分 6,000 种更是期望撞 21 行，
+    # 所以旧实现在这 500 行上就红，不用等 21 万行。
+    for col, vals in (("username", [x for x in np.asarray(t["users"]["username"],
+                                                          dtype=object).tolist()
+                                    if isinstance(x, str)]),
+                      ("email", email), ("phone", phone)):
+        uniq = len(set(vals))
+        dup = len(vals) - uniq
+        ok(dup == 0, f"users.{col} 全列唯一（{len(vals)} 行 / {uniq} 个不同值"
+                     f"{'' if dup == 0 else f'，重复 {dup} 行'}）")
 
     check_row_coherence(t)
 
@@ -450,11 +472,75 @@ def check_behavior_closures(t: dict, reg: np.ndarray, as_of_end) -> None:
     refs = set(np.asarray(pv["referrer"], dtype=object).tolist())
     ok(refs <= set(T.REFERRERS),
        f"page_views.referrer ⊆ REFERRERS 声明的取值域（越界 {sorted(refs - set(T.REFERRERS))[:2]}）")
-    ok(len(refs - {""}) >= 2,
-       f"page_views.referrer 的非空取值 {len(refs - {''})} 种 ≥ 2"
+    # 减掉的是 `None` 和 `""` 两个：`None` 是「直接打开」的当前表达，`""` 是它
+    # 2026-09-01 之前的表达（见 `T.REFERRERS` 上面那段）。两个都减是为了这条断言
+    # 在池子改回去时也不会静默变松——空串一旦回到池里，它算"一种非空取值"，
+    # 这条 ≥ 2 就可能靠它凑够。
+    ok(len(refs - {"", None}) >= 2,
+       f"page_views.referrer 的非空取值 {len(refs - {'', None})} 种 ≥ 2"
        f"（原来只有 1 种，按来源页做站内路径分析恒得一行）")
     ok(len(set(np.asarray(pn["deep_link"], dtype=object).tolist())) >= 2,
        "push_notifications.deep_link 不是整列同值（原来整列 app://home）")
+
+    # ---- events.properties：4 种事件带属性，且属性里的键指向真的行 ----
+    # 生成器原来是整列 `F.const(n, {})`，而卡片 knowledge/domains/behavior/events.md
+    # 贴着 4 种形状、三段参考 SQL 直接 `json_extract_scalar(properties, '$.…')`——那三段
+    # 在旧产出上**返回空集且不报错**。L2 退化列体检只报得出「整列同一个值 '{}'」，
+    # 报不出「有属性但接不上」，所以这一段判的是后者：属性里的键 JOIN 得回去。
+    # 一列随机小整数满足「有属性」而不满足这条，v1 就是那样（order_id 是 12 位随机数，
+    # 卡片专门留了一段 ⚠️ 说它 JOIN 不上）。
+    ev, o, pr = t["events"], t["orders"], t["products"]
+    ev_name = np.asarray(ev["event_name"], dtype=object)
+    props = np.asarray(ev["properties"], dtype=object)
+    with_prop = {str(nm) for nm, p in zip(ev_name.tolist(), props.tolist()) if p}
+    ok(with_prop == set(T._PROP_EVENTS),
+       f"带属性的事件恰好是 {sorted(T._PROP_EVENTS)}"
+       f"（多的 {sorted(with_prop - set(T._PROP_EVENTS))}、"
+       f"少的 {sorted(set(T._PROP_EVENTS) - with_prop)}）")
+
+    pname = dict(zip(np.asarray(pr["product_id"]).tolist(),
+                     np.asarray(pr["product_name"], dtype=object).tolist()))
+    vp = props[ev_name == "view_product"].tolist()
+    ok(all(p["product_id"] in pname for p in vp),
+       f"view_product.properties.product_id 全部命中 products"
+       f"（落空 {sum(1 for p in vp if p['product_id'] not in pname)} 条）")
+    ok(all(pname[p["product_id"]] == p["product_name"] for p in vp),
+       "view_product 属性里的 product_name 就是该 product_id 的名字——两者不一致时，"
+       "「按属性里的名字分组」和「join products 再分组」会给出两套答案")
+
+    ac = props[ev_name == "add_to_cart"].tolist()
+    ok(all(p["product_id"] in pname for p in ac),
+       f"add_to_cart.properties.product_id 全部命中 products"
+       f"（落空 {sum(1 for p in ac if p['product_id'] not in pname)} 条）")
+    qs = sorted({int(p["quantity"]) for p in ac})
+    ok(set(qs) <= {1, 2, 3} and len(qs) >= 2,
+       f"add_to_cart.properties.quantity 取值 {qs} ⊆ 1/2/3 且不止一种")
+
+    leaves = set(T._post_objects()[1].tolist())
+    kws = {str(p["keyword"]) for p in props[ev_name == "search"].tolist()}
+    ok(kws <= leaves,
+       f"search.properties.keyword ⊆ semantics.yaml 的叶子类目"
+       f"（越界 {sorted(kws - leaves)[:2]}）——搜索词必须是站内真有的东西，"
+       f"否则「搜索词 TOP 10 里哪些类目缺货」会拿到一批 products 里不存在的词")
+    ok(len(kws) >= 20,
+       f"搜索词覆盖 {len(kws)} 个类目 ≥ 20（整列同一个词时按搜索词下钻恒得一行）")
+
+    valid = np.isin(np.asarray(o["status"], dtype=object), list(T.VALID_STATUS))
+    amt = dict(zip(np.asarray(o["order_id"])[valid].tolist(),
+                   cents(np.asarray(o["actual_amount"])[valid]).tolist()))
+    pu = props[ev_name == "purchase"].tolist()
+    oids = [int(p["order_id"]) for p in pu]
+    miss = [x for x in oids if x not in amt]
+    ok(not miss,
+       f"purchase.properties.order_id 全部命中**有效**订单（落空 {len(miss)} 条）"
+       f"——v1 这一列是不接任何表的随机数，接不上时查询不报错、只静默返回空")
+    ok(len(set(oids)) == len(oids) == int(valid.sum()),
+       f"purchase 事件与有效订单一一对应（事件 {len(oids)}、去重单号 {len(set(oids))}、"
+       f"有效单 {int(valid.sum())}）")
+    ok(all(amt[x] == cents(p["amount"]) for x, p in zip(oids, pu)),
+       "purchase.properties.amount 逐条 == 该单的 orders.actual_amount（精确到分）"
+       "——不等就是 _prep_behavior 里 events_purchase 的段位算错了，"
+       "金额与单号张冠李戴，而两边各自都还是合法值，没有任何一层会报错")
 
 
 # ------------------------------------------------------- D-02 / D-03 商品域语义
@@ -701,6 +787,139 @@ def check_product_counters(t: dict) -> None:
        f"未卖光的 SKU 库存落在 [20, 5000]（实测 {int(live.min())}~{int(live.max())}）")
 
 
+def check_attribution_costs(t: dict, ctx) -> None:
+    """归因 ⟷ 投放成本的跨表闭环（P0-5）。
+
+    这一域此前**一条断言都没有**，而 CAC / ROI 的每一道题都压在它上面。代价看得见：
+    v1 的成本表 244,774 installs 配全库 500 个用户（490 倍）、CAC ¥2,900/人，
+    而 L1–L5、verify_load、reconcile 全绿——数量关系层面它没有任何矛盾可查。
+    """
+    cd, ua, u = t["channel_daily_costs"], t["user_attributions"], t["users"]
+    paid = ctx.dim_ids["_paid_channels"]
+    ch_type = ctx.dim_ids["_channel_types"]
+    spans = ctx.dim_ids["_campaign_spans"]
+    creas = ctx.dim_ids["_creatives_by_campaign"]
+    ac_owner = {a: c for c, lst in ctx.dim_ids["_campaigns_by_channel"].items()
+                for a in lst}
+    naxis, win = budget.COST_AXIS_DAYS, budget.WINDOW_DAYS
+    day0 = np.datetime64(budget.DATA_START, "D")
+    slot = {int(c): i for i, c in enumerate(paid.tolist())}
+
+    ch = np.asarray(cd["channel_id"], dtype=np.int64)
+    day = (np.asarray(cd["date"]).astype("datetime64[D]") - day0).astype(np.int64)
+    ins = np.asarray(cd["installs"], dtype=np.int64)
+    clk = np.asarray(cd["clicks"], dtype=np.int64)
+    imp = np.asarray(cd["impressions"], dtype=np.int64)
+    cost = np.asarray(cd["cost"], dtype=np.float64)
+
+    # ---------- 轴的形状 ----------
+    ok(len(ch) == len(paid) * naxis,
+       f"成本表 = 投放渠道 {len(paid)} × 成本轴 {naxis} 天 = {len(paid) * naxis} 行"
+       f"（实测 {len(ch)}）")
+    ok(set(ch.tolist()) == set(paid.tolist()),
+       f"成本表只含 paid/kol 渠道，自然量渠道一行都没有"
+       f"（多出 {sorted(set(ch.tolist()) - set(paid.tolist()))}）")
+    # ch ≤ 14、day < 311，乘 100000 不会撞键
+    cell = ch * 100000 + day
+    ok(len(np.unique(cell)) == len(cell),
+       f"(channel_id, date) 唯一，没有重复格子（重复 {len(cell) - len(np.unique(cell))}）")
+    ok(int(day.min()) == 0 and int(day.max()) == naxis - 1,
+       f"成本轴铺满 {budget.DATA_START} ~ {budget.COST_AXIS_END}"
+       f"（实测第 {int(day.min())} ~ {int(day.max())} 天）")
+
+    # ---------- 漏斗与金额 ----------
+    mono = (imp > clk) & (clk > ins) & (ins >= 1)
+    ok(mono.all(),
+       f"每行 impressions > clicks > installs ≥ 1（违例 {int((~mono).sum())}）")
+    ok((cost > 0).all(), f"每行都有花费 cost > 0（违例 {int((cost <= 0).sum())}）")
+    ok(len(set(np.asarray(cd["currency"], dtype=object).tolist())) == 1,
+       "currency 恒为单一币种（本库只有 CNY）")
+    ok(all(x is None for x in np.asarray(cd["creative_id"], dtype=object).tolist()),
+       "creative_id 整列 NULL——成本按活动汇总、不拆到素材，"
+       "这一列登记在 verify_constants.ALL_NULL_PINNED")
+    ok((np.asarray(cd["created_at"]).astype("datetime64[D]")
+        == np.asarray(cd["date"]).astype("datetime64[D]")).all(),
+       "created_at 与 date 同日（当日汇总、当晚落库；v1 是灌数那一瞬的常量）")
+
+    # ---------- 活动归属与档期 ----------
+    acid = np.asarray(cd["ad_campaign_id"], dtype=object).tolist()
+    has = np.array([x is not None for x in acid])
+    ok(has.any() and not has.all(),
+       f"一部分成本行挂到具体活动、一部分挂不上（挂上 {int(has.sum())}/{len(has)}；"
+       f"挂不上的语义是「渠道级投放，未归到活动」）")
+    ok(all(ac_owner[int(a)] == int(c)
+           for a, c in zip(np.asarray(acid, dtype=object)[has], ch[has])),
+       "成本行挂的活动属于本渠道（跨渠道乱指会让按活动/按渠道两条口径互相矛盾）")
+    ok(all(spans[int(a)][0] <= int(d) <= spans[int(a)][1]
+           for a, d in zip(np.asarray(acid, dtype=object)[has], day[has])),
+       "成本行挂的活动档期覆盖该日（不给还没开始/已经结束的活动记花费）")
+
+    # ---------- 核心：窗内 installs 兜住归因新客 ----------
+    # 这条就是 P0-5 的判据本身：它把成本表的分子和 mart_channel_daily 的分母钉在一起。
+    # 分母口径由 database/iceberg/02_mart.sql 定死——last_touch 归因到本渠道、
+    # 且 CAST(users.registered_at AS date) 落在这一天，所以这里必须照抄那个口径。
+    reg_day = (np.asarray(u["registered_at"]).astype("datetime64[D]")
+               - day0).astype(np.int64)
+    a_ch = np.asarray(ua["channel_id"], dtype=np.int64)
+    a_uid = np.asarray(ua["user_id"], dtype=np.int64)
+    m = (np.asarray(ua["attribution_type"], dtype=object) == "last_touch") \
+        & np.isin(a_ch, paid)
+    idx = np.array([slot[int(c)] for c in a_ch[m].tolist()], dtype=np.int64)
+    nu_grid = np.bincount(idx * win + reg_day[a_uid[m] - 1],
+                          minlength=len(paid) * win).reshape(len(paid), win)
+    ins_grid = np.zeros((len(paid), naxis), dtype=np.int64)
+    ins_grid[np.array([slot[int(c)] for c in ch.tolist()]), day] = ins
+    short = int((ins_grid[:, :win] < nu_grid).sum())
+    ok(short == 0,
+       f"窗内每个渠道-日的 installs ≥ 当日 last_touch 归因新客数（违例 {short} 格）")
+
+    # ---------- CAC 两端 ----------
+    # 只钉两端：乘数表相邻两档在中段只差约 1.25 倍，取整和保底花费足以让中间的名次
+    # 换位；两端留了 ≥1.55 倍，是算出来有保证的。理由写在 tables.CHANNEL_CPI_MULT。
+    c_cost = np.zeros(len(paid), dtype=np.float64)
+    np.add.at(c_cost, np.array([slot[int(c)] for c in ch[day < win].tolist()]),
+              cost[day < win])
+    c_nu = nu_grid.sum(axis=1)
+    ok((c_nu > 0).all(),
+       f"每个投放渠道窗内都有归因新客，CAC 有定义"
+       f"（无新客的渠道 {[int(paid[i]) for i in np.flatnonzero(c_nu == 0)]}）")
+    cac = c_cost / np.maximum(c_nu, 1)
+    hi_want = max(T.CHANNEL_CPI_MULT, key=T.CHANNEL_CPI_MULT.get)
+    lo_want = min(T.CHANNEL_CPI_MULT, key=T.CHANNEL_CPI_MULT.get)
+    ok(int(paid[int(np.argmax(cac))]) == hi_want,
+       f"CAC 最高的渠道 == 乘数表最大的那个（期望 {hi_want}，"
+       f"实测 {int(paid[int(np.argmax(cac))])}）")
+    ok(int(paid[int(np.argmin(cac))]) == lo_want,
+       f"CAC 最低的渠道 == 乘数表最小的那个（期望 {lo_want}，"
+       f"实测 {int(paid[int(np.argmin(cac))])}）")
+
+    # ---------- 归因表自身 ----------
+    ok(len(np.unique(a_uid)) == len(a_uid), "每个用户至多一条归因")
+    ok((np.asarray(ua["attributed_at"]) == np.asarray(ua["click_time"])).all(),
+       "attributed_at == click_time（v1 是灌数那一瞬，按归因时间分桶只有一个桶）")
+    ok((np.asarray(ua["install_time"]).astype("datetime64[s]")
+        - np.asarray(ua["click_time"]).astype("datetime64[s]")
+        == (np.asarray(ua["days_to_install"]) * 86400).astype("timedelta64[s]")).all(),
+       "install_time − click_time == days_to_install 天")
+    ua_a = np.asarray(ua["ad_campaign_id"], dtype=object).tolist()
+    ua_c = np.asarray(ua["creative_id"], dtype=object).tolist()
+    hasa = np.array([x is not None for x in ua_a])
+    hasc = np.array([x is not None for x in ua_c])
+    is_ad = np.array([ch_type[int(c)] in ("paid", "kol") for c in a_ch.tolist()])
+    ok((hasa == is_ad).all(),
+       f"归因的 ad_campaign_id 非空 ⟺ 渠道是 paid/kol（自然量没有广告活动，这是语义"
+       f"而不是概率；违例 {int((hasa != is_ad).sum())}）")
+    ok(all(ac_owner[int(a)] == int(c)
+           for a, c in zip(np.asarray(ua_a, dtype=object)[hasa], a_ch[hasa])),
+       "归因挂的活动属于本渠道")
+    ok((hasc <= hasa).all(),
+       f"有素材必然有活动（违例 {int((hasc & ~hasa).sum())}）")
+    ok(all(int(cr) in creas[int(a)] for cr, a in
+           zip(np.asarray(ua_c, dtype=object)[hasc],
+               np.asarray(ua_a, dtype=object)[hasc])),
+       "归因挂的素材属于它所挂的那个活动")
+
+
 def build_tables() -> tuple:
     """scale=1 全内存生成一份表集合。正例跑它，每个反例跑它的深拷贝。
 
@@ -750,6 +969,50 @@ def run_all_checks(t: dict, ctx) -> None:
         real = np.bincount(t[src]["post_id"], minlength=npost + 1)[1:]
         ok((p[col] == real).all(), f"posts.{col} == {src} 真实行数")
     ok((p["view_count"] >= p["like_count"]).all(), "view_count ≥ like_count")
+
+    # ---------- posts 的三个数组列（P1-10） ----------
+    #
+    # 这三列此前**整列是空数组**，而云上那套普查抓不到：`verify_constants.py` 明说
+    # 跳过所有数组列（Trino 的 min/max 在数组上语义不清），`verify_literals.py` 的
+    # 字面值检查只看字符串列。也就是说这一层是它们唯一的判据，写松了等于没有。
+    #
+    # 判的不只是"非空"。`tags[0]` 是本帖的品类词，它同时约束标题和 product_ids：
+    # 三者说的必须是同一件东西。只判非空的话，「标题说吹风机、关联商品是猫粮」照样过
+    # ——那种同帖自相矛盾比整列空更糟，因为它看起来是有数据的。
+    leaf_of_cat = {cid: path.rsplit(SEM.SEP, 1)[-1]
+                   for path, cid in SEM.load().tree.leaf_ids.items()}
+    pr = t["products"]
+    leaf_of_pid = dict(zip(pr["product_id"].tolist(),
+                           [leaf_of_cat[int(c)] for c in pr["category_id"].tolist()]))
+    tags = np.asarray(p["tags"], dtype=object).tolist()
+    media = np.asarray(p["media_urls"], dtype=object).tolist()
+    prods = np.asarray(p["product_ids"], dtype=object).tolist()
+    titles = np.asarray(p["title"], dtype=object).tolist()
+    ctype = np.asarray(p["content_type"], dtype=object)
+
+    ok(min(len(m) for m in media) >= 1,
+       f"每帖至少一个媒体文件（media_urls 空的 {sum(1 for m in media if not m)} 行）")
+    ok(min(len(g) for g in tags) >= 2,
+       f"每帖至少两个标签：品类词 + 话题（不足的 {sum(1 for g in tags if len(g) < 2)} 行）")
+    nlink = sum(len(q) for q in prods)
+    ok(nlink > 0, f"product_ids 有真实关联（{nlink} 条关联 / {len(prods)} 帖；"
+                  f"relationships.md 声明的 products↔posts N:N 靠它兑现）")
+
+    bad = [i for i, (g, s) in enumerate(zip(tags, titles)) if g[0] not in s]
+    ok(not bad, f"tags 首项（品类词）出现在标题里（违例 {len(bad)}/{len(tags)}）")
+    badp = [(i + 1, q, leaf_of_pid[q], g[0])
+            for i, (g, ids) in enumerate(zip(tags, prods)) for q in ids
+            if leaf_of_pid[q] != g[0]]
+    eg = ("" if not badp else
+          f"，例：帖 {badp[0][0]} 说 {badp[0][3]}、商品 {badp[0][1]} 是 {badp[0][2]}")
+    ok(not badp, f"关联商品属于本帖品类（违例 {len(badp)}/{nlink}{eg}）")
+    nrev = int((ctype == "review").sum())
+    badr = sum(1 for q, c in zip(prods, ctype) if c == "review" and len(q) != 1)
+    ok(badr == 0, f"评测帖恰好关联一件商品（{nrev} 帖，违例 {badr}）")
+    badm = [i + 1 for i, (m, c) in enumerate(zip(media, ctype))
+            if any(not u.startswith(f"https://cdn.example.com/posts/{i + 1}/") for u in m)
+            or any(u.endswith(".mp4") != (c == "short_video") for u in m)]
+    ok(not badm, f"媒体 URL 挂本帖 post_id、短视频是 mp4（违例 {len(badm)}）")
 
     s = t["sessions"]
     ns = len(s["session_id"])
@@ -862,6 +1125,20 @@ def run_all_checks(t: dict, ctx) -> None:
        and (exp_ts[np.asarray(uc["status"]) == "unused"] >= as_of_end).all(),
        "expired/unused 与 expire_at 是否过窗一致")
 
+    # 每人限领（P1-11）。`coupons.per_user_limit` 在维表、卡片、DDL 注释三处明写，
+    # 而 v2 一处都没管：实测 10.0% 的 (user, coupon) 配对越限，最糟一行是限领 1 张
+    # 发了 26 张。这条断言的分母是配对而不是行——按行统计会把违例摊薄到看不见。
+    lim = ctx.dim_ids["_coupon_limits"]
+    u_arr = np.asarray(uc["user_id"], dtype=np.int64)
+    c_arr = np.asarray(uc["coupon_id"], dtype=np.int64)
+    pair, held = np.unique(u_arr * (int(c_arr.max()) + 1) + c_arr, return_counts=True)
+    allow = np.array([lim[int(p % (int(c_arr.max()) + 1))] for p in pair.tolist()])
+    over = held > allow
+    worst = int((held - allow).max())
+    ok(not over.any(),
+       f"每个 (user, coupon) 的持有张数 ≤ coupons.per_user_limit"
+       f"（{len(pair)} 个配对，越限 {int(over.sum())}，最大超出 {max(worst, 0)} 张）")
+
     # ---------- L4.8 / L5.6 事件保底与漏斗 ----------
     ev = t["events"]
     name = np.asarray(ev["event_name"], dtype=object)
@@ -916,10 +1193,13 @@ def run_all_checks(t: dict, ctx) -> None:
     # ---------- L9 字面值真实性 ----------
     check_literals(t)
 
+    # ---------- P0-5 归因 ⟷ 投放成本 ----------
+    check_attribution_costs(t, ctx)
+
 
 # ============================================================ 反例一侧（--negative）
 #
-# 为什么要有这一侧：上面 106 条 `ok()` **全部是正向的**，而本项目已经把「比的两端不
+# 为什么要有这一侧：上面 140 条 `ok()` **全部是正向的**，而本项目已经把「比的两端不
 # 独立」「名字比覆盖面大」这类假绿灯逐条记进了 docs/test-plan.md。同一种形态在这个
 # 文件上的样子是：判据写歪了（比错列、把违例算成 0、条件恒真），它照样一片绿，而且
 # 因为它绿得最快、跑在 L0，后面每一层的"通过"都会被读成"数据是对的"。
@@ -1017,11 +1297,270 @@ def _inject_placeholder_username(t: dict, cache: dict) -> None:
     t["users"]["username"] = np.array([f"user_{i + 1}" for i in range(n)], dtype=object)
 
 
+def _inject_username_duplicated(t: dict, cache: dict) -> None:
+    """抹掉「先到先得」的四位后缀——这就是 combine_unique 之前 username 的原样。
+
+    不是随手把某一行改成和另一行相同：抹后缀才是 P1-6 的真实形态（同一个词池组合
+    被多个用户共用），而且抹掉多少行由数据自己决定，不用猜。scale 1 上 500 行落进
+    24,576 种组合，实测 8 行带后缀，抹完就是 8 行重复。
+    前面那两条判据（序号形态 / 词沙拉）只看词池长什么样，抹后缀不动词池，所以它们
+    过得去，红会落在唯一性那条上。
+    """
+    un = np.asarray(t["users"]["username"], dtype=object)
+    t["users"]["username"] = np.array([re.sub(r"_\d{4}$", "", x) for x in un],
+                                      dtype=object)
+
+
+def _inject_email_duplicated(t: dict, cache: dict) -> None:
+    """同上，抹掉邮箱本地部分的 `.NNNN` 后缀。分隔符是点，所以正则也换成点。
+
+    域名不动：域名基数那条判据在唯一性之前，改了它会先红在那边。
+    """
+    em = np.asarray(t["users"]["email"], dtype=object)
+    t["users"]["email"] = np.array(
+        [re.sub(r"\.\d{4}$", "", x.rsplit("@", 1)[0]) + "@" + x.rsplit("@", 1)[1]
+         for x in em], dtype=object)
+
+
+def _inject_phone_duplicated(t: dict, cache: dict) -> None:
+    """把第 2 行的手机号改成第 1 行的。
+
+    手机号没有后缀可抹（加后缀会破 11 位定长，所以 unique_digits 走的是碰撞重抽），
+    它的缺陷形态本来就是「40 亿空间里偶然撞上几行」——21 万行期望撞 6 行。所以这里
+    直接造一次碰撞，量级和真实形态一致。号码本身仍是合法号段，格式那条判据过得去。
+    """
+    ph = np.asarray(t["users"]["phone"], dtype=object)
+    ph[1] = ph[0]
+    t["users"]["phone"] = ph
+
+
+def _inject_post_arrays_empty(t: dict, cache: dict) -> None:
+    """把 posts 三个数组列清空——**这就是 P1-10 的原样**（`F.const(n, [])` ×3）。
+
+    三列一起清，一个反例盯三条断言里最先跑的那条（媒体非空）。分开写三个反例没有
+    额外信息量：缺陷从来是"这三列一起是空的"，不会只空一列。
+    """
+    n = len(t["posts"]["post_id"])
+    for col in ("media_urls", "tags", "product_ids"):
+        a = np.empty(n, dtype=object)
+        a[:] = [[] for _ in range(n)]
+        t["posts"][col] = a
+
+
+def _inject_post_product_cross_leaf(t: dict, cache: dict) -> None:
+    """把某个有关联商品的帖子的 product_ids 换成**别的品类**的 SKU。
+
+    这是"填了但填错"的形态：非空、类型合法、能 UNNEST、能 JOIN 上 products，
+    只有品类对不上——正是只判非空时会放过去的那一种。
+    """
+    pr, p = t["products"], t["posts"]
+    leaf_of_cat = {cid: path.rsplit(SEM.SEP, 1)[-1]
+                   for path, cid in SEM.load().tree.leaf_ids.items()}
+    leaf_of_pid = dict(zip(pr["product_id"].tolist(),
+                           [leaf_of_cat[int(c)] for c in pr["category_id"].tolist()]))
+    prods = np.asarray(p["product_ids"], dtype=object)
+    tags = np.asarray(p["tags"], dtype=object)
+    i = int(next(j for j, q in enumerate(prods.tolist()) if q))
+    mine = tags[i][0]
+    prods[i] = [next(q for q, lf in leaf_of_pid.items() if lf != mine)]
+    p["product_ids"] = prods
+
+
+def _inject_post_media_wrong_ext(t: dict, cache: dict) -> None:
+    """把某条短视频帖的媒体文件改成 .jpg。post_id 前缀不动，只错扩展名。"""
+    p = t["posts"]
+    media = np.asarray(p["media_urls"], dtype=object)
+    ct = np.asarray(p["content_type"], dtype=object)
+    i = int(np.flatnonzero(ct == "short_video")[0])
+    media[i] = [u.replace(".mp4", ".jpg") for u in media[i]]
+    p["media_urls"] = media
+
+
+def _inject_over_per_user_limit(t: dict, cache: dict) -> None:
+    """把某个用户的所有核销行挪到同一张「限领 1 张」的券上，订单侧同步改写。
+
+    这是旧实现的原样：`_prep_orders` 在 150 张券里独立均匀抽，`user_coupons` 的核销行
+    再照抄订单的券号，于是一个用户在同一张限领 1 张的券上下几单、就持有几张
+    （实测最糟一行是限 1 发了 26 张）。
+
+    刻意**连订单一起改**：只改券行会先撞上前面的「核销行 coupon 与订单 coupon 一致」，
+    那条一红就证明不了限领这条判据在盯什么。改完之后 1:1 关系、order_id 集合、
+    user 一致这几条全都还成立，唯一红的是限领。
+    """
+    lim = load_dim_ids()["_coupon_limits"]
+    cid = min(c for c, v in lim.items() if v == 1)
+    uc, o = t["user_coupons"], t["orders"]
+    used = np.flatnonzero(np.asarray(uc["status"]) == "used")
+    u_used = np.asarray(uc["user_id"], dtype=np.int64)[used]
+    # 取核销行最多的那个用户：他的持有张数 = 用券单数，一定 > 1
+    victim = int(np.bincount(u_used).argmax())
+    rows = used[u_used == victim]
+    oid = np.array([int(x) for x in np.asarray(uc["order_id"], dtype=object)[rows]])
+    # copy()：这两列是 ctx.cache 里整表数组的**视图**（分块只是切片），原地写会顺带
+    # 改掉 cache，让同一次进程里的后续用例读到被污染的数据
+    uc["coupon_id"] = np.asarray(uc["coupon_id"], dtype=np.int64).copy()
+    uc["coupon_id"][rows] = cid
+    uc["coupon_code"] = np.asarray(uc["coupon_code"], dtype=object)
+    uc["coupon_code"][rows] = f"CP{cid:06d}"
+    ocp = np.asarray(o["coupon_id"], dtype=object)
+    ocp[oid - 1] = cid
+    o["coupon_id"] = ocp
+
+
 def _inject_single_email_domain(t: dict, cache: dict) -> None:
     """域名收敛到 1 个，但格式仍然合法——格式那条在前面，必须让它过去。"""
     em = np.asarray(t["users"]["email"], dtype=object)
     t["users"]["email"] = np.array([f"{x.rsplit('@', 1)[0]}@example.com" for x in em],
                                    dtype=object)
+
+
+def _cost_newusers(t: dict):
+    """重算「last_touch 归因到本渠道、且当天注册」的日新客网格。
+
+    注入函数只拿得到 `t` 和 `cache`，拿不到 `ctx.dim_ids`，所以这里自己现读一遍
+    维表索引。判据那边算的是同一个量——这是刻意的：反例要精确踩在闭环的边界上
+    （installs = 新客数 − 1），差一个就要么踩不到、要么顺带破了 installs ≥ 1。
+    """
+    dim = load_dim_ids()
+    paid, win = dim["_paid_channels"], budget.WINDOW_DAYS
+    day0 = np.datetime64(budget.DATA_START, "D")
+    ua, u = t["user_attributions"], t["users"]
+    reg = (np.asarray(u["registered_at"]).astype("datetime64[D]") - day0).astype(np.int64)
+    ch = np.asarray(ua["channel_id"], dtype=np.int64)
+    m = (np.asarray(ua["attribution_type"], dtype=object) == "last_touch") \
+        & np.isin(ch, paid)
+    slot = {int(c): i for i, c in enumerate(paid.tolist())}
+    idx = np.array([slot[int(c)] for c in ch[m].tolist()], dtype=np.int64)
+    grid = np.bincount(idx * win + reg[np.asarray(ua["user_id"])[m] - 1],
+                       minlength=len(paid) * win).reshape(len(paid), win)
+    return dim, paid, slot, grid
+
+
+def _inject_cost_below_newusers(t: dict, cache: dict) -> None:
+    """把新客最多那一格的 installs 压到「新客数 − 1」——P0-5 的原始形态。
+
+    只动这一格、只减 1：减到 0 会先破 `installs ≥ 1`，整列压平会先破漏斗单调，
+    两种都会让反例红在别处。scale 1 下峰值格是 3 个新客，减 1 后仍 ≥1、
+    且远小于 clicks（最小 19），前面那两条判据都过得去。
+    """
+    _dim, paid, slot, grid = _cost_newusers(t)
+    i, d = np.unravel_index(int(np.argmax(grid)), grid.shape)
+    nu = int(grid[i, d])
+    if nu < 2:
+        raise RuntimeError(f"没有任何渠道-日的归因新客 ≥ 2（峰值 {nu}），"
+                           f"压不出「installs < 新客数」而又不破 installs ≥ 1")
+    cd = t["channel_daily_costs"]
+    day = (np.asarray(cd["date"]).astype("datetime64[D]")
+           - np.datetime64(budget.DATA_START, "D")).astype(np.int64)
+    row = int(np.flatnonzero((np.asarray(cd["channel_id"]) == int(paid[i])) & (day == d))[0])
+    cd["installs"][row] = nu - 1
+
+
+def _inject_cost_campaign_out_of_span(t: dict, cache: dict) -> None:
+    """把某行的花费改挂到**本渠道另一个档期不覆盖这天**的活动上。
+
+    换成别的渠道的活动会先破「活动属于本渠道」那条（它排在档期那条前面），
+    所以必须在同渠道内换。
+    """
+    dim = load_dim_ids()
+    camps, spans = dim["_campaigns_by_channel"], dim["_campaign_spans"]
+    cd = t["channel_daily_costs"]
+    day = (np.asarray(cd["date"]).astype("datetime64[D]")
+           - np.datetime64(budget.DATA_START, "D")).astype(np.int64)
+    acid = np.asarray(cd["ad_campaign_id"], dtype=object)
+    for row in np.flatnonzero(np.array([x is not None for x in acid.tolist()])):
+        c, d = int(cd["channel_id"][row]), int(day[row])
+        for a in sorted(camps[c]):
+            if not (spans[a][0] <= d <= spans[a][1]):
+                cd["ad_campaign_id"][row] = a
+                return
+    raise RuntimeError("每个渠道的每个活动都覆盖了它每一行花费的日期，注入失效")
+
+
+def _inject_cost_cac_top_flipped(t: dict, cache: dict) -> None:
+    """把乘数最低那个渠道的花费放大 100 倍，让它顶上 CAC 第一。
+
+    只放大花费、不动 installs：`cost > 0` 和漏斗单调都不受影响，红的只会是
+    「CAC 最高的渠道 == 乘数表最大的那个」。
+    """
+    lo = min(T.CHANNEL_CPI_MULT, key=T.CHANNEL_CPI_MULT.get)
+    cd = t["channel_daily_costs"]
+    m = np.asarray(cd["channel_id"]) == lo
+    cd["cost"] = np.where(m, np.asarray(cd["cost"], float) * 100.0, cd["cost"])
+
+
+def _inject_attr_campaign_cross_channel(t: dict, cache: dict) -> None:
+    """让一条归因挂上**别的渠道**的活动——D-04 的原始形态（旧版从全部 50 个里乱抽）。
+
+    素材必须同时置空：素材属于原来那个活动，不置空的话先破「素材属于它所挂的活动」。
+    """
+    dim = load_dim_ids()
+    camps = dim["_campaigns_by_channel"]
+    ua = t["user_attributions"]
+    acid = np.asarray(ua["ad_campaign_id"], dtype=object)
+    row = int(np.flatnonzero(np.array([x is not None for x in acid.tolist()]))[0])
+    c = int(ua["channel_id"][row])
+    other = next(a for cid, pool in camps.items() if cid != c for a in pool)
+    ua["ad_campaign_id"][row] = other
+    ua["creative_id"][row] = None
+
+
+def _inject_product_name_template(t: dict, cache: dict) -> None:
+    """把一个商品名改回「修饰词 + 原名」的模板形态（D-03 的原始形态）。
+
+    改名要**连 events.properties 一起改**，否则先破的是「view_product 属性里的
+    product_name 就是该 product_id 的名字」那一条，红在别处。同一个理由见
+    `_inject_attr_campaign_cross_channel`（改活动要连素材一起置空）：反例只应破它
+    针对的那一条，破在别处等于这个反例没在验它想验的判据。
+    """
+    pid = int(t["products"]["product_id"][0])
+    new = "优质" + str(t["products"]["product_name"][0])
+    t["products"]["product_name"][0] = new
+    props = np.asarray(t["events"]["properties"], dtype=object)
+    for i in range(len(props)):
+        p = props[i]
+        if p.get("product_name") is not None and p.get("product_id") == pid:
+            props[i] = dict(p, product_name=new)
+
+
+def _ev_props(t: dict, name: str) -> tuple[np.ndarray, np.ndarray]:
+    """→ (properties 整列, 该事件名的行下标)。四个 properties 反例共用。"""
+    p = np.asarray(t["events"]["properties"], dtype=object)
+    idx = np.flatnonzero(np.asarray(t["events"]["event_name"], dtype=object) == name)
+    return p, idx
+
+
+def _inject_props_all_empty(t: dict, cache: dict) -> None:
+    """还原生成器原来的样子：整列 `{}`。
+
+    这一条是四个 properties 反例里唯一**真发生过**的形态（`F.const(n, {})`），
+    其余三个是「有属性但接不上」，形态取自 v1 的产出。
+    """
+    p = np.asarray(t["events"]["properties"], dtype=object)
+    for i in range(len(p)):
+        p[i] = {}
+
+
+def _inject_props_name_mismatch(t: dict, cache: dict) -> None:
+    p, idx = _ev_props(t, "view_product")
+    p[idx[0]] = dict(p[idx[0]], product_name="别的商品")
+
+
+def _inject_props_order_dangling(t: dict, cache: dict) -> None:
+    p, idx = _ev_props(t, "purchase")
+    p[idx[0]] = dict(p[idx[0]], order_id=10 ** 11)   # v1 那种 12 位随机数
+
+
+def _inject_props_amount_drift(t: dict, cache: dict) -> None:
+    p, idx = _ev_props(t, "purchase")
+    p[idx[0]] = dict(p[idx[0]], amount=float(p[idx[0]]["amount"]) + 0.01)
+
+
+def _inject_props_keyword_single(t: dict, cache: dict) -> None:
+    p, idx = _ev_props(t, "search")
+    kw = p[idx[0]]["keyword"]
+    for i in idx.tolist():
+        p[i] = {"keyword": kw}
 
 
 # (反例 id, 期望消息片段, 注入函数)。片段取断言消息里**独一无二**的那一小段，
@@ -1039,6 +1578,10 @@ NEG_CASES: list[tuple[str, str, object]] = [
      lambda t, c: t["orders"]["shipping_fee"].__setitem__(
          0, t["orders"]["shipping_fee"][0] + 1.0)),
     # ---- 计数器回填 ----
+    # ---- P1-10 posts 三个数组列 ----
+    ("post-arrays-empty", "每帖至少一个媒体文件", _inject_post_arrays_empty),
+    ("post-product-cross-leaf", "关联商品属于本帖品类", _inject_post_product_cross_leaf),
+    ("post-media-wrong-ext", "短视频是 mp4", _inject_post_media_wrong_ext),
     ("like-counter-drift", "posts.like_count == post_likes 真实行数",
      lambda t, c: t["posts"]["like_count"].__setitem__(0, t["posts"]["like_count"][0] + 1)),
     ("session-event-counter-drift", "sessions.event_count == events 真实行数",
@@ -1058,6 +1601,7 @@ NEG_CASES: list[tuple[str, str, object]] = [
      lambda t, c: t["user_coupons"]["status"].__setitem__(
          np.flatnonzero(np.asarray(t["user_coupons"]["status"]) == "used")[0], "unused")),
     ("coupon-unused-has-order", "非核销行 order_id 全为空", _inject_coupon_dangling),
+    ("coupon-over-per-user-limit", "coupons.per_user_limit", _inject_over_per_user_limit),
     # ---- 事件保底 / 漏斗 / 时序 / 留存 ----
     ("register-event-count", "register 事件数 == 用户数",
      lambda t, c: t["events"]["event_name"].__setitem__(
@@ -1086,11 +1630,21 @@ NEG_CASES: list[tuple[str, str, object]] = [
      _inject_push_open_before_deliver),
     ("push-campaign-on-transactional", "campaign_id 非空 ⟺ 营销型推送",
      _inject_push_campaign_on_txn),
+    # 注入值 2026-09-01 从 `""` 改成 `None`：池子里的"直接打开"改成 None 之后，
+    # 灌一整列 `""` 会先红在上一条「⊆ REFERRERS 声明的取值域」上，而这条负测钉的是
+    # 「非空取值 ≥ 2」那一条——红在别处等于没测到。
     ("referrer-degenerate", "page_views.referrer 的非空取值",
-     lambda t, c: t["page_views"]["referrer"].__setitem__(slice(None), "")),
+     lambda t, c: t["page_views"]["referrer"].__setitem__(slice(None), None)),
     ("deep-link-single-value", "不是整列同值",
      lambda t, c: t["push_notifications"]["deep_link"].__setitem__(
          slice(None), "app://home")),
+    # ---- events.properties 的四种形状与它们的 JOIN ----
+    ("event-props-all-empty", "带属性的事件恰好是", _inject_props_all_empty),
+    ("event-props-name-mismatch", "就是该 product_id 的名字", _inject_props_name_mismatch),
+    ("event-props-keyword-single", "搜索词覆盖", _inject_props_keyword_single),
+    ("event-props-order-dangling", "purchase.properties.order_id 全部命中",
+     _inject_props_order_dangling),
+    ("event-props-amount-drift", "amount 逐条 ==", _inject_props_amount_drift),
     ("push-copy-mixed", "全部来自 PUSH_COPY 声明的组合",
      lambda t, c: t["push_notifications"]["title"].__setitem__(
          slice(None), t["push_notifications"]["title"][0])),
@@ -1098,9 +1652,7 @@ NEG_CASES: list[tuple[str, str, object]] = [
     ("brand-category-violation", "品牌→类目白名单违例 0", _inject_brand_violation),
     ("price-out-of-band", "价格越界 0",
      lambda t, c: t["products"]["price"].__setitem__(0, t["products"]["price"][0] * 20)),
-    ("product-name-structure", "product_name 全部形如",
-     lambda t, c: t["products"]["product_name"].__setitem__(
-         0, "优质" + str(t["products"]["product_name"][0]))),
+    ("product-name-structure", "product_name 全部形如", _inject_product_name_template),
     ("description-template", "description 去重数",
      lambda t, c: t["products"]["description"].__setitem__(
          slice(None), t["products"]["description"][0])),
@@ -1147,8 +1699,47 @@ NEG_CASES: list[tuple[str, str, object]] = [
     ("email-single-domain", "域名基数", _inject_single_email_domain),
     ("phone-bad-segment", "users.phone 100% 符合",
      lambda t, c: t["users"]["phone"].__setitem__(0, "12345678901")),
+    # ---- P1-6/7 三个身份标识的唯一性 ----
+    # 每条都是「把 combine_unique / unique_digits 的作用撤掉」，不是随手改一行：
+    # 反例要长成缺陷的原样，否则它只证明断言会响、不证明断言盯的是这个缺陷。
+    ("literal-username-duplicated", "users.username 全列唯一",
+     _inject_username_duplicated),
+    ("literal-email-duplicated", "users.email 全列唯一", _inject_email_duplicated),
+    ("literal-phone-duplicated", "users.phone 全列唯一", _inject_phone_duplicated),
     ("post-title-content-mismatch", "posts 正文首句是标题前缀",
      lambda t, c: t["posts"]["content"].__setitem__(0, "完全无关的另一段正文。补充说明")),
+    # ---- P0-5 归因 ⟷ 投放成本 ----
+    # 这一域此前一条断言都没有，所以每个家族都得配一个反例：判据是新写的，
+    # 「它真的会红」这件事在这里没有任何历史证据可依赖。
+    ("cost-install-below-newusers", "installs ≥ 当日 last_touch 归因新客数",
+     _inject_cost_below_newusers),
+    ("cost-funnel-not-monotonic", "impressions > clicks > installs",
+     lambda t, c: t["channel_daily_costs"]["clicks"].__setitem__(
+         0, t["channel_daily_costs"]["installs"][0])),
+    ("cost-cell-duplicated", "(channel_id, date) 唯一",
+     lambda t, c: t["channel_daily_costs"]["date"].__setitem__(
+         1, t["channel_daily_costs"]["date"][0])),
+    # 日期推到轴外一天：行数和唯一性都不变，红的只能是轴的两端那条。
+    ("cost-axis-out-of-range", "成本轴铺满",
+     lambda t, c: t["channel_daily_costs"]["date"].__setitem__(
+         0, np.datetime64(budget.COST_AXIS_END, "D") + np.timedelta64(1, "D"))),
+    # v1 的原始形态：created_at 整列等于灌数那一瞬。
+    ("cost-created-at-frozen", "created_at 与 date 同日",
+     lambda t, c: t["channel_daily_costs"]["created_at"].__setitem__(
+         slice(None), t["channel_daily_costs"]["created_at"][0])),
+    ("cost-creative-filled", "creative_id 整列 NULL",
+     lambda t, c: t["channel_daily_costs"]["creative_id"].__setitem__(0, 1)),
+    ("cost-campaign-out-of-span", "活动档期覆盖该日",
+     _inject_cost_campaign_out_of_span),
+    ("cost-cac-top-flipped", "CAC 最高的渠道", _inject_cost_cac_top_flipped),
+    ("attr-campaign-cross-channel", "归因挂的活动属于本渠道",
+     _inject_attr_campaign_cross_channel),
+    # 自然量渠道挂上广告活动——「非空 ⟺ paid/kol」那条语义等价的反向。
+    ("attr-organic-has-campaign", "非空 ⟺ 渠道是 paid/kol",
+     lambda t, c: t["user_attributions"]["ad_campaign_id"].__setitem__(
+         int(np.flatnonzero(np.array([x is None for x in
+             np.asarray(t["user_attributions"]["ad_campaign_id"], dtype=object).tolist()]))[0]),
+         1)),
 ]
 
 
@@ -1162,6 +1753,10 @@ class _CtxView:
     def __init__(self, ctx, cache: dict) -> None:
         self._ctx, self.cache = ctx, cache
         self.as_of_end = ctx.as_of_end
+        # dim_ids 是从 CSV 现读的只读维表索引，反例不改它，直接共享同一份。
+        # 它必须转发出来：check_attribution_costs 要拿 _paid_channels / _campaign_spans
+        # 等键，缺了会 AttributeError——那是崩，不是判红，整个成本域的反例会全部失效。
+        self.dim_ids = ctx.dim_ids
 
     def n(self, table: str) -> int:
         return self._ctx.n(table)

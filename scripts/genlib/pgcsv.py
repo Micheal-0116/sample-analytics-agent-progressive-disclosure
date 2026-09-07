@@ -10,7 +10,7 @@ pgcsv —— 列式(dict[str, ndarray])→ Postgres COPY 兼容 CSV,分块流式
 CSV 约定(与 \copy ... WITH CSV HEADER 对齐):
 - 用 csv.writer(QUOTE_MINIMAL),逗号分隔,带 header。
 - None / NaN → 空串(COPY 视为 NULL,DDL 列允许 NULL 时正确)。
-- bool → 'true'/'false'。datetime64 → ISO 文本。
+- bool → 'true'/'false'。datetime64 → `YYYY-MM-DD HH:MM:SS`(**空格**分隔,见 _TS_SEP)。
 - 数组列用 to_pg_array 转 '{...}';dict 列用 json.dumps。
 """
 from __future__ import annotations
@@ -21,6 +21,29 @@ import json
 import numpy as np
 
 CHUNK_ROWS = 500_000   # 每块行数;内存/吞吐折中
+
+
+def _ts_text(arr: np.ndarray) -> np.ndarray:
+    """
+    datetime64 整列 → CSV 文本,**空格**分隔日期与时间。
+
+    不能用 np.datetime_as_string 的原样输出:它给的是 ISO 的 `T` 分隔
+    (`2026-01-23T22:35:38`),而下游 `scripts/lakehouse/load.py` 的
+    `CAST(col AS timestamp(6))` 在 Athena/Trino 上对 `T` 分隔的文本直接抛
+    INVALID_CAST_ARGUMENT——已实测。Trino 只认 `2026-01-23 22:35:38`
+    这种空格分隔形式(秒精度和微秒精度都收)。
+
+    分隔符是固定第 10 个字符,但仍走 np.char.replace 而不是切片拼接:
+    这里每列只跑一次,可读性比那点开销值钱。
+
+    **日精度的列(datetime64[D])必须按日输出**,不能一律按秒。`fillers.ts_to_date`
+    返回的就是 datetime64[D],对应 DDL 里的 date 列,而 load.py 给 date 列生成的是
+    `CAST(col AS date)`——喂它 `2026-01-23 00:00:00` 会失败。仓库里现有的
+    data/csv 也是这个约定(channel_daily_costs.date = `2026-05-26`)。
+    """
+    unit = 'D' if arr.dtype == np.dtype('datetime64[D]') else 's'
+    out = np.datetime_as_string(arr, unit=unit)
+    return np.char.replace(out, 'T', ' ') if unit == 's' else out
 
 
 def to_pg_array(lst) -> str:
@@ -55,16 +78,19 @@ def _cell(v):
     if isinstance(v, dict):
         return json.dumps(v, ensure_ascii=False)
     if isinstance(v, np.datetime64):
-        return np.datetime_as_string(v, unit='s')
-    if isinstance(v, (dt.datetime, dt.date)):
+        return str(_ts_text(np.asarray([v]))[0])
+    if isinstance(v, dt.datetime):
         # 走到这里的是 **object 列里的** 时间戳：条件时间列（`_cond_ts` / `ts_offset`
         # 那类要按掩码置空的）只能用 object 数组表达,None 与 datetime 混在一起,
         # 所以 write_table 上面那段整列向量化转换不认它,逐格落到这里。
         #
-        # 必须显式给一支,不能落到下面的 str()：`str(datetime)` 用**空格**分隔日期与时间,
-        # 而 datetime64 那一支给的是 ISO 的 `T`。同一个文件里两种分隔符混着出现,而且
-        # 只在「可空的时间列」上出现——这类列恰好是最少被抽查的。isoformat() 与
-        # np.datetime_as_string(unit='s') 逐字符一致。
+        # 必须显式给一支,不能落到下面的 str()——虽然 `str(datetime)` 恰好也给空格分隔,
+        # 但它在 microsecond==0 时省掉小数部分、非 0 时带上,同一列里两种宽度混着出现。
+        # 这里钉死成与 _ts_text 逐字符一致的秒精度形式,让「可空的时间列」和普通时间列
+        # 在 CSV 里长得完全一样——这类列恰好是最少被抽查的。
+        return v.replace(microsecond=0).isoformat(sep=' ')
+    if isinstance(v, dt.date):
+        # date 没有时间部分,isoformat() 就是 'YYYY-MM-DD',DDL 里对应 date 列。
         return v.isoformat()
     return str(v)
 
@@ -82,7 +108,7 @@ def write_table(path: str, columns: dict[str, np.ndarray],
     for k, col in columns.items():
         arr = col
         if isinstance(arr, np.ndarray) and np.issubdtype(arr.dtype, np.datetime64):
-            prepared[k] = np.datetime_as_string(arr, unit='s')
+            prepared[k] = _ts_text(arr)
         else:
             prepared[k] = arr
 

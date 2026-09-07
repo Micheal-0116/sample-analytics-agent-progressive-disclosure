@@ -19,10 +19,11 @@
 
 ## 口径
 
-- 渠道 = **last_touch 归因**。**注意：约六成 GMV（当前样本实测 64.4%，会随数据重造变，报结论前请现算）归不到渠道（channel_type='unknown' / channel_name='未归因'）。做渠道归因时必须把这块单列出来，不能当它不存在。**
+- 渠道 = **last_touch 归因**。**注意：约六成 GMV（当前数据实测 64.7%，会随数据重造变，报结论前请现算）归不到渠道（channel_type='unknown' / channel_name='未归因'）。做渠道归因时必须把这块单列出来，不能当它不存在。**
 - ⚠️ 那六成里**约一半其实有渠道信息**：建表用的是 `WHERE attribution_type='last_touch'`，
-  而 471 个下单用户里 175 人只有 `first_touch` 记录（两种类型在 `user_attributions` 里
-  是互斥的，没有用户同时有），这批人被口径滤成了「未归因」。这不是建表写错——last_touch
+  而有过成交的 126,010 个买家里，44,217 人有 `last_touch` 记录、43,738 人只有
+  `first_touch` 记录（两种类型在 `user_attributions` 里是互斥的，实测同时有两种记录的
+  用户数 = 0），剩下 38,055 人一条归因都没有。中间那 43,738 人被口径滤成了「未归因」。这不是建表写错——last_touch
   就该取 last_touch——但报数时得说清是"不符合本口径"而不是"来路不明"。
 - `is_new_user=true` = 该用户的首笔有效订单。
 - 全表 gmv 合计 = `mart_daily_kpi` 的 gmv 合计（同口径，可交叉校验）。

@@ -89,10 +89,29 @@ L1–L5 查的全是**数量关系**——行数对不对、求和等不等、�
     python3 scripts/lakehouse/verify_literals.py -t posts -t users
     python3 scripts/lakehouse/verify_literals.py --selftest # 判据自测（无云依赖）
     python3 scripts/lakehouse/verify_literals.py --coherence-only
-    python3 scripts/lakehouse/verify_literals.py --from-csv /tmp/genFULL_csv
+    python3 scripts/lakehouse/verify_literals.py --from-csv \
+        /Users/jtzhu/analytics-agent-data/genFULL_csv
 
-`--from-csv` 的实测基线（全量产出，2026-08-28）：**PASS 63 · FAIL 0 · 豁免 5 · 空列 2**，
-一致性五条全 ok。改生成器或改判据后对着比。注意它的列清单真源是 DDL
+`--from-csv` 的实测基线（**只有生成器产出的那 24 张表**，全量，2026-08-28）：
+**PASS 63 · FAIL 0 · 豁免 5 · 空列 2**，一致性五条全 ok。改生成器或改判据后对着比。
+
+指向**装载用**的那个目录时基线不是这个数，别读成回归。装载要求 `CSV_DIR` 里凑齐 35 张表，
+另外 11 张（`scripts/gen/dims_to_parquet.DIMS`）是从 `data/csv` 原样拷进去的 v1 产物，
+于是普查面从 63 列涨到 103 列，并带进 **4 条 FAIL**（scale 10 实测，2026-09-01：
+`PASS 103 · FAIL 4 · 豁免 5 · 空列/跳过 12`）：
+
+    ad_creatives.creative_name   144/144 共用前缀 '素材' + 数字尾
+    banners.banner_name          119/119 中文字后紧跟 ASCII 句点
+    campaigns.description         50/50  同上
+    campaigns.owner               50/50  共用前缀 'admin_' + 数字尾
+
+这 4 条**重灌不会修**：这三张表没有 builder，属于 D-02 留下的 4 张 SUB 表（`campaigns` /
+`coupons` / `ad_campaigns` / `ad_creatives`，见 `docs/test-plan.md` 的重灌风险 ①），
+重灌只是把同一份 v1 CSV 再拷一遍。刻意不给它们开豁免口子：报尾那句「这是**生成器产出**
+上的 FAIL，改 scripts/gen/ 直到它绿」对这 4 条不成立，但把它们改判成 EXEMPT 会让
+「补了 builder 之后这 4 条自动变绿」这个信号一起消失——本文件的立场是缺口留着、看得见。
+
+注意它的列清单真源是 DDL
 （`scripts/gen/ddl.py::parse_all_raw`）而不是 `information_schema`——后者只给 varchar，
 数组 / JSONB 列压根不出现，于是「没被查过」和「查过没问题」在报告上长得一模一样。
 离线这条路把它们连同 TYPE_EXEMPT 一起印在「普查之外」那两行，缺口还在但可见。
