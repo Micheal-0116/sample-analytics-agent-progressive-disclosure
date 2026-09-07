@@ -44,8 +44,8 @@ L0–L6 全绿只说明「现在没问题」，**不说明检查器还有效**�
 ## 用法
 
     python3 scripts/negative_tests.py --list        # 看用例清单
-    python3 scripts/negative_tests.py --offline     # 只跑不连云的 33 个（秒级）
-    python3 scripts/negative_tests.py               # 全部 50 个（要 AWS 凭证，约 4 分钟）
+    python3 scripts/negative_tests.py --offline     # 只跑不连云的 37 个（秒级）
+    python3 scripts/negative_tests.py               # 全部 55 个（要 AWS 凭证，约 4 分钟）
     python3 scripts/negative_tests.py -c enum-value-absent -c doc-sql-rotten
 
 退出码非 0 = 有检查器在缺陷面前保持了沉默（或负测自己的锚点失效了），两种都要处理。
@@ -86,6 +86,7 @@ class Case:
     forbid: str = ""                  # 输出不得匹配的正则（防假阳性回归）
     delete: list[str] = field(default_factory=list)   # 整份删掉的文件（一样会还原）
     requires: str = ""                # 需要的外部命令（缺了就**明说跳过**，不假红也不静默少跑）
+    env: dict[str, str] = field(default_factory=dict)  # 追加的环境变量（基线那次也带）
 
     def touched(self) -> list[str]:
         return sorted({rel for rel, _, _ in self.patches} | set(self.delete))
@@ -142,6 +143,29 @@ CASES: list[Case] = [
         cmd=[PY, "backend/agent.py", "--selftest"],
         expect=r"GATE_ALLOWED 里没有 ToolSearch",
         forbid=r"全部通过",
+    ),
+    # 这条守的不是"上限这个数写得对不对"，而是**判据真的接在 preflight 上并且拦得住**。
+    # 注入选 day → hour 而不是把 MAX_OPEN_PARTITIONS 改小：后者只证明比较符还在，前者
+    # 才是真会发生的那种改动（有人觉得小时粒度剪得更狠），而且它同时走了单批归堆那段
+    # 算法。没有这道闸的表现是灌到那张表才在云上炸，前面每一层都绿。
+    Case(
+        id="partition-writers-over-limit",
+        cloud=False,
+        guards="scripts/lakehouse/load.py 的 check_partitions()（接在 --preflight 上）",
+        defect="有人把分区粒度调到更细的 hour()，单批分区数越过 Athena 的 100 个"
+               "并发写入器硬上限——这条不可提额，撞上就是 INSERT 中途失败",
+        # 锚点带着 `PARTITION_SPEC` 里的**实际对齐空格**，因为 apply_patches 做的是字面
+        # 替换、并且要求锚点恰好出现一次。2026-09-01 往那个 dict 里加了三张表
+        # （user_coupons / user_follows / post_comments），键名变长、整块重新对齐，
+        # 这条锚点当场变成出现 0 次，用例报 FAIL 且信息就是「锚点出现 0 次」。
+        # 这种红是**要的**：换成宽松匹配就会在下一次对齐后静默匹配到别的行。
+        # 不能只锚 `("day", "created_at"),`——那三张表里有两张也是这个形态，会撞成 3 次。
+        patches=[("scripts/lakehouse/gen_ddl.py",
+                  '"post_likes":    ("day", "created_at"),',
+                  '"post_likes":    ("hour", "created_at"),')],
+        cmd=[PY, "scripts/lakehouse/load.py", "--preflight"],
+        expect=r"post_likes: hour\(created_at\) 单批最多开 \d+ 个分区",
+        forbid=r"L0–L6 全绿",
     ),
     Case(
         id="iceberg-ddl-handedit",
@@ -438,12 +462,14 @@ CASES: list[Case] = [
         cloud=False,
         guards="eval/run_eval.py --selftest（留存 cohort 的时间列）",
         defect="`users` 上 `created_at` 和 `registered_at` **两列都存在**，所以 cohort "
-               "写错列时 EXPLAIN 通过、SQL 出结果、行数也正常——只是分出来的是另一批人"
-               "（种子那一批实测 500/500 行两列不相等）。这是「检查器验的是另一个维度」的"
-               "第三种形态：`verify_doc_sql.py` 查语法，语法没错，错的是语义。"
-               "旧版本这段确实写的是 `created_at`。全量重灌之后两列**逐行相等**（实测），"
-               "所以现在写错列不再分出另一批人——这条钉的是**卡片点名哪一列**，"
-               "不是当下的数值差异：两列相等是这一批数据的偶然，不是口径",
+               "写错列时 EXPLAIN 通过、SQL 出结果、行数也正常。这是「检查器验的是另一个"
+               "维度」的第三种形态：`verify_doc_sql.py` 查语法，语法没错，错的是语义。"
+               "旧版本这段确实写的是 `created_at`。"
+               "**这条的后果 2026-09-01 变小了、判据没变**：重灌后 213,535 行的 "
+               "`created_at` / `updated_at` 是 `registered_at` 的逐行副本（连时分秒都相等），"
+               "所以现在写错列分出来的是同一批人。留着判据的理由是它盯的是**卡片教哪一列**，"
+               "而那份逐行相等是这一版数据的偶然性质，不是列语义——生成器一改回去，"
+               "「写错列分出另一批人」立刻复活，而那时候再想起补判据就晚了",
         patches=[("knowledge/metrics/core_metrics.md",
                   "DATE_TRUNC('week', CAST(registered_at AS date)) AS cohort_week",
                   "DATE_TRUNC('week', CAST(created_at AS date)) AS cohort_week")],
@@ -489,6 +515,27 @@ CASES: list[Case] = [
         cmd=[PY, "eval/run_eval.py", "--selftest"],
         expect=r"找不到 `算不出留存`",
     ),
+    Case(
+        id="kb-retention-incomparable-gone",
+        cloud=False,
+        guards="eval/run_eval.py --selftest（「cohort 之间不可比」这条结论约束）",
+        defect="上一条钉的是卡片里「曲线不衰减时算不出留存」那条**形状**判据，这一条钉的是"
+               "与形状无关的另一条：满窗那几周之间 W1 只差 2.9pp、D1 只差 0.9pp，"
+               "agent 把它答成「越老的 cohort 粘性越强」——**把噪声报成了业务发现**，"
+               "而那句右删失说明让整段话听起来很严谨。两条判据在卡片里各占一节，"
+               "所以各有一条负测。"
+               "这条的**判据形态**收窄过一次：卡片改写时那句话在文件里留下了 5 份副本"
+               "（小标题 / 结论段 / 可照抄的引用块 / chart 段 / 右删失段），而 `run_eval` "
+               "原来只要求裸子串出现过一次，于是只改得动小标题的注入注完仍然满足它，"
+               "检查器 exit 0——**报出来是「假阴性」，根因却在判据的形态**。修法是把 must "
+               "拆成位置不同、各自唯一的三处（小标题 / 引用块 / 判分器那句），"
+               "锚点跟着钉小标题那一处",
+        patches=[("knowledge/analysis/retention_curve.md",
+                  "## ⚠️ cohort 之间不可比",
+                  "## ⚠️ 关于这份数据的 cohort")],
+        cmd=[PY, "eval/run_eval.py", "--selftest"],
+        expect=r"找不到 `## ⚠️ cohort 之间不可比`",
+    ),
     # judge_retention 里是**两道闸**，各自独立，所以这里也是两条用例。合成一条会留下
     # 一个洞：两条闸的白名单不同、触发条件不同（形状那条只在曲线不衰减时生效，可比性
     # 那条总是生效），只注入一条时另一条常常把散文拦下来，检查器照样红——红得却不是
@@ -526,6 +573,34 @@ CASES: list[Case] = [
         cmd=[PY, "eval/run_eval.py", "--selftest"],
         expect=r"数字对但把 cohort 差异读成业务结论应判错: 得到 True，期望 False",
         forbid=r"全部通过",
+    ),
+    # 三种架构对比测试的前置层（`verify_portability.py`）也得有人证明它会红。
+    # 两条各钉一侧：静态类型兼容那一侧，和跨格式逐列相等那一侧。
+    Case(
+        id="portability-rs-type-incompat",
+        cloud=False,
+        guards="scripts/gen/verify_portability.py --static 的 rs_type_compat",
+        defect="有人把 INTEGER 的 Parquet 物理类型改回 int64（这正是本项目踩过的原始缺陷，"
+               "见 arrow_types.py 的 docstring）——Redshift `COPY ... FORMAT AS PARQUET` "
+               "会报 Spectrum Scan Error / code 15007，而生成侧一路全绿",
+        patches=[("scripts/gen/arrow_types.py",
+                  "        return pa.int32()                        # Redshift INTEGER = int32，不是 int64",
+                  "        return pa.int64()                        # Redshift INTEGER = int32，不是 int64")],
+        cmd=[PY, "scripts/gen/verify_portability.py", "--static"],
+        expect=r"只接受 Parquet \('int32',\)，实际 int64",
+    ),
+    Case(
+        id="portability-null-vs-empty",
+        cloud=False,
+        guards="scripts/gen/verify_portability.py --selftest 的判据 8",
+        defect="有人把「空串与 NULL 判不等」放宽成判等——那正是 2026-09-01 那个 referrer "
+               "缺陷能在两个 arm 上静默分叉的原因（Athena 侧 IS NULL 命中 28%，"
+               "Redshift 侧 0 行，两边都不报错）",
+        patches=[("scripts/gen/verify_portability.py",
+                  '    if v is None:\n        return None',
+                  '    if v is None:\n        return ""')],
+        cmd=[PY, "scripts/gen/verify_portability.py", "--selftest"],
+        expect=r"判据 8：空串与 NULL 判不等",
     ),
     Case(
         id="doc-row-total-drift",
@@ -761,11 +836,18 @@ CASES: list[Case] = [
         defect="线上库新出现一个整列同一个值的列而没人登记——灌载忠实、EXPLAIN 通过、"
                "没声明枚举所以 verify_enums 不看它，任何求和恒等式都满足，"
                "而基于它算的比率恒等于 0 且不报错",
+        # 锚点 2026-09-01 从 posts.share_count 换到 channel_daily_costs.currency：
+        # 全量重灌之后 posts 的三个计数器不再是常量（RELOAD_PENDING 那 14 条一起清了），
+        # 拿一个已经非退化的列做锚点，这条负测会永远"注入了但注不出缺陷"而绿。
+        # currency 是 BY_DESIGN_CONST 里的刻意常量，重灌不会动它，所以锚点稳。
         patches=[("scripts/lakehouse/verify_constants.py",
-                  '    "posts.share_count": "同 posts.like_count，从 post_shares 明细 bincount 回填",\n',
+                  '    "channel_daily_costs.currency":\n'
+                  '        "tables.py::build_channel_daily_costs 里是 F.const(n, \'CNY\')。本库只有人民币一种"\n'
+                  '        "计价，成本表不做多币种——`knowledge/metrics/governed_metrics.md` 的 CAC / ROI "\n'
+                  '        "口径全部按元直接相加，引入第二种币种要先加汇率表，那是另一个决策",\n',
                   "")],
-        cmd=[PY, "scripts/lakehouse/verify_constants.py", "-t", "posts"],
-        expect=r"posts\.share_count.*不在任何清单里",
+        cmd=[PY, "scripts/lakehouse/verify_constants.py", "-t", "channel_daily_costs"],
+        expect=r"channel_daily_costs\.currency.*不在任何清单里",
     ),
     Case(
         id="degenerate-col-stale-entry",
@@ -773,12 +855,37 @@ CASES: list[Case] = [
         guards="scripts/lakehouse/verify_constants.py（方向二：清单条目已过期）",
         defect="清单里某列已经不是退化列了（比如重灌真发生了），那条却还留着——"
                "豁免变成永久免疫，下一个人读到的是「这列还没修」",
+        # 锚点 2026-09-01 从 events.created_at 那一行换到 RELOAD_PENDING 的桶口：重灌把那
+        # 一行连同另外 13 条一起清了（清除条件达成），而这条负测要的只是"往常量清单里塞一条
+        # 已经不成立的条目"，塞在桶口上同样成立、而且不依赖桶里有什么。
+        #
+        # 锚点写**整行带类型标注**，不写 `RELOAD_PENDING = {`。桶被清空之后那行就成了
+        # `RELOAD_PENDING: dict[str, str] = {}`（空字典必须标注，否则类型推不出来），
+        # 短锚点命中 0 次——2026-09-03 这条就是这么失败的，而且失败信息长得像「检查器沉默」，
+        # 实际是负测自己没注入进去。同侧的 array-col-stale-entry 一直是这么写的。
         patches=[("scripts/lakehouse/verify_constants.py",
-                  '    "events.created_at": "生成器挂在事件时刻 ev_time 上",',
-                  '    "events.created_at": "生成器挂在事件时刻 ev_time 上",\n'
-                  '    "posts.title": "负测注入的过期条目",')],
+                  "RELOAD_PENDING: dict[str, str] = {}",
+                  'RELOAD_PENDING: dict[str, str] = {\n'
+                  '    "posts.title": "负测注入的过期条目",\n}')],
         cmd=[PY, "scripts/lakehouse/verify_constants.py", "-t", "posts"],
         expect=r"posts\.title.*已经不是常量了",
+    ),
+    # 第三条守**数组列**那套判据（2026-08-31 加）。走的是"清单过期"这个方向，因为另一个
+    # 方向（真出现一列整列空数组）需要往云上写一列空数组进去，而负测不改数据、只改仓库
+    # 文件。这一条仍然证明了要证明的事：数组普查真的连云取了数、真的按 cardinality 判了，
+    # 而不是像 2026-08-31 之前那样把 8 个数组列打印一遍就算完（P1-10 就是从那个口子漏的）。
+    Case(
+        id="array-col-stale-entry",
+        cloud=True,
+        guards="scripts/lakehouse/verify_constants.py（数组普查：清单条目已过期）",
+        defect="数组列的豁免清单里留着一条已经有真元素的列——和标量那侧同一种病，"
+               "而数组列此前根本不在普查面里，连「退化」都判不出来",
+        patches=[("scripts/lakehouse/verify_constants.py",
+                  "ARRAY_EMPTY_PINNED: dict[str, str] = {}",
+                  'ARRAY_EMPTY_PINNED: dict[str, str] = {\n'
+                  '    "posts.tags": "负测注入的过期条目",\n}')],
+        cmd=[PY, "scripts/lakehouse/verify_constants.py", "-t", "posts"],
+        expect=r"posts\.tags.*登记成整列空数组，但实际有 \d+ 个元素",
     ),
     Case(
         id="doc-sql-rotten",
@@ -798,6 +905,16 @@ CASES: list[Case] = [
         guards="scripts/lakehouse/verify_load.py（CSV 真源 ⟷ Athena 现查）",
         defect="CSV 与湖里的数不一致——装载丢了行/串了值，行数对但求和不对",
         patches=[("data/csv/channels.csv", "13,直接访问", "130,直接访问")],
+        # 重灌之后 verify_load 的 CSV 侧默认不再是 `data/csv/`（那是 v1 的 19 万行样本），
+        # 而是装载快照 `data/loaded_row_counts.json` 记的那个目录。所以这里必须显式把
+        # CSV_DIR 指回 `data/csv`，否则改了它也影响不到被测命令 —— 检查器会正常绿，
+        # 用例读作「假阴性」，实际是**注入打空了**。这是"账本换了、锚点没跟着换"那一类
+        # 的第四例（前三例：degenerate-col-unlisted / -stale-entry / doc-row-total-drift）。
+        #
+        # 拿 `data/csv/channels.csv` 比云上这份是成立的：channels 是直通维表，
+        # 两个目录里这个文件逐字节相同（14 行）。**别把这个做法推广到生成表** ——
+        # 那些表在两份数据里行数和取值都不一样，比出来的"差异"是比错了对象。
+        env={"CSV_DIR": "data/csv"},
         cmd=[PY, "scripts/lakehouse/verify_load.py", "-t", "channels"],
         # 认到「channels 有几项指标不符」+ 汇总行；只认「处差异」的话，连"读不到表"
         # 之类跟装载无关的红也算过。
@@ -889,8 +1006,9 @@ RESTORE_FAILED = False
 
 # ---------------------------------------------------------------- 执行
 
-def run(cmd: list[str]) -> tuple[int, str]:
-    p = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=900)
+def run(cmd: list[str], env: dict[str, str] | None = None) -> tuple[int, str]:
+    p = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=900,
+                       env={**os.environ, **env} if env else None)
     return p.returncode, p.stdout + p.stderr
 
 
@@ -910,13 +1028,14 @@ def apply_patches(case: Case) -> None:
 # 基线（未注入时那次运行）按命令缓存：reconcile 家族有 8 个用例共用同一条
 # `reconcile.py --strict`，一次云调用约 40 秒，不缓存就白跑 7 遍。
 # 缓存成立的前提是**每个用例退出时工作树已还原**，所以还原一旦失败就停跑（RESTORE_FAILED）。
-_BASELINE: dict[tuple[str, ...], tuple[int, str]] = {}
+_BASELINE: dict[tuple, tuple[int, str]] = {}
 
 
-def baseline_result(cmd: list[str]) -> tuple[int, str]:
-    key = tuple(cmd)
+def baseline_result(cmd: list[str], env: dict[str, str] | None = None) -> tuple[int, str]:
+    # env 也进 key：同一条命令换了环境变量就是另一次运行（例如 CSV_DIR 指到别处）。
+    key = (tuple(cmd), tuple(sorted((env or {}).items())))
     if key not in _BASELINE:
-        _BASELINE[key] = run(cmd)
+        _BASELINE[key] = run(cmd, env)
     return _BASELINE[key]
 
 
@@ -924,19 +1043,19 @@ def run_case(case: Case, fast: bool) -> tuple[bool, str]:
     """返回 (是否通过, 说明)。"""
     base = None if fast else case.baseline_cmd()
     if base:
-        rc, out = baseline_result(base)
+        rc, out = baseline_result(base, case.env)
         if rc != 0:
             return False, ("注入前就已经是红的（rc=%d），这个用例证明不了任何事。"
                            "先修好正向检查：\n%s" % (rc, tail(out)))
 
     files = case.touched()
     if not files:
-        rc, out = run(case.cmd)
+        rc, out = run(case.cmd, case.env)
         return judge(case, rc, out)
 
     with Sandbox(files):
         apply_patches(case)
-        rc, out = run(case.cmd)
+        rc, out = run(case.cmd, case.env)
     return judge(case, rc, out)
 
 

@@ -1,9 +1,18 @@
 #!/usr/bin/env bash
 # 湖仓架构验收：跑完 L0–L6，全部记账后一次性报结果。
 #
-# 架构是 S3 Tables（Iceberg）+ Glue Data Catalog + Athena。Redshift 已整体退役，
-# 原来 L1/L2/L4/L5/L6 里所有 Redshift 专属检查都换成了对应的湖仓检查。治理层（L4）
-# 换的不是同一个原语：Redshift 的动态脱敏在 LF 里没有等价物，落成了列级排除 —— 见那一节。
+# 这个脚本验的是**湖仓那条 arm**：S3 Tables（Iceberg）+ Glue Data Catalog + Athena。
+# L1/L2/L4/L5/L6 里原来的 Redshift 专属检查都换成了对应的湖仓检查；治理层（L4）换的不是
+# 同一个原语：Redshift 的动态脱敏在 LF 里没有等价物，落成了列级排除 —— 见那一节。
+#
+# 但**别读成「Redshift 退役了」**（这行注释一度就是那么写的）。项目现在要的是三种架构的
+# 横向对比，Redshift Serverless 和 DuckDB 都是在跑的 arm，不是历史包袱：
+#
+#   · 跨 arm 的取值对账     python3 eval/compare_goldens.py
+#   · 某条 arm 的金标可跑性  DB_BACKEND=redshift python3 eval/run_eval.py --dry-run
+#
+# 这个脚本只锚 athena（L5 那条金标门就写死了 DB_BACKEND=athena），另外两条 arm 的验收
+# 走上面两条命令，别指望在这里看到它们的红绿。
 #
 #   bash scripts/test_all.sh           # L3 只抽查 3 张表（35 张要 ~1 分钟）
 #   bash scripts/test_all.sh --l0      # 只跑 L0（不连云、不要凭证；CI 用这一档）
@@ -138,6 +147,14 @@ hdr "L0 静态自测（无云依赖）"
 # 无关的灯，代价不是"少测一项"，是**下次没人认真看这份报告**。反过来也不能
 # 直接删掉这两行：那样"L0 全绿"会被读成"生成器也验过了"。
 if $PY -c "import numpy" >/dev/null 2>&1; then
+  # genlib 是生成器的底座，其中 pgcsv 那段盯的是**装载能不能成**：Athena 的
+  # `CAST(x AS timestamp(6))` 只认空格分隔，pgcsv 曾写出 ISO 的 `T` 分隔，
+  # 结果 8000 万行那条生成路径整个装不进湖，而 CSV 自己看起来完全正常。
+  # 这类"格式对不上"的缺陷只有在写出的那一层才拦得住，装载时报错指不到成因。
+  # 跑 8 秒（pgcsv 那段写 100 万行真文件），无云依赖。
+  # 判据写全 ", 0 failed ==="：只写 "0 failed" 的话 "10 failed" 也能匹配上。
+  grep_run "genlib 底座自测（含 CSV 时间戳形式）" ", 0 failed ===" \
+    $PY scripts/genlib/selftest.py
   grep_run "生成器 fillers 自测"          "全部通过" $PY scripts/gen/selftest_fillers.py
   grep_run "生成器跨表闭环自测"           "全部通过" $PY scripts/gen/selftest_closures.py
   # 反例一侧：上面那 106 条断言（跨表闭环自测自己报的数）全是正向的，判据写歪了它照样绿，而它绿在最前面，
@@ -146,6 +163,14 @@ if $PY -c "import numpy" >/dev/null 2>&1; then
   # 不碰云，代价和 fillers 自测同级。
   grep_run "生成器跨表闭环自测的反例一侧"  "反例全部按预期变红" \
     $PY scripts/gen/selftest_closures.py --negative
+  # 三种架构对比测试的前置判据（Redshift / Athena+S3Tables / DuckDB+S3Tables 要吃同一份
+  # 数据）。这里跑的是它的红绿自测 + 两条不读数据的静态判据：Parquet 物理类型 ⟷ Redshift
+  # 列类型、Iceberg 类型 ⟷ DuckDB reader 支持集合。读数据的判据 3–8 不在这里——那要一份
+  # 全量产出目录（判据 8 还要两份），跑法写在 verify_portability.py 的 docstring 里。
+  grep_run "三架构可移植性判据自测（红绿两侧 · 无云依赖）" "全部通过" \
+    $PY scripts/gen/verify_portability.py --selftest
+  grep_run "Parquet ⟷ Redshift 类型兼容 + Iceberg ⟷ DuckDB 类型（静态，35 表）" "全部通过" \
+    $PY scripts/gen/verify_portability.py --static
 else
   note "跳过生成器自测（fillers / 跨表闭环）：未装 numpy，装了自动跑。"
   note "  pip install numpy —— 只在要重新造数据时才需要，湖仓链路不依赖它。"
@@ -175,15 +200,38 @@ grep_run "维度分辨率判据自测（L6 · 无云依赖）" "全部通过" \
     $PY scripts/lakehouse/verify_resolution.py --selftest
 grep_run "画像相关性判据自测（L8 · 无云依赖）" "全部通过" \
     $PY scripts/lakehouse/verify_correlation.py --selftest
-# 四张行为大表（post_likes / page_views / user_follows / push_notifications，合计
-# 95,029 行）的分布真实性判据。跟上面那条一样只挂 --selftest：正向那一支对现行库必然
-# 21/27 红（数据不重灌的决定已定），挂上去就是一盏永远红的灯。
-# 自测本身不连云、不读库，验的是判据有没有区分力：27 条判据 × 均匀夹具必须红 / 重尾夹具
+# 四张行为大表（post_likes / page_views / user_follows / push_notifications）的分布真实性
+# 判据，外加 events 的一条窗口判据（28 条）。跟上面那条一样只挂 --selftest：正向那一支对
+# 现行库必然一片红，挂上去就是一盏永远红的灯——2026-08-31 重灌换掉了分布形状那一批红，
+# 但 ev_in_session 的成因在生成器，只有下一次重新生成才可能变绿。
+# 自测本身不连云、不读库，验的是判据有没有区分力：每条判据 × 均匀夹具必须红 / 重尾夹具
 # 必须绿，外加集中度统计量与朴素实现逐位对齐、随机基线公式与四个实测点吻合、
 # WEAK/NOINPUT 不许当通过、通过线是闭的。它自己就是这批判据的唯一闸门。
-grep_run "行为大表分布判据自测（27 条 × 红绿两侧 · 无云依赖）" "全部通过" \
+grep_run "行为大表分布判据自测（28 条 × 红绿两侧 · 无云依赖）" "全部通过" \
     $PY scripts/lakehouse/verify_behavior.py --selftest
 grep_run "pg→trino 方言改写自测"          "全部通过" $PY scripts/gen/pg_to_trino.py --selftest
+# 三种架构横向对比那一套（scripts/bench/）的判据自测，六条都不连云、不花钱。
+# 挂上来的直接原因：在此之前**整套测试里没有一条断言碰过它们**，于是那些判据坏掉
+# 也不会让任何东西变红——2026-09-07 一次性查出三处，全是靠人读代码才发现的：
+# 整批摊薄那一栏拿整批墙钟给每条 arm 记账（一条 arm 为另两条付钱、同一段时间收两遍）、
+# Athena 每条查询的 10MB 起步价被合并成一次（8 条里漏收 7 次）、
+# 两个正确性闸门在受治理的三列上**没有缺陷也是红的**（红得没道理和绿灯掩盖缺陷是同一枚
+# 硬币，那次真的跨 arm 不一致形态一模一样）。现在那些性质都写成断言了，这几行是它们的闸门。
+grep_run "arm 探针标签逐位相同（三种方言不串味 · 无云依赖）" "✅" \
+    $PY scripts/bench/arms.py --selftest
+grep_run "表级三方对账判据自测（含治理豁免 11 条 · 无云依赖）" "自测通过 ✅" \
+    $PY scripts/bench/correctness.py --selftest
+grep_run "取值三方对账判据自测（含治理豁免 6 条 · 无云依赖）" "自测通过 ✅" \
+    $PY scripts/bench/query_correctness.py --selftest
+# 这条钉的是「起步价的单位」：Athena 按查询、Redshift 按活动分钟、Fargate 按任务。
+# 三个单位混用正是上面那两处成本错的根源。
+grep_run "单价与计费规则换算自测（无云依赖）" "换算逻辑自测通过 ✅" \
+    $PY scripts/bench/prices.py --selftest
+# 核心断言：**任何一条 arm 的摊薄金额都不许随另一条 arm 的耗时变化**（双向各查一次）。
+grep_run "耗时与成本口径自测（摊薄不许串台 · 无云依赖）" "耗时与成本逻辑自测通过 ✅" \
+    $PY scripts/bench/timing.py --selftest
+grep_run "冷启动结算自测（账单侧口径 · 无云依赖）" "自测通过 ✅" \
+    $PY scripts/bench/cost_cold.py --selftest
 # 这道闸管的是「不许写」，管不了「不许看」——后者是 L4 的事，两条别互相当替补。
 # 在这条自测之前整套测试里没有一条断言碰过它：把 _FORBIDDEN 改松不会让任何东西变红。
 grep_run "只读 SQL 边界自测（管「不许写」；「不许看」在 L4）" "全部通过" $PY backend/db.py
@@ -250,6 +298,11 @@ grep_run "规模声明自洽（docs/scale.json ⟷ data/csv · 文档声明原�
   "规模声明自洽 ✅" $PY scripts/lakehouse/verify_scale.py --selftest
 grep_run "枚举卡片解析器自测"             "全部通过" $PY scripts/lakehouse/verify_enums.py --selftest
 grep_run "退化列分类器 + 登记清单自测"     "全部通过" $PY scripts/lakehouse/verify_constants.py --selftest
+# 一致性快照的跨方言渲染。这条挂上来是因为它的失败方式是**静默漏列**：Trino 报
+# `decimal(12,2)` / `timestamp(6)`，Postgres 那套类型名一个都对不上，`kind()` 返回
+# None，全部金额列和时间列被当成 varchar 跳过——快照只剩 count，脚本 exit 0，
+# 输出看起来完全正常。自测同时钉住 Postgres 那一支逐字节没变（两份基线按它产的）。
+grep_run "一致性快照跨方言渲染自测"        "全部通过" $PY scripts/consistency/snapshot.py --selftest
 grep_run "建站脚本自测"                   "全部通过" $PY scripts/lakehouse/setup.py --selftest
 grep_run "CSV 装载前检（表头/列序/行尾/换行/数组）" "✅" $PY scripts/lakehouse/load.py --preflight
 # boot() 决定整页走真实链路还是离线烘焙数据，而它坏掉时页面**照常给答案**（问退款答
@@ -336,15 +389,22 @@ grep_run "卡片枚举取值 ⟷ Athena 实际取值" \
 # 路径四：列的**基数**。上面三条全绿时，一列仍可能整个恒等于 0 或整列 NULL——
 # 灌载忠实（verify_load 比的是 CSV ⟷ Athena，源头本来就是 0）、EXPLAIN 通过、
 # 没声明枚举所以 verify_enums 不看它，而 core_metrics.md 的 like_rate 恒等于 0.00
-# 且不报错。实测 468 个标量列里 33 个常量 + 46 个整列 NULL，逐列登记在那份清单里；
+# 且不报错。实测 468 个标量列里 31 个常量 + 46 个整列 NULL，逐列登记在那份清单里；
 # 这条的价值全在「清单外新增一个」和「清单里某条已被修好」两种情况都会红。
-grep_run "线上库退化列（常量 / 整列 NULL）全部登记在册" \
+# 8 个数组列 2026-08-31 起也在普查面里（此前一律跳过）：判 sum(cardinality) = 0，
+# 即「整列空数组」——posts 那三列一度就是这个形态，而那一轮没有任何一层会红。
+grep_run "线上库退化列（常量 / 整列 NULL / 整列空数组）全部登记在册" \
   "全部登记在册 ✅" $PY scripts/lakehouse/verify_constants.py
 
 hdr "L3 装载完整性（CSV 真源 ⟷ Athena 现查）"
 # 不用 scripts/consistency/snapshot.py 的基线 JSON：那两份基线描述的是 v2 那批数据
 # （users 21 万行），跟当前部署（500 行）无关，比起来**稳定通过但什么也没验证**。
 # 这里两边都现算，没有会过期的中间文件。理由详见 verify_load.py 的模块 docstring。
+# 2026-09-01 起 CSV 侧的目录**不再是 data/csv**：云上是 7,994 万行的全量产出，
+# 而 data/csv 是 v1 的 19 万行，比起来会得出一屏假差异（"你比错了东西"被印成
+# "装载不完整"）。verify_load.py::_resolve_csv_dir 现在从 data/loaded_row_counts.json
+# 读装载那次的产出目录并指过去；那个目录不在本机时判红并给出重造命令，不退回 data/csv。
+# 显式 `CSV_DIR=` 仍然优先。
 if [[ $FULL -eq 1 ]]; then
   echo "  （全量 35 张表，约 1 分钟…）"
   grep_run "35 张基表的行数/数值求和/时间边界/布尔计数全等" \
@@ -392,10 +452,14 @@ hdr "L5 查询路径"
 grep_run "口径恒等式：多条路径的 GMV/退款/行数互等 + 两处 v1 缺陷仍被钉住" \
   "全部成立 ✅" $PY scripts/lakehouse/verify_mart_parity.py --numbers
 
-# 不写死金标条数（加一道题不该让测试红）。用 `OK$` 锚行尾：全通过时那行就到 OK 结束，
+# 不写死金标条数（加一道题不该让测试红）。锚行尾是关键：全通过时那行到 `arm=<名>` 结束，
 # 有失败时 run_eval 会在后面接「；失败: [id…]」，正则自然不匹配。别写成宽松的 `OK`。
+#
+# `arm=` 这一段必须一起匹配，不能只锚到 `OK$`：三条 arm 之后 run_eval 在 OK 与失败清单
+# **之间**插了 arm 标记，只锚 `OK$` 会永远不匹配——2026-09-03 就这么红了一次，27 道题
+# 全 golden_ok，红的是这条正则。
 grep_run "全部金标 SQL 均可在 Athena 执行" \
-  "金标验证: [0-9]+/[0-9]+ OK$" env DB_BACKEND=athena $PY eval/run_eval.py --dry-run
+  "金标验证: [0-9]+/[0-9]+ OK · arm=[a-z]+$" env DB_BACKEND=athena $PY eval/run_eval.py --dry-run
 
 hdr "L6 服务与前端渲染契约"
 # 这一层自己起后端、测完就关，不依赖外部已有服务。

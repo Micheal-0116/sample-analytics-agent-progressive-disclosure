@@ -14,14 +14,14 @@ L2 后面另挂一组**不编号、不是闸门**的数据真实性报告器（�
 bash scripts/test_all.sh              # L0–L6，约 3 分钟（L3 抽查 3 张表）
 bash scripts/test_all.sh --l0         # 只跑 L0，不连云、不要凭证，exit 0 可判（CI 跑的是这一档）
 bash scripts/test_all.sh --full       # L3 换成全量 35 张表（多约 1 分钟）
-bash scripts/test_all.sh --l8         # 追加 L8 负测（50 个用例，约 4 分钟，会临时改文件再还原）
+bash scripts/test_all.sh --l8         # 追加 L8 负测（55 个用例，约 4 分钟，会临时改文件再还原）
 ```
 
 L7（端到端 agent）不在里面：它烧 Bedrock token 并覆盖 `eval/report.md`，该有人看着跑。
 
 ### CI 覆盖到哪一层（`.github/workflows/offline.yml`）
 
-CI **只跑离线那一档**：`test_all.sh --l0`（34 条）+ `negative_tests.py --offline`（33 个用例）
+CI **只跑离线那一档**：`test_all.sh --l0`（44 条）+ `negative_tests.py --offline`（37 个用例）
 + CDK 那 9 条执行角色策略断言（`Template.fromStack`，纯合成）。三步都不连云。
 
 L1–L7 不在 CI 里，而这是个**刻意的缺口**：那几层要能连这个账号的凭证（S3 Tables / Glue /
@@ -51,7 +51,7 @@ cd backend && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 ## L0 静态自测（无云依赖，秒级）
 
-34 项，全部是纯函数级断言（其中 3 项生成器自测要 numpy、1 项 boot() 契约要 node，缺了打 note、不算 FAIL）。改了 `scripts/` 下任何生成器/解析器/改写器，**先跑这一层**（`--l0` 就只跑它）。
+44 项，全部是纯函数级断言（其中 3 项生成器自测要 numpy、1 项 boot() 契约要 node，缺了打 note、不算 FAIL）。改了 `scripts/` 下任何生成器/解析器/改写器，**先跑这一层**（`--l0` 就只跑它）。
 
 注意那两个「缺了打 note」的依赖在 CI 里是**装上的**（`scripts/requirements.txt` + `setup-node`）：
 note 不算 FAIL 是给本机开的方便，如果 CI 也让它跳过，那批断言会在一片绿灯里一直不跑。
@@ -66,11 +66,11 @@ note 不算 FAIL 是给本机开的方便，如果 CI 也让它跳过，那批�
 | `deploy/sync_agent_code.py --selftest` / `--check` | 同步器自己坏了（认不出漂移），**或**云上副本 `analyticsagent/app/analytics/` 与 `backend/` 不再是同一份代码 |
 | `eval/run_eval.py --selftest` | L7 判分器坏了：`judge_funnel` 的形态闸不再拦非单调"漏斗"、`stats.funnel` 的实时闸不再报 `monotonic=False`，`L4-funnel` 的金标口径被改回"每步各数一遍"，**或 `knowledge/` 里的漏斗参考 SQL 退回独立计数 / 漏斗题不再路由到方法卡**（最后这一项是 agent 真正读的那条路，前三项全绿时它照样能答错）。另一半盯**留存**：cohort 时间列退回 `created_at`（`users` 两列都有，EXPLAIN 照样过）、分子不再限定在 cohort 内（会炸出 509%）、「这份数据算不出留存」这条**结论级**约束被摘掉，以及 `judge_retention` 的结论闸被摘掉——后两条都是「数字全对而结论仍然错」那一类，一条管卡片里那句话还在，一条管判分器真的会因此判错。还有一条管**金标自己的时间锚点**：`(SELECT max(x) …)` 里的 x 必须是 `meta_snapshot.as_of_date`，写成逐表 max 直接判错——这条补的是「评测在奖励知识库明令禁止的写法」，9 条金标原来用的正是逐表 max，而它在多数表上恰好等于锚点、算出来和正确答案一样。见下 |
 | `verify_mart_parity.py --selftest` / 无参 | 集市层 CTAS 的谓词或列数在手工搬运中丢了 |
-| `reconcile.py` / `verify_load.py` / `verify_enums.py` / `setup.py --selftest` | 对应对账器自己的解析逻辑坏了（这些自测是**假阳性**的防线） |
-| `verify_scale.py --selftest` | `docs/scale.json` 与 `data/csv/` 对不上（seed 那一批的每表行数是抄的，CSV 是真源），**或**某处文档里声明规模的原文被改写/被抄成了另一批的数。这条补的是整个对账层的一处结构性盲区：比表、比列、比枚举、比退化列、比装载忠实，**从不比规模**——于是「五处文档写着 19 万行、湖里装着 7994 万行、L0–L6 全绿」真的发生过。湖里到底装的是哪一批要连云，在 L3 |
+| `reconcile.py` / `verify_load.py` / `verify_enums.py` / `setup.py --selftest` | 对应对账器自己的解析逻辑坏了（这些自测是**假阳性**的防线）。`verify_load` 那条另外盯 CSV 侧**两条聚合路径算不出同一个 dict**：向量化那条（pyarrow）是全量 8000 万行实际走的，逐行那条（`CSV_ENGINE=stdlib`）是口径的定义式，两条漂开的表现是全量对账悄悄换了判据。同一份构造数据钉住六件事，其中「整列 false 的布尔列也要产生 `true:` 键」是这次补的洞——不产生键时那一列**完全不参与对账**，Athena 侧真的全 true 也照样绿 |
 | `gen/semantics.py --selftest` | `scripts/gen/semantics.yaml` 自相矛盾了。它是商品语义（品牌→类目白名单 / 价格带 / 品牌分档 / 规格词池）的**唯一真源**，生成器和 `verify_semantics.py` 都从它读——所以配置错的时候两侧会**一起**用错的那份，于是一致、全绿、而数据是错的。9 项校验在 `load()` 里，任何调用方都跑得到；`--selftest` 另外查 4 件小样本查不到的事，最要紧的一条是「不重名商品名上界 ≥ 全量目标 SKU 数」（scale=1 只造 200 行永远够用，缩了品牌白名单要到灌全量那一刻才炸）。**这一条不在 numpy 分支里**：只要 pyyaml |
 | `verify_literals.py` / `verify_semantics.py` / `verify_resolution.py` / `verify_correlation.py` / `verify_behavior.py` 的 `--selftest` | L2+ 那五个报告器的**判据失去了区分力**。挂的只有 `--selftest`（正向那一支对现行库必然红，理由在 L2+ 那一节），所以这一条是那 157 项断言（23 + 19 + 6 + 28 + 81）的**唯一**闸门：夹具喂给纯函数判据，均匀/合法那一侧必须绿、退化/违例那一侧必须红。前三个是 2026-08-27 补挂的——写前两批时还没把「自测就是唯一闸门」定成模式，那 48 项断言（23 + 19 + 6）在此之前没有任何东西在跑 |
 | `load.py --preflight` | CSV 表头/列序/换行/数组格式与 DDL 不一致——灌进去会整列错位且不报错 |
+| `consistency/snapshot.py --selftest` | 一致性快照的**跨方言渲染**坏了。它的失败方式是静默漏列：Trino 的 `information_schema` 报 `decimal(12,2)` / `timestamp(6)`，Postgres 那套类型名一个都对不上，判类返回 None，全部金额列和时间列被当成 varchar 跳过——快照只剩 `count`，脚本 exit 0，输出格式看起来完全正常。同时钉住 Postgres 那一支**逐字节没变**（那两份归档基线是按它产的，`scripts/gen/main.py` 的 `_expected.json` 也照着它的类型分类走） |
 | `ui/boot_test.mjs` | 前端存活探针的行为坏了：慢探针被判死（页面静默落进离线烘焙数据）、**后端说「还在预热」却被当成「不在」**、探不通却假装在线、一直预热不完却永远转圈、探针期间提问不等探针、**降级之后再也不看一眼后端**（先开页面后起后端就永久锁死）、或**降级过的页面在后端已经活着时仍给烘焙答案**。见下 |
 | `ui/asset_check.py` | shell 引用的本地资源在**本地那套挂载布局**下取不到：线上它在站点根、本地被挂在 `/app` 下，写死绝对路径就是静默 404——图表框空白、字体退回系统默认，页面其余部分照常渲染，界面上一句红字都没有 |
 
@@ -195,7 +195,8 @@ note 不算 FAIL 是给本机开的方便，如果 CI 也让它跳过，那批�
   断言，那时反例会"通过"而它本来该盯的判据其实已经坏掉。**第一次跑就抓到一个**：
   `tag-not-unique` 只搬了 `tag_name` 没搬 `tag_type`，而 `tag_pools` 是按 type 分池的，
   于是先破的是分池那条；补上 `tag_type` 才落到 `UNIQUE(product_id, tag_name)` 上。
-  最终 44/44 红对，正例侧仍 106/106，两侧合计约 8 秒。
+  最终 44/44 红对，正例侧仍 106/106，两侧合计约 8 秒（**这是那一批当时的数**；
+  两侧此后随新判据一起长，现在是正例 150 条 / 反例 66 个注入，见下面的运行记录）。
   它盖不到两类，写在 `NEG_CASES` 上方：①注入是**表级**的，病灶在生成器内部的缺陷造不
   出来——典型是 D-01「倍率传导到 GMV」的 `mult[uid-1]` 下标错位，那条判据的红由 2026-08
   实测留档（错位 0.49× vs 阈值 1.48×）；②同一 check 家族里**先判的挡住后判的**，
@@ -234,7 +235,7 @@ python3 scripts/lakehouse/verify_constants.py
 | `reconcile.py --strict` | 声明态（v1 DDL + 集市 Iceberg DDL）⟷ Glue 实际态 ⟷ 知识库卡片 | 表和**列**：名字、类型、列注释、指标 SQL 引用的标识符 |
 | `verify_doc_sql.py` | 卡片里每条示例 SQL ⟷ Athena `EXPLAIN` | **可执行性**：语法 + 目录 + 列 + 类型解析，扫描 0 字节。文档不会被执行，错了没人会响 |
 | `verify_enums.py` | 卡片枚举小节 ⟷ 列里的实际取值（双向） | **列里装的值**。上面两条都管不到 |
-| `verify_constants.py` | 每个标量列的**基数**（`min`/`max`/`count`）⟷ 一份逐列登记的清单 | **列里有没有值**。前三条全绿时一列仍可能整列恒等于 0 或整列 NULL |
+| `verify_constants.py` | 每个标量列的**基数**（`min`/`max`/`count`）+ 每个数组列的**元素总数**（`sum(cardinality)`）⟷ 一份逐列登记的清单 | **列里有没有值**。前三条全绿时一列仍可能整列恒等于 0、整列 NULL、或整列是空数组 |
 
 第三条是这个项目那类缺陷最纯的形态：卡片写 `status='active'` 而数据是 `'on_sale'` 时，
 SQL 语法正确、对账全绿、EXPLAIN 通过、**跑出来是空集**，然后"没有在售商品"这个结论
@@ -275,6 +276,12 @@ Athena 用的那个写法不带前缀。写串了报 `EntityNotFoundException`�
 标量列取 `min(CAST(c AS VARCHAR))` / `max(...)` / `count(c)` / `count(*)`：`min = max`
 ⟹ 整列同一个值，`count(c) = 0` ⟹ 整列 NULL。
 
+数组列（8 列）走**另一套判据**（2026-08-31 加，此前一律跳过）：
+`sum(cardinality(c))` / `max(cardinality(c))` / `count(c)` / `count(*)`，只判两件能定义
+清楚的事——`count(c) = 0` ⟹ 整列 NULL（和标量列共用 `ALL_NULL_PINNED`），
+`sum(cardinality(c)) = 0` ⟹ **整列空数组**（行不是 NULL，但每行都是 `[]`）。刻意不判
+「长度恒为 k」或元素级常量：那要先定义数组上的"常量"，而真实缺陷形态是"一个元素都没有"。
+
 **为什么前面每一层都看不到它**：`verify_load.py` 比的是 CSV 真源 ⟷ Athena，而 CSV 里
 那一列本来就全是 0，灌得**完全忠实**；`verify_enums.py` 只看声明过枚举的列，而退化列
 恰恰最容易是没声明的那种；`verify_doc_sql.py` 的 `EXPLAIN` 不看基数；L1–L5 全是数量
@@ -282,22 +289,43 @@ Athena 用的那个写法不带前缀。写串了报 `EntityNotFoundException`�
 `knowledge/metrics/core_metrics.md:242-246` 的 `like_rate` / `comment_rate` 在线上库
 **恒等于 0.00 且不报错**——正是本文档反复点名的「不报错、数看着合理、结论是反的」。
 
-实测（468 个标量列 + 8 个数组列跳过，全库 75s）：**33 个常量列 + 46 个整列 NULL**，
-账算得平（389 正常 + 33 + 46 = 468）。33 = 14 生成器侧待重灌 + 17 透传遗留 + 2 单行表。
-逐列登记在脚本里的三份清单，每条带**谁该修它、什么时候能删**：
+实测（2026-08-31 重跑，468 个标量列 + 8 个数组列，全库 77s）：**31 个常量列 + 48 个整列
+NULL**，账算得平（标量 389 正常 + 31 + 46 + 2 单行表 = 468；数组 6 有真元素 + 2 整列 NULL
+= 8）。31 = 15 生成器侧待重灌 + 15 透传遗留 + 1 刻意常量。整列 NULL 从 46 变 48 是数组
+普查上线那一刻现出来的两列：`campaigns.target_segment_ids` / `ab_tests.target_segment_ids`
+（两张透传表，v1 CSV 本来就空，重灌不会修）。逐列登记在脚本里的五份清单
+（2026-08-31 从三份变五份，见下），每条带**谁该修它、什么时候能删**：
 
-- **`RELOAD_PENDING`（14）**——生成器已产非常量值，清除条件就是重灌。含
+- **`RELOAD_PENDING`（15）**——生成器已产非常量值，清除条件就是重灌。含
   `posts.like_count` / `comment_count` / `share_count`（三计数器现在从明细回填）、
   `user_attributions.attributed_at`（线上库 350 行全等于灌数那一瞬，按归因时间分桶只有
-  一个桶）、8 个审计时间戳（v1 把它们写成了装载瞬时值），以及下面单列出来的两条。
-- **`DIMS_PASSTHROUGH`（17）**——落在 `dims_to_parquet.DIMS` 那 12 张透传表上，逐字节
+  一个桶）、8 个审计时间戳（v1 把它们写成了装载瞬时值）、
+  `channel_daily_costs.created_at`（P0-5 之后挂在该行自己那天的 23:30，311 个不同值），
+  以及下面单列出来的两条。
+- **`DIMS_PASSTHROUGH`（15）**——落在 `dims_to_parquet.DIMS` 那 11 张透传表上，逐字节
   来自 v1 CSV，**重灌不会修**。表名从 `dims_to_parquet.DIMS` **现读**，不在这里复制
-  一份：那份清单变了这里要跟着红。它们不是豁免，是"已知、且当前没有任何代码负责产它"，
-  和 `budget.py` 那 4 张声明 SUB 却没人兑现的表是同一批活。
-- **`ALL_NULL_PINNED`（46）**——**只钉集合，未逐条裁定**。「可空业务列在当前数据下
+  一份：那份清单变了这里要跟着红。它们不是豁免，是"已知、且当前没有任何代码负责产它"。
+  这一类**因为 P0-5 少了两条**：`channel_daily_costs` 现在有 builder、已从 `DIMS` 移出，
+  它的 `currency` / `created_at` 留在这里的话 `_check_ledger()` 会直接红。
+- **`BY_DESIGN_CONST`（1）**——生成器**刻意**产常量，重灌后仍是常量，而它是对的。
+  目前只有 `channel_daily_costs.currency`：本库只有人民币一种计价，恒为 `'CNY'` 是口径
+  而不是缺陷。前三类都装不下它——归 `RELOAD_PENDING` 会在重灌后变成一条永远清不掉的
+  待办，归 `DIMS_PASSTHROUGH` 是假话。失效条件照旧带着：它哪天不是常量了仍然红
+  （`--selftest` 里有这条）。
+- **`ALL_NULL_PINNED`（48）**——**只钉集合，未逐条裁定**。「可空业务列在当前数据下
   无人填」和「这列本该有值却丢了」要逐列定口径，不在这一轮范围里。其中
   `tmp_campaign_roi_analysis.attributed_gmv` / `roi` 是 eval **刻意的**陷阱题，
-  不该被裁定成缺陷。
+  不该被裁定成缺陷。`channel_daily_costs.creative_id` 从「透传表」那一组挪到了
+  「生成器侧」：builder 里写的是 `F.const(n, None)`（成本按活动汇总、不拆到素材）。
+- **`ARRAY_EMPTY_PINNED`（0）**——整列空数组的豁免清单，**当前一列都没有**，这是刻意的：
+  实测 8 个数组列里 6 列有真元素、2 列整列 NULL（已进上一份清单），没有一列是空数组。
+  空清单是一句可判真假的话——"此刻没有任何数组列该被豁免"，不是占位。它存在的理由是
+  P1-10：新生成器一度让 `posts.media_urls` / `tags` / `product_ids` 三列全是
+  `F.const(n, [])`，而那一轮**没有任何一层会红**——装载忠实（源头就是空数组）、
+  `verify_literals.py` 只看字符串列、`verify_enums.py` 只看声明了枚举的列、L1–L5 全是
+  数量关系，而这个脚本当时跳过所有数组列。代价是 `relationships.md:61` 声明的
+  products ↔ posts N:N 和 `domains/social/posts.md` 那段 `CROSS JOIN UNNEST(product_ids)`
+  示例查询**恒返回 0 行**。
 
 两条值得单独记的实例：
 
@@ -310,7 +338,7 @@ Athena 用的那个写法不带前缀。写串了报 `EntityNotFoundException`�
 
 **为什么是逐列登记而不是一律判红。** 隔壁 `verify_literals.py` 面对同样处境选择了
 **不接进 `test_all.sh`**（理由见下面「为什么刻意不接进 `test_all.sh`」那一节）。这里走了
-另一条路，因为这里的红集是**有界且可逐条点名的**（33 + 46 列，不是无界的文本质量），
+另一条路，因为这里的红集是**有界且可逐条点名的**（31 + 48 列，不是无界的文本质量），
 所以能做成清单：清单里的列打印+说明，清单外的列 FAIL，**清单里但已经不退化了的也 FAIL**。
 最后那条抄 `selftest_closures.py::ENUM_SUPERSET_OK` 的形态——豁免必须带失效条件，
 否则它变成永久免疫，而"某列被修好了"和"某列还没修"在报告上长得一模一样。L8 的
@@ -330,9 +358,11 @@ Athena 用的那个写法不带前缀。写串了报 `EntityNotFoundException`�
 `min/max` 而不是 `count(DISTINCT c)`：两者对"是不是常量"等价（任何全序下 min=max ⟺
 常量），但便宜得多，而且顺带把那个常量值带回来——`country` 那条就是靠这个值发现的。
 已知失真一处：`double` 的 `-0.0` 与 `0.0` 转成不同字符串，这种列会被判成"非常量"，
-方向是**漏报不是误报**，且本库没有 double 列。8 个数组列不在普查面里（Trino 对数组的
-min/max 是逐元素比较，"常量"在数组上要先定义），**跳过的列逐个打印出来**——理由同
-形态 ② 的教训：报告上「没被查过」和「查过没问题」长得一样，缺口就等于不存在。
+方向是**漏报不是误报**，且本库没有 double 列。数组列不走 `min/max`（Trino 对数组是逐元素
+比较，"常量"在数组上要先定义），改走 `sum(cardinality)`；2026-08-31 之前它们是**跳过并
+逐个打印列名**，现在是**查过并逐列打印结论**（元素总数 / 非空行 / 最长）。报告的行数没变、
+每行的含义变了——之前那种写法是形态 ② 教训只学到一半：把缺口打印出来确实比藏起来好，
+但"打印出来"不是判据，缺口照样在（P1-10 就是从这个口子漏过去的）。
 
 ## L2+ 数据真实性诊断（五个报告器，**不是闸门**，`test_all.sh` 不跑）
 
@@ -387,7 +417,7 @@ L9 157s，见最近一次实测。
 | `verify_semantics.py` | `scripts/gen/semantics.yaml` | 0 违例 × 5 类 | **单行的业务合理性**：(品牌, 叶子类目) 在不在白名单、价格在不在「类目带 ∩ 品牌分档窗口」、商品名能不能由「修饰词+品牌+类目」还原 |
 | `verify_resolution.py` | 同上 + `scripts/gen/budget.py` | 6 条推导出来的线 | **整体的分辨率**：空类目数、每类目/每品牌 SKU 数、每 SKU 被下单次数、类目内价格跨度 vs 声明带宽 |
 | `verify_correlation.py` | `scripts/gen/profiles.yaml` | 4 条极差线 + 4 条方向约束 + 1 条人数分布 | **列与列之间有没有边**：画像四维（收入/职业/年龄/性别）分档后的人均 GMV 极差与方向 |
-| `verify_behavior.py` | **样本自算的随机基线** + 两张卡片自己声明的规则 | 27 条：8 条集中度（写成基线的倍数）、11 条定义性（通过线恒为 0）、4 条取值域、4 条比值/区间 | **四张行为大表自身的形状**：度分布重尾、互惠性、漏斗形状、标记 ⟷ 事实一致性、取值域退化。`post_likes` / `page_views` / `user_follows` / `push_notifications` 合计 95,029 行，此前的自动化覆盖**只有计数对账**（`like_count` / `page_view_count` 的行数对得上），形状零覆盖 |
+| `verify_behavior.py` | **样本自算的随机基线** + 两张卡片自己声明的规则 | **28 条**（2026-09-01 从 27 加了 `ev_in_session`）：8 条集中度（写成基线的倍数）、12 条定义性（通过线恒为 0）、4 条取值域、4 条比值/区间 | **四张行为大表自身的形状**：度分布重尾、互惠性、漏斗形状、标记 ⟷ 事实一致性、取值域退化。`post_likes` / `page_views` / `user_follows` / `push_notifications` 合计 95,029 行，此前的自动化覆盖**只有计数对账**（`like_count` / `page_view_count` 的行数对得上），形状零覆盖 |
 
 前三条的分工值得写下来，因为很容易以为一条就够：**L7 判单行对不对，L6 判整体够不够
 分**。一个类目里只有 1 个商品时，`verify_semantics.py` 每一行都合法，可「类目 A 客单价
@@ -525,6 +555,22 @@ python3 scripts/lakehouse/verify_load.py -t users -t orders  # 抽查
 逐表比行数、数值列求和、时间边界、布尔计数。**改过 `data/csv/` 或重灌过表必须跑全量**
 （`bash scripts/test_all.sh --full`）。
 
+**2026-09-01 起 CSV 侧的目录由装载快照决定，默认不再是 `data/csv`。** 重灌之后云上是
+7,994 万行的全量产出，而 `data/csv` 是 v1 的 19 万行——拿它跟 Athena 比会得出一屏差异，
+**而那屏差异不是装载出了问题，是在比两份不同的数据**。这种红灯比没有灯更坏：它把
+「你比错了东西」印成了「装载不完整」。所以加了一份 `data/loaded_row_counts.json`
+（装载那次的逐表行数 + `source` / `scale` / `seed` / 轴），`verify_load.py::_resolve_csv_dir`
+没有显式 `CSV_DIR=` 时就指到 `source` 那个目录；那个目录不在本机时**判红并打出重造命令**
+（同 scale + 同 seed = 同一份数据），**不退回 `data/csv`**——"没法对账"不等于"对账通过"。
+同一份快照也是 `check_doc_totals` 的基准，所以 `connection.md` 那几个数在没有那 7.3G
+产出的机器上照样比得动。代价是多一份要维护的中间产物，所以它记着自己是哪一次装载，
+指向的目录还在时会**逐表**跟现产出对一遍，不等就红（快照过期或产出被动过）。
+
+CSV 侧有两条等价的聚合路径：装了 pyarrow 走向量化那条，否则退回逐行的标准库那条
+（`CSV_ENGINE=stdlib` 可以强制）。**标准库那条是口径的定义式**，向量化那条只是快路，
+`--selftest` 里两条跑同一份构造数据逐键比。全量那一次读的是 `CSV_DIR` 指向的目录，
+不是仓库里的 `data/csv`。
+
 这里**不用**归档的基线 JSON。原来那两份（`consistency.generator-expected.json` 等）
 记的是 v2 那批 21 万行的绝对值，与现在的 `data/csv/` 已经不是同一批数据，比起来
 **稳定通过但什么也没验证**。原话写在脚本头上：基线会过期，而且过期时是绿的。
@@ -548,6 +594,30 @@ CSV 4,225 ⟷ Athena 1,804,371）。**读到这盏红灯先分清是哪一种**�
 **更该警惕的是它反过来的那一面**：如果湖里被人用 `load.py` 灌回了种子，这个检查会**全绿**
 ——绿的同时湖已经从 8000 万行退回 22 万行。这盏灯的绿只保证「`data/csv/` 那一份完整地在湖
 里」，**不保证湖里没有别的、更大的一份被它覆盖掉了**。
+
+### 8000 万行那一次多走一条
+
+先把一个说法纠回来：这里原来写「CSV 侧 8000 万行读不动」，**那句话不成立**。2026-08-31
+实测 1872 万行 / 1.7GB，逐行标准库 55.8s、向量化 4.6s，全量外推是 4 分钟对 20 秒——
+慢，但从来不是读不动。所以下面这条路不是替代品，它验的是**另一件事**：
+
+`_expected.json` 是生成器在生成的时候顺手用 int64 累加出来的（代价接近零），拿它对
+Athena 快照，验的是「生成 → 序列化 → 传输 → 装载」整条链路无损，而且**不需要把 6.8GB
+再读一遍**。`verify_load.py` 那条读的是落盘的 CSV，证明的是「CSV → Athena」——中间那段
+「内存里的 ndarray → CSV 文本」它看不到。两条都跑，覆盖的区间才连起来。
+
+```bash
+SNAPSHOT_BACKEND=athena python3 scripts/consistency/snapshot.py --out /tmp/athena.json
+python3 scripts/consistency/snapshot.py --subset --compare $OUT/_expected.json /tmp/athena.json
+```
+
+`--subset` 是因为生成器只覆盖 24 张基表，库里有 48 张。这仍然不是"归档基线"——比的是
+这一次生成当场算的数。2026-08-31 实测：48 张表 / 473 项指标，Athena 侧 **3 分 45 秒**；
+两侧的**键集合**在那 24 张表上逐字节相同（值不同是因为线上还是 v1 数据）。
+
+两处判据是这条路能成立的前提，改任何一侧都要对上另一侧：数值列先 `CAST(... AS
+DECIMAL(38,4))` 再求和（Trino 是 MPP，float 累加顺序不定），以及**没有非空值的列
+两侧都给 `null` 而不是 `0`**（SQL 的 `SUM` 在那种列上返回 NULL）。
 
 ## L4 治理层（最小权限角色 + 列级排除）
 
@@ -774,8 +844,8 @@ HTTP、不解析 SSE。于是夹在中间的东西——SSE 分帧、事件键�
 
 ```bash
 python3 scripts/negative_tests.py --list        # 用例清单
-python3 scripts/negative_tests.py --offline     # 只跑不连云的 27 个（秒级）
-python3 scripts/negative_tests.py               # 全部 50 个
+python3 scripts/negative_tests.py --offline     # 只跑不连云的 37 个（秒级）
+python3 scripts/negative_tests.py               # 全部 55 个
 bash scripts/test_all.sh --l8                   # 挂在套件末尾跑
 ```
 
@@ -804,7 +874,12 @@ sha256 核对。第一步是关键：少了它，一个本来就红的检查器�
 注入用唯一子串替换，锚点必须恰好出现一次，否则用例直接 ERROR（锚点漂移显式失败，
 而不是静默改了别的地方）。还原一旦失败就停跑剩下的用例：脏工作树上的"绿"不可信。
 
-### 50 个用例
+`Case.env` 给被测命令追加环境变量，**基线那一次也带同一份**（否则两次跑的是两个配置，
+"注入前是绿的"这句话就落不到同一个对象上），基线缓存的 key 因此把 env 也算进去。
+它只有一个用途，但那个用途是必需的：检查器的输入源可以被环境变量改掉，
+而注入是打在固定路径上的文件——两者一旦对不上，注入就打空了，见 `csv-value-changed`。
+
+### 55 个用例
 
 | id | 守的检查器 | 注入的缺陷 |
 |---|---|---|
@@ -814,6 +889,7 @@ sha256 核对。第一步是关键：少了它，一个本来就红的检查器�
 | `gov-policy-loosened` | `governance.py --selftest` | 把 `users.email` 从治理策略里拿掉（云上照发照过） |
 | `gov-probe-blind` | `governance.py --verify` | 探针换成调用方（admin）身份跑：**必须全红**，全绿＝那批断言什么也没验 |
 | `gov-backend-not-assuming` | `governance.py --verify-backend` | AssumeRole 照做但 session 没传给 Athena 客户端（`identity` 字段仍然对） |
+| `partition-writers-over-limit` | `load.py` 的 `check_partitions()`（接在 `--preflight` 上） | 把 `post_likes` 的分区粒度从 `day()` 调到 `hour()`。单批分区数从 31 涨到 738，越过 Athena 给 Iceberg INSERT 的 **100 个并发写入器**硬上限（不可提额）。注入选换粒度而不是把 `MAX_OPEN_PARTITIONS` 改小：前者是真会发生的那种改动（有人觉得小时粒度剪得更狠），而且它连带走了"按月归堆取最坏一批"那段算法。没有这道闸的表现是灌到那张表才在云上炸，前面每一层都绿 |
 | `iceberg-ddl-handedit` | `gen_ddl.py --check` | 手改生成的 Iceberg DDL 列名 |
 | `ddl-enum-comment-drift` | `verify_ddl_comments.py` | 把 `products.status` 注释里的 `'on_sale'` 改回 `'active'`——**这就是它坏掉时的真实样子**：SQL 语法对、目录解析通过、返回空集，结论直接反过来（「一件在售商品都没有」），而 `verify_doc_sql` 的 EXPLAIN 不看 `WHERE` 里的字面量、`reconcile` 只比表和列 |
 | `ddl-enum-prose-requoted` | `verify_ddl_comments.py`（去引号约定） | 给「业务上合法但本批数据没有」的值加回引号（`（业务上还有 draft` → `（业务上还有 'draft'`）。约定的全部意义在于**引号是「可以直接抄进 SQL」的标记**，加回去注释就重新变成一份能抄的假清单。这条是写文档时真踩的：我在 `products.status` 的说明里写了带引号的 `DEFAULT 'active'`，检查器当场判红 |
@@ -833,8 +909,9 @@ sha256 核对。第一步是关键：少了它，一个本来就红的检查器�
 | `enum-value-undocumented` | `verify_enums` 方向二 | 数据里有、卡片没写 |
 | `degenerate-col-unlisted` | `verify_constants` 方向一 | 从登记清单里摘掉一列。线上库里一列整个恒等于某个值时，`verify_load` 比的是 CSV ⟷ Athena（源头本来就是那个值，灌得完全忠实）、EXPLAIN 不看基数、没声明枚举所以 `verify_enums` 不看它、任何求和恒等式都满足——于是 `core_metrics.md` 的 `like_rate` 恒等于 0.00 且不报错 |
 | `degenerate-col-stale-entry` | `verify_constants` 方向二 | 往清单里塞一条**已经不退化**的列。只守方向一的话那份清单会退化成只增不减的白名单：某列被修好之后条目永远留着，"已修"和"未修"在报告上长得一样 |
+| `array-col-stale-entry` | `verify_constants` 数组普查 | 往 `ARRAY_EMPTY_PINNED` 里塞一条**已经有真元素**的数组列。这一条守的是 2026-08-31 新加的数组判据本身：数组列此前一律跳过（只打印列名），于是 `posts.media_urls` / `tags` / `product_ids` 三列全是空数组时**没有任何一层会红**，而 `relationships.md:61` 声明的 N:N 和卡片里那段 `UNNEST` 示例查询恒返回 0 行。走"清单过期"这个方向是因为另一个方向要往云上写一列空数组进去，而负测不改数据、只改仓库文件 |
 | `doc-sql-rotten` | `verify_doc_sql` | 卡片示例 SQL 引用不存在的列 |
-| `csv-value-changed` | `verify_load` | 改一个 CSV 数值（行数对但求和不对） |
+| `csv-value-changed` | `verify_load` | 改一个 CSV 数值（行数对但求和不对）。用例显式带 `CSV_DIR=data/csv`：重灌后检查器默认读装载快照记的目录，不带这个环境变量注入就打空了 |
 | `doc-row-total-drift` | `verify_load --selftest` | 改 `knowledge/connection.md` 里的全库规模声明（**agent 数不出这个数**，治理角色读不到 `user_messages`，只能照抄卡片）。注入打在**张数**上而不是行数上：行数随重灌变，锚点绑在某一批数据上会让负测自己先炸（重灌到 7994 万行那次就炸了），张数不变而报错路径相同 |
 | `scale-prompt-hardcoded` | `verify_scale --selftest` | 把 prompt 里的「行数取决于湖里装的是哪一批」换回写死的「35 张明细表，约 19 万行」。**这就是本库真实发生过的那个状态**：五处文档声明 19 万行、湖里装着 7994 万行、L0–L6 全绿——数量级差 427 倍而没有一盏灯，因为整个对账层比表、比列、比枚举、比退化列、比装载忠实，**从不比规模** |
 | `scale-decl-half-edited` | `verify_scale --selftest` | 把 `backend/run.sh` 里两处「约 19 万行」中的一处改掉。判据钉的是**出现次数**而不是「只准出现一处」：真要求去重，判据就变成在管别人的散文；钉次数则一改一漏立刻红（2 → 1），而正当的多处引用不受干扰 |
@@ -883,18 +960,22 @@ reconcile 家族 8 个用例共用同一条基线命令，基线结果按命令�
 | **`DENIED_BUILTINS` 的完备性** | 它是**黑名单**，天生补不全：SDK 下一版加一个内置工具，在有人把它写进这张表之前就是可达的。真正的闸是 `hooks` 那道白名单（不在 `GATE_ALLOWED` 里一律拒），黑名单只负责把暴露面缩小、让模型看不见。所以这两层缺一不可——但"黑名单是否已覆盖当前 SDK 的全部内置工具"没有任何检查断言 |
 | **云上副本 `analyticsagent/` 的运行时行为** | 共享代码已经改成生成物（L0 `sync_agent_code.py --check` + L8 `cloud-copy-drift`），所以「云上那份代码和 backend/ 不是同一份」这个缺口补上了。**没补的是「这份代码在 AgentCore 上真跑得对」这件事的自动化**：2026-08-20 已首次部署并按 `analyticsagent/README.md` 人工复验通过三条（退款全量 963,560.92、渠道 GMV 与本地逐字一致、CloudTrail 证实生效身份是治理角色）。但 Runtime 是另一条执行路径（暖客户端跨调用复用、知识树从 S3 同步、身份是 exec role 假借治理角色），**这三条至今只能人工跑**——`test_all.sh` 与 `eval/` 都只打本地 `backend/`。首次部署就撞上了一个只有云上才有的失效模式：exec role 晚于容器存在，那批容器带着空配置**永久**降级（module 级配置一个容器只跑一次），而调用方看到的是 `success: true`、73 秒、一个数都没有。已在 `runtime_config.py` 改成硬失败，但**那个硬失败本身也没有负测盯着**。`render_test_prod.mjs` 只验前端兜底渲染，不验云上真实链路 |
 | **DDL 里 `DEFAULT` 的字面量** | `verify_ddl_comments.py` 只比行内注释里的枚举清单，**不看同一行的 `DEFAULT`**。刻意不加：正确判据是「`DEFAULT` ∈ 业务上合法的值」，而这一层能拿到的只有「∈ 本批数据里出现过的值」，两者不是一回事——`ad_campaigns.status DEFAULT 'draft'` 完全合法（默认值命名的是**初始态**，它在被观测到之前就已经流转掉了）。退一步的规则「∈ 卡片 ∪ 注释散文提到的值」也不成立：散文里为了讲清缺陷本来就会提到错值（我自己那句「旧注释的 draft/active/inactive/deleted 一个都不存在」就带着 `active` 这个词）。**判据推导不出来的检查不该写**——写了就是一盏语义不明的灯。已知的唯一一处实例是 `products.status DEFAULT 'active'`（那批错值的残留），已就地改成 `'on_sale'`；`gen_ddl.py` 生成 Iceberg DDL 时会把 `DEFAULT` 整个丢掉，只有 `setup_local.sh` 的 v1 Postgres 路径会执行它，而那条路是 CSV `COPY` 灌数、这一列总是被显式提供，**所以运行时零影响**。下次再出现只能靠人读 |
+| **只剩一个取值的列「声明不出来」** | `verify_enums.parse_card` 认一次枚举声明的条件是「`### <列名>` + 紧随的表格**至少两行**」（`len(vals) >= 2`，防一张顺手写的单行表被当成枚举）。副作用是：**一列退化到只有一个值时，它恰好落进这个门槛之外**——卡片照标准格式写了那一行，解析器不收，于是 `verify_enums`（卡片 ⟷ 云）和 `selftest_closures.check_enums_vs_cards`（生成器 ⟷ 卡片）两侧都看不见它。2026-09-01 实测有三列在这个状态：`orders.cancel_reason`（75,471 行全是「用户取消」）、`orders.refund_reason`（41,995 行全是「商品问题」）、`push_notifications.failure_reason`（512,974 行全是「token 失效」）。**方向是漏报**：值退化得越彻底，这一层越沉默。当前兜底是 `verify_constants.py` 的「整列同一个值」，它抓得到"塌成一个值"，但抓不到"从五个值塌成两个"。**那三个实例 2026-09-02 已经关掉**（`load_parquet.py --apply` 把三张表从新 parquet 重灌，现在分别是 8 / 8 / 6 个值，卡片里的枚举表也随之能被 `parse_card` 收了），`RELOAD_PENDING` 那一桶因此是空的——**缺口没关**：门槛还在，下一列退化到单值时这两层照旧看不见。这次也留下一条附带证据：旧 `RELOAD_PENDING` 注释预测 `failure_reason` 修好后 `verify_enums` 会红，实际没红，正是因为单值时它压根不在解析面里，**两个方向都沉默**。真要补就得把门槛从"行数"换成"这一节是不是一次声明"（比如认表头形态），那会动到所有卡片的解析结果，本批没做 |
 | **5 行不可比对的枚举注释** | `channels.platform`、`ad_creatives.creative_format`、`ab_tests.primary_metric`、`ab_test_variants.variant_key`、`payments.payment_channel` 的注释里有取值清单，但知识卡片里**没有对应的枚举表**，`verify_ddl_comments.py` 对它们只能报 SKIP。基准不存在时"一致"没有意义，所以不硬凑；要补就得先给卡片加枚举小节（那样 `verify_enums.py` 会顺带把它们纳入云上比对） |
 | **"比的两端不独立"这类假绿灯** | 不是某一个检查器的缺口，是一种**形态**，本项目已发现**五处**：①`verify_enums.py`（卡片 ⟷ 线上库——库里装的是照卡片生成的数据）；②`reconcile.py` H 类（源注释 ⟷ Glue 注释——Glue 的注释就是建表时从这份源写进去的）；③此前压根不存在的「生成器 ⟷ 卡片」；④**新检查器天生就在这个陷阱里**：`verify_semantics.py` 判的商品是 `scripts/gen` 照 `semantics.yaml` 造的，判据也是 `semantics.yaml`——所以它对生成侧的那声"全绿"本身不含信息，真正携带信息的是它对**云上 v1 数据**跑出来的红（白名单 123/200、价格 154/200、名字模板 200/200）和 `--selftest` 里照抄任务书的反例。凡是"生成器 ⟷ 检查器"共用真源的检查，都必须有一组**不由这个生成器产出**的数据来证明它有区分力；⑤`product_tags` 的 `tag_type` 一列：生成器从 `tag_pools` 摊平时**顺带**记住每个名字来自哪个池，检查侧若也从同一份 `tag_pools` 反查，就是拿函数的输出去验函数——所以真正加了保护的是 `semantics.py` 的第 9 条校验（**名字跨池不重复**），它管的是配置层，不依赖任何一侧的实现；⑥`profiles.yaml` 的效应量 ⟷ 通过线：用生成器的倍率去推检查器的通过线就是同一个形态，所以这份配置把 `judge:` 和 `generate:` 分成两段、`load()` 返回三个独立数据类，**检查侧结构上拿不到 `Generate`**。两段的数字刻意不相等（gender 通过线 15% ⟷ 倍率 35%）：前者是"多小就不值得据此分层"，后者是"真实综合电商里常见的幅度"，不该是同一个数。共同点是**两端不是独立来源，而是同一份东西的两个副本**，于是"一致"不携带任何信息，比没有检查更坏——它会发出一盏假绿灯。这份文档里每加一条新检查，都该先问一句「这两端各自的真源是谁」 |
 | **同一个枚举有三份副本，且没有任何一份被声明** | 查 D-01 时顺带发现：`user_profiles.occupation` 在 `scripts/generators/user_domain.py`（旧生成器，产出 `data/csv` → 云上）里是 **15 个值**，在 `scripts/gen/tables.py`（新生成器）里是 **12 个**，**交集只有 9 个**。DDL 只写 `VARCHAR(50)`、knowledge 卡片只写「职业」，两处都没有声明枚举取值，所以 `verify_enums.py`（卡片 ⟷ 库）和 L2 的枚举对账**都抓不到**——它们只能核对"被声明过"的列。这一列在本批之前是零覆盖。已把真源收敛到 `profiles.yaml` 的 `dimensions.occupation`，`tables.py` 从那里读、`verify_correlation.py` 也按同一份分档并把值域外的取值单独标出来。**教训是「没有声明的枚举列，对账层看不见」**：本库还有多少这样的列没数过 |
 | **卡片教给 agent 的判定规则可以在数据上恒假，而没有任何一层会红** | 查行为大表分布时发现三处。`knowledge/domains/behavior/sessions.md:41` 的「is_bounce 跳出判定规则」表写着 `page_view_count = 1 → TRUE`，而现行库 103 个 `is_bounce=true` 的会话页面数是 2~10、**单页会话一个都没有**；`knowledge/domains/marketing/push_notifications.md` 的「状态判断逻辑」表写着「发送失败 = `failure_reason IS NOT NULL`」和「待发送 = `scheduled_at IS NOT NULL AND sent_at IS NULL`」，而这两列在现行库里**整列为空**——照卡片查，失败数恒为 0（实际 470 条）、待发送恒为空集。这类缺陷躲过了每一层：`verify_doc_sql.py` 只 EXPLAIN（语法/目录/列/类型全对）、`verify_enums.py` 只比枚举取值集合、`reconcile.py` 只比列名与类型，**没有任何一条检查「卡片声明的这条规则在真实数据上还选得出行」**。现在 `verify_behavior.py` 有三条判据钉住它，但那是逐条手写的，不是通用机制：卡片里还有多少条这样的规则没数过。通用解法要能从散文表格里提取可执行谓词，成本远高于本批。**2026-08-28 补了一半**：`verify_constants.py` 把「这一列整列 NULL」这个**前提**钉住了（`push_notifications.failure_reason` / `scheduled_at` 都在 `ALL_NULL_PINNED` 里，那两列被填上会红），于是"规则恒假"的成因至少不会再悄悄出现或悄悄消失。但**没被覆盖的仍是主体**：钉的是列的基数，不是「规则还选得出行」；`sessions.md:41` 那条 `page_view_count = 1` 恒假靠的是取值分布而不是整列 NULL，这一层完全够不着 |
+| **结论级约束被自己的修复作废，而钉着它的四层一致地绿** | 上一栏说的是"卡片写的规则在数据上恒假"，这一栏是它的**反面**：卡片写的规则曾经为真，被一次修复变成了假，而所有钉着它的层照旧绿。实例是留存。重灌前「这份数据算不出留存、曲线不衰减」是真话（实测 `45.0 / 43.0 / 42.1 / 41.1 / 43.0`，第 4 周还回升），于是它被写进 `analysis/retention_curve.md`、`metrics/core_metrics.md`、`domains/behavior/_index.md` 的路由、`eval/cases.json` 的 trap、`run_eval.py::judge_retention` 的判分闸和四个 L8 用例——**六处**。2026-08-31 的重灌把活跃度改成注册后第 k 天的截断指数分布，曲线变成 `D1 59.4% → D7 22.3% → D14 14.7%` 单调衰减，那句话当场变成假话。**危险的不是过期，是方向**：判分闸此时开始**要求** agent 说出一句已经不成立的话——它不是漏报，是主动强制输出错误结论，而 selftest / L8 / L7 全绿（金标是照旧口径写的，agent 照旧卡片答，判分器照旧白名单判，三者自洽）。已全部重接到那条仍然成立的性质（cohort 之间不可比）。补法没有便宜的：这类失效的判据是"卡片的结论句在**当前数据**上还成不成立"，要能执行散文里的结论，成本与上一栏同级。当前唯一的兜底是流程——「重灌后要动的地方」那一节，而它上一版**只列了卡片里的数字和整列 NULL 的口径，没列结论句**，所以这次是靠人重算留存曲线才发现的 |
+| **`events.event_time` 可以落在自己 `session_id` 的窗口外，`page_views` 有闸而 `events` 没有** | `verify_behavior.py::judge_pv_in_session` 对 `page_views` 钉着「`viewed_at` 必须落在所属会话的 `[start_time, start_time + duration]` 内」，通过线恒为 0 行；**`events` 没有任何等价断言**。2026-09-01 手工量了一次，缺陷是实存的：8,541,400 行事件里 **1,183,518 行（13.9%）** 的 `event_time` 在自己会话的窗口外（411,232 早于会话开始、772,286 晚于结束），1,086,210 行（12.7%）连**日期**都不是同一天，最大偏差 **90 天**。成因在生成器：`purchase` / `use_coupon` / `register` 三种保底事件被挂到用户的**首个会话**（`res_sess.append(first_sess[o_uid])`），时刻却取 `orders.placed_at` / 注册时刻。后果不止是"关联不上"——它让**事件口径的活跃天数随账龄增长**（窗首那批人均 14.5 天 vs 腹地 8.3 天，而两者的会话口径都是 5 天左右），于是按 `events` 分 cohort 时窗首 D1 虚高约 **21pp**，按 `sessions` 分则看不出边缘。**这一栏的教训是覆盖的不对称**：同一条性质在一张表上是通过线为 0 的硬闸、在旁边那张更大的表上零覆盖，而报告上两张表都是绿的。**覆盖缺口已补**（2026-09-01）：`verify_behavior.py` 加了第 28 条 `judge_ev_in_session`，两条路径（Athena 分组聚合 / CSV 逐行）都实现，`--selftest` 的红绿两侧夹具钉住它，实测 Athena 侧 13.86%、`data/csv` 侧 1.37%——**两份数据都红但成因不同**（v1 那 274 行均匀散在通用事件上），所以它不是一条只对新生成器红的灯。**没补的是缺陷本身**：改生成器的保底事件归属只能在下一次全量重灌生效，所以这条判据当前必红，缺陷同时登记在 `knowledge/domains/behavior/events.md` 的 ⚠️ 块里（连同"别拿 `session_id` 归因这三种事件"这条纪律），清除条件是下一次重灌。这一栏留着，因为**留下来的仍是缺口**：还有多少条"在 A 表上有闸、在 B 表上没有"的性质没数过——这个形态本身没有任何机制在查 |
+| **两列内容逐行相同，没有任何一层会看见** | `verify_constants.py` 抓的是**一列内部**退化（min = max、整列 NULL），它按构造看不见**两列之间**的重复。实例：`users` 的 `registered_at` / `created_at` / `updated_at` 三列在现行库里**逐行字节相同**（213,535 行逐行比，时间差恒为 0），因为 `build_users` 直接 `"created_at": reg, "updated_at": reg`。三列各自分布正常、基数上万，所以 `verify_constants` / `verify_literals` / `reconcile` 全绿。它的后果这次恰好是**好的**——L8 有一个用例钉着「卡片必须教 agent 用 `registered_at` 而不是 `created_at` 定义 cohort」，写错列会拿到另一批人，而现在写错也得到同一批人，那个陷阱自己失效了（用例保留，因为它钉的是"卡片教哪一列"，不是"写错会不会出错")。**但方向可以反过来**：`updated_at` 本该随用户资料变更前移，把它等同于注册时刻会让"最近更新过资料的用户"这类问题恒为空集，而没有任何一层会红。判据是现成的、也很便宜（对声明语义不同的时间列两两算逐行相等比例，比例接近 1 就报），本批没做 |
 | **五个报告器的「取数那一段」** | 它们的 `--selftest`（157 项）验的是**判据逻辑**：给定一份事实，判得对不对。验不到的是事实**怎么来的**——Trino 聚合写错、列名拼错、`LEFT JOIN` 手滑写成 `JOIN`、CSV 解析器读错一列、布尔 `t`/`true` 两种写法漏认一种。这一段目前唯一的印证是 `verify_behavior.py` 两条路径（Athena / CSV）27 条判据逐位相同——而**这正好是本表里「比的两端不独立」那个形态**：两个实现一致，不证明任何一个对（两边都把 `LEFT` 写成 `JOIN` 就会一致地错）。另外四个报告器连这层互印都没有：`verify_semantics` / `verify_resolution` / `verify_correlation` / `verify_literals` 的两条路共用的判据函数覆盖不到各自的取数码（`verify_literals` 的 `--from-csv` 是 2026-08-28 补的，**共用的是判据、不是取数**，所以补完仍在这一栏里；两条路还有一处已知的口径差：Trino 的 `regexp_like` 走 RE2J 认 `\p{Han}`，离线那条用 CJK 基本区 + 扩展 A + 兼容表意文字近似，覆盖面略窄，差异写在 `HAN_DOT_RE` 上方）。要补得有一份**小的、可控的、带已知缺陷的固定数据集**，两条路径都去读、都必须报出同一批红——那是一批独立的活，本阶段没做。L8 补不了这个：见 L2+ 那一节讲的结构性原因 |
 | **报告器自己在目标规模下跑不跑得完** | 没有任何一条断言碰过五个报告器的**复杂度**。它们的 `--selftest` 用几十到几千行的夹具，量的是判得对不对，量不出「同样的代码喂 4,000 万行会怎样」。2026-08-28 栽过一次，值得逐字记下来：`verify_behavior.py --from-csv` 的取值域累加器写成 `col_acc[c] = (cnt + 1, seen | {val})`，而 `seen | {val}` **不是插入、是重建一个集合并把已攒下的元素全拷一遍**，单行 O(\|seen\|)、整循环 O(n·k)。四个被查的列里三个（`page_views.referrer` / `page_url`、`push_notifications.deep_link`）只有 9–26 个不同取值，**scale 1 几秒跑完、`test_all.sh` 一路绿**；现形的是 `push_notifications.scheduled_at`——它是时间戳，全量 427 万行里 302 万个不同值，累计元素拷贝 4.6×10¹² 次。实测增长指数 **2.25–2.56**（scale 4/12/40 → 7.03s / 83.22s / 1819.29s），全量外推 **≈57 小时 CPU**；真跑过的那次烧到 147 分钟 CPU 才被杀，进度约 4%。改成原地 `add` 后指数回到 0.94–1.04、scale 40 快 **201×**、**输出与旧实现逐字节相同**（85 行，拿被杀那轮之前存下的 scale-40 输出当 oracle 比过）。**这类缺陷按构造测不到**：小样本是判据迭代的正确工具，但它对复杂度天生盲。补法只有一条——判据定稿后**至少跑一次全量**，并把耗时记进本文档，下次谁改了取数码、耗时从两分钟变成两小时就会被看见。顺带一个诊断细节：作业当时输出 0 字节，那是 `print` 全在结尾 + 重定向下的块缓冲，**不是卡死**；判活要看 CPU 时间在不在涨，不要看有没有输出 |
-| **数组 / JSONB 列的字面值形态** | `verify_literals.py` 的形态判据（占位符、词沙拉）只对标量文本有定义，8 个数组 / JSONB 列因此不在普查面里：`events.properties`、`orders.shipping_address`、`posts.media_urls`、`posts.product_ids`、`posts.tags`、`products.image_urls`、`user_attributions.tracking_params`、`user_profiles.interests`。**原来这个缺口是不可见的**：Athena 那条路从 `information_schema` 只捞 `varchar`，数组/JSONB 压根不出现在结果里，于是报告上「没被查过」和「查过没问题」长得一模一样。2026-08-28 把离线那条路的类型真源换成 DDL（`scripts/gen/ddl.py::parse_all_raw`）并**加了一行「普查之外」把这 8 列连同 5 个 `TYPE_EXEMPT` 列逐个点名**——缺口还在，但从此印在报告上，不再靠读代码才知道。真要补，得先定义数组列的形态判据（元素基数？每行元素数分布？JSON 键集合的稳定性？），那是另一批活 |
+| **数组 / JSONB 列的字面值形态** | `verify_literals.py` 的形态判据（占位符、词沙拉）只对标量文本有定义，8 个数组 / JSONB 列因此不在普查面里：`events.properties`、`orders.shipping_address`、`posts.media_urls`、`posts.product_ids`、`posts.tags`、`products.image_urls`、`user_attributions.tracking_params`、`user_profiles.interests`。**原来这个缺口是不可见的**：Athena 那条路从 `information_schema` 只捞 `varchar`，数组/JSONB 压根不出现在结果里，于是报告上「没被查过」和「查过没问题」长得一模一样。2026-08-28 把离线那条路的类型真源换成 DDL（`scripts/gen/ddl.py::parse_all_raw`）并**加了一行「普查之外」把这 8 列连同 5 个 `TYPE_EXEMPT` 列逐个点名**——缺口还在，但从此印在报告上，不再靠读代码才知道。真要补，得先定义数组列的形态判据（元素基数？每行元素数分布？JSON 键集合的稳定性？），那是另一批活。**2026-09-01 这个缺口出了实例，而且两条都在同一批数据里**：`orders.shipping_address` 全表 854,140 行是同一个 `{"province": "广东", "city": "深圳"}`，`user_attributions.tracking_params` 全表 149,474 行是同一个 `{"utm_source": "douyin"}`（含 App Store / 直接访问那些行，按它统计渠道得「100% 来自抖音」）。两列在重灌前都是整列 NULL，重灌后**从空的变成了假的**——`IS NOT NULL` 通过、`json_extract_scalar` 返回值也讲得通，唯一看见它们的是 `verify_constants.py` 的「整列同一个值」。教训比缺口本身重要：**这个缺口的危险性不在"数组列的形态没查"，在"非 NULL 的假常量比 NULL 更难发现"**——空列会让人停下来查，假常量不会。**两个实例 2026-09-02 关掉了**（生成器侧的 `SHIP_ADDRESSES` / `_channel_platforms` 加上 `load_parquet.py --apply` 从新 parquet 重灌这两张表，现在 `shipping_address` 10 个取值、`tracking_params` 11 个），但**缺口本身没关**：这 8 列仍在普查之外，下一个数组列的假常量照旧只能靠 `verify_constants` 那条"整列同一个值"兜。清掉它们的那一轮还把兜底条件本身修正了一次：`RELOAD_PENDING` 原来的清除条件写「下一次全量重灌」，而 2026-09-02 的实况是**重灌过了、Athena 和 DuckDB 仍读到旧值**——那两条 arm 共读的 Iceberg 副本没跟着灌。所以正确的清除条件是「**三条 arm 都读到重灌后的数据**」，这条已改写进 `verify_constants.py` 的桶注释 |
 | **白名单只到「品牌 × 二级类目」的粒度** | `semantics.yaml` 的品牌经营范围声明在**二级类目**上（`家电>大家电`），叶子由它展开。所以「海尔卖冰箱」和「海尔卖电视」在这份配置里是同一件事，`verify_semantics.py` 也就分不出叶子级的不合理配对。收紧到叶子要手写 632 → 数千条声明，且大部分声明没有可复核的依据（「海尔到底做不做电视」这种事上，写细一格就从"可复核"退回"执行者的行业印象"，正好违反那条硬约束）。**当前粒度是刻意的**：拦得住任务书里那五类实例（跨大类的随机配对），拦不住同一大类内的细分错配 |
 | **`get_schema` 这条死通道** | `backend/db.py:255 _describe_comments()` → `:294 _get_schema_athena()` → `:446 get_schema()` 会从 `DESCRIBE` 里抽 Glue 列注释拼进 schema 文本，带着很讲究的 docstring（解释为什么类型走 `information_schema` 而注释走 `DESCRIBE`），**但全仓库没有一个调用点**——工具层早已重构成 `read_doc` 读 `knowledge/`（`backend/README.md:49` 记着这件事）。它不是覆盖缺口，是**会误导判断的死代码**：读代码的人（包括本次审查）会以为 Glue 注释进得了 agent 上下文，从而误判「改 Glue 元数据要重跑 L7」。同一份死代码在 `analyticsagent/app/analytics/db.py:259` 还有一份同步副本。另外 `db.py:62` 那句「注释是灌数时从 `schema_manifest.yaml` 落进 Glue 的」也不准：manifest 里没有这些枚举文本，它们是建表时从 `database/iceberg/01_tables.sql` 的 `COMMENT` 进去的 |
 | **`web/catalog.json` 的新鲜度** | 它是部署期快照，没有任何检查断言它与当前 Glue 一致。v2 时代它就在替不存在的治理层背书。改了数据/表结构后手动重跑 `scripts/deploy/build_catalog_json.py` |
 | **Cognito 认证路径** | 要浏览器 + SRP 登录，无法自动化。只能人工过一遍 |
-| **知识卡片的散文正文** | `verify_doc_sql` 只验 SQL 能跑、`verify_enums` 只验枚举值。`use_when` / `avoid_when` / `caveats` 里一句写错的口径说明，几乎没有检查器能抓——而 agent 就是照它选表的。**唯一的例外是被事故钉过的那几句**：selftest 第 7/8/9 组按关键字核了漏斗的方法卡路由、漏斗的「绝对值不可比」这条结论约束、留存的「这份数据算不出留存」这条结论约束，以及判分器认不认后者（`kb-funnel-route-gone` / `kb-funnel-absolute-gone` / `kb-retention-verdict-gone` / `retention-verdict-gate-gone` / `retention-incomparable-gate-gone`）。那是**逐字符串**的白名单，不是"能读懂散文"——换个说法写同一句错话，它照样绿 |
+| **知识卡片的散文正文** | `verify_doc_sql` 只验 SQL 能跑、`verify_enums` 只验枚举值。`use_when` / `avoid_when` / `caveats` 里一句写错的口径说明，几乎没有检查器能抓——而 agent 就是照它选表的。**唯一的例外是被事故钉过的那几句**：selftest 第 7/8/9 组按关键字核了漏斗的方法卡路由、漏斗的「绝对值不可比」这条结论约束、留存的「这份数据算不出留存」这条结论约束，以及判分器认不认后者（`kb-funnel-route-gone` / `kb-funnel-absolute-gone` / `kb-retention-verdict-gone` / `kb-retention-incomparable-gone` / `retention-verdict-gate-gone` / `retention-incomparable-gate-gone`）。那是**逐字符串**的白名单，不是"能读懂散文"——换个说法写同一句错话，它照样绿。**这一栏 2026-09-01 又添了一条实证**：逐字符串白名单不光漏错话，还会**误杀对话**——判分器要求结论里出现「不能/不要/别排名」，而 agent 写的是「不建议排名」，一份完全正确的回答被判红。现在那一处白名单旁边多了一条「否定 + 动作」的正则，但**这个失效方向是这类白名单固有的**：它只认它见过的说法。**第三条实证同日补上，栽在"这句话在不在"这个判据形态本身**：改写把「cohort 之间不可比」在 `retention_curve.md` 里留下了 **5 份副本**（顶部小标题 / 结论段 / 可照抄的引用块 / chart 段 / 右删失段），而 must 只要求裸子串出现过一次，于是钉着它的 `kb-retention-incomparable-gone`（按"锚点恰好出现一次"的规矩只改得动小标题）注入完检查器照旧 exit 0，L8 把它报成**假阴性**——报的层对不上根因，根因在判据太松：5 份副本里少掉 4 份仍然绿。修法是把 must 拆成**位置不同、各自唯一**的三处（agent 最先读到的小标题 / 它照抄进 risk finding 的引用块 / 「判分器盯的就是它」那句），锚点钉小标题。**一般化的教训：只要一句话在卡片里可能有多份副本，"这句话在不在"就不是一条可用的判据，钉着它的负测会跟着一起空转。** |
 | **数据本身的业务自洽性** | `verify_load` 只证明 CSV → Athena 无损，不证明 CSV 里的数据在业务上讲得通。`docs/data-audit.md` 那些不变量（漏斗单调、留存衰减、计数器一致）在当前种子数据上**多数不成立**，那份文档带横幅。**部分补上了**：上面「L2+ 数据真实性诊断」那五个报告器覆盖了字面值多样性、商品域的单行语义、维度分辨率、画像 ⟷ 消费的相关性、四张行为大表的分布形状——但它们**一律不是闸门**（对云上必红，理由写在那一节）。剩下的真缺口是**跨表的数值口径自洽**：`order_items.unit_price` ⟷ `products.price`（同一件商品在明细里的单价与商品表的标价无关——**这一条还没修**。2026-08-28 在**新生成器的全量产出**上复测过一次，缺陷仍在且性质没变：`/tmp/genFULL_csv`，180.4 万条明细逐行 join 4,133 个 SKU，`unit_price` 均值 **92.10** ⟷ 同 SKU 的 `products.price` 均值 **1216.76**（13.2×），**逐行相关 −0.0010**，两者相等（差 < 1 分）的行只占 **0.0009%**。注意这不是"整体贵了 13 倍"这种可以一个系数改掉的偏移：相关系数是 0，明细单价与它自己那件商品的标价**互相独立**，所以「按标价折扣率」「客单价 ⟷ 商品定价档」这类问题在这份数据上答出来的都是噪声。修它要让 `build_order_items` 从 `products.price` 起价再乘折扣，而那会同时移动 `orders` 的四个金额列和 `products` 五个计数器的回填口径——属于下一批）。**已修**：`products` 的五个计数器 ⟷ `order_items` 的实际售出，原来 `sold_count` 是独立抽样的，目标规模下 Σ 比窗内真实件数高 26.9×、154 个 SKU（3.7%）连方向都相反（最糟的一行 `sold_count=1` 而窗内真卖了 163 件）、两条「爆款榜」的秩相关只有 +0.02（Top20 重合 0/20）；现在从明细回填（`_prep_product_counters`），实测比值 1.61×、硬矛盾 0、秩相关 +0.97、Top20 重合 17/20，`selftest_closures.check_product_counters` 的 10 条断言盯着它。`posts.like_count` / `sessions.page_view_count` 这类声明计数列与明细表的对账在生成侧有 `selftest_closures.py` 盯着，**云上那份没有**。`verify_behavior.py` 刻意不碰这一类，理由是它属于另一层（跨表数值闭环），造第二份实现只会两处各自漂。**刻意不修的一条**：漏斗转化率的绝对值。事件按种类近似均匀独立抽出（25 种各 736–866 行，极差比 1.18），漏斗顶端「看过就走」那一侧没按真实比例生成——浏览过商品的 394 人里一次都没加购的只有 80 人（20.3%），于是端到端转化全量 50.5%、近 30 天 16.2%，量级上不是业务水平。要修就得重造事件流并抬高行数预算；本项目的用途是演示 progressive disclosure 与 agent 写 SQL 的准确性，**形态**（394/314/258/199，逐层流失 20%/18%/23%，单调递减）已经够用，所以改成在语义卡片里加注：`analysis/funnel_analysis.md` 的「口径声明」+ `metrics/core_metrics.md` 的购买转化漏斗块，由 `run_eval.py --selftest` 第 7d 组逐字盯着、L8 `kb-funnel-absolute-gone` 证明那盏灯会红。注意这条只针对绝对值——**单调性不成立永远是 SQL 的错**，两张卡片都写明了不许拿它甩锅 |
 | **「`budget.py` 声明的规模 ⟷ 生成器实际产出」没有任何断言** | `budget.BASE` 是唯一声明每张表规模与缩放类的地方，但没有一条检查把它和 `main.py` 真正写出来的行数对起来。这不是假设，是已经栽过一次又剩了四次的实例：`products` 声明 SUB（4,133）而整类没有 builder、被 `data/csv` 的 200 行盖掉，差 20 倍全绿；修完之后 `ad_campaigns` / `ad_creatives` / `campaigns` / `coupons` 四张仍是同一状态（声明 1,033 / 2,976 / 1,033 / 3,100，实际透传 v1 的 50 / 144 / 50 / 150）。**这一栏的危险性全在重灌那一刻**：现在库里是 v1 规模，声明与产出的差距看不出后果；一灌全量，转化侧 ×427 而广告/券/活动侧不动，`user_coupons` 会变成 970 万行核销只指向 150 张券（每张券发出约 6.5 万次，v1 是 151 次）、`user_attributions` 14.9 万条归因只指向 50 个活动。判据是现成的、也很便宜——`main.py` 写完每张表后拿 `budget.table_rows(scale)` 对一遍行数，声明与产出不等就炸；透传那 12 张要么改成 FIXED（承认它们不缩放），要么给它们写 builder。**刻意先记下来不动**：改 `budget.BASE` 的类别会移动全量产出的每一个数，属于下一批 |
 | **计数器与「本该解释它」的那一列零相关（`verify_correlation.py` 只盖了画像 ⟷ 消费这一对）** | D-01 补的 `verify_correlation.py` 建立了「两列之间该有效应量」这类判据，但它的判据面只有**画像属性 ⟷ 消费金额**。同一形态在别处仍然零覆盖，2026-08-28 在全量产出（`/tmp/genFULL_csv`）上量到两处，都记在这里而**没修**：①**帖子的传播量与它的曝光时长无关**——36.16 万条已发布帖子，曝光天数 0–91 天，`corr(曝光天数, like_count) = +0.0035`，`view_count +0.0034`、`share_count +0.0016`、`comment_count −0.0009`；按曝光时长四分档看平均赞数是 41.4 / 42.0 / 42.6 / 42.5，**一根平线**。真实社区里累计计数是随暴露时间单调累积的，所以"昨天发的"和"三个月前发的"在这份数据里点赞数同分布；②**`product_tags` 的标签与商品的销售表现无关**——4,133 个 SKU、按 `tag_name` 分组看「该组平均 `sold_count` / 全体平均」，全部落在 **0.88×–1.11×**（每组 n≈390，这个跨度就是噪声）；反方向也一样，销量前 10% 的 SKU 平均带 **0.650** 个 `promotion` 标签、后 10% 带 **0.645**（1.01×），`corr(sold_count, promotion 标签数) = −0.0080`、`corr(sold_count, 标签总数) = −0.0117`。也就是说「限时特惠/满减 到底带不带得动销量」这个问题在这份数据上恒为"没区别"。两处的共同点和 `unit_price` 那条一样：**每一列单看都合法、每一张表单看都自洽，坏的是两列之间该有的那个方向**，而现有的每一层——闭环自测（查的是恒等式）、`verify_behavior`（查的是单列分布形状）、`verify_correlation`（只有画像 ⟷ 消费）——都不查它。要补得把「A 与 B 之间该有 ρ ≥ x」抽成一张可声明的表（像 `profiles.yaml` 的 `judge:` 那样），而不是再逐条手写判据 |
@@ -904,19 +985,85 @@ reconcile 家族 8 个用例共用同一条基线命令，基线结果按命令�
 | **`web/index.html` 里展示用的 SQL 字符串** | 那是给观众看的文本，不进数据库，方言错了没有任何东西会红。人工核对 |
 | **v1 本地 Postgres 分支** | `db.py` 的 postgres 路径、`docker-compose.cloud.yml`、顶层 `database/*.sql` **刻意不覆盖**，边界见 [legacy.md](legacy.md) |
 | **`scripts/gen/` 生成器** | 缺 numpy 时 L0 自动跳过；且 8000 万行 → Parquet → COPY 那条路没接到 Iceberg，装载的是仓库里的 CSV 种子数据 |
-| **L8 自己的覆盖面** | 50 个用例覆盖 **18 个检查器脚本 / 22 个可执行入口**（同一脚本的不同 flag 各算一个入口，例如 `governance.py` 的 `--selftest` / `--verify` / `--verify-backend`；这两个数是从 `guards=` 现数的，此前这一栏写的「27 个检查器」对不上任何一种数法），绝大多数是**一种**缺陷形态（`asset_check.py` 有两个，`backend/agent.py --selftest` 有两个（闸门退回 `can_use_tool`、白名单里丢掉 `ToolSearch`），`verify_constants.py` 有两个（清单外新增退化列、清单条目已过期——**必须成对**，只守前者的话那份清单会退化成只增不减的白名单），`verify_scale.py --selftest` 有两个（prompt 写死某一批的行数、同一个数抄两处只改了一处），`boot_test.mjs` 有四个：超时预算被改小、`warming` 被当成"后端不在"、降级不可逆、后端活着却给烘焙答案——同一处代码栽过三次；`run_eval.py --selftest` 有**十三个**，是全场最密的：判分器的形态闸、金标的口径、`knowledge/` 参考 SQL 的口径、漏斗题到方法卡的路由、漏斗「绝对值不可比」这条结论约束、金标的时间锚点不许写成逐表 `max()`，加上留存的六条——cohort 时间列、分子的 cohort 限定、「曲线不衰减时算不出留存」这条**结论级**判据写在卡片里、判分器真的会因为它判错、**形状闸得跟着曲线形状开合**（写死那一版在数据换成会衰减的批次之后开始要求 agent 说假话），以及**「cohort 之间不可比」那道与形状无关的闸**（判分器里是两道闸，各自独立，所以各有一条负测），再加**常规模式的文档路由**（`LITE_SUFFIX` 一刀切禁读 `analysis/` ⟷ 域索引写着"哪怕只是取数也要读"，两句话对冲、系统提示赢，那份口径硬约束就永远读不到）。它密不是因为它重要，是因为同一个错误在这里住过七个地方，而前两个闸全绿时 agent 在浏览器上照旧答错：它读的是知识卡片，不是金标）。它证明"该报时会报"，不证明检查器想得全。想得不全的部分就在这张表里 |
+| **L8 自己的覆盖面** | 55 个用例覆盖 **19 个检查器脚本 / 24 个可执行入口**（同一脚本的不同 flag 各算一个入口，例如 `governance.py` 的 `--selftest` / `--verify` / `--verify-backend`；这两个数是从 `guards=` 现数的，此前这一栏写的「27 个检查器」对不上任何一种数法），绝大多数是**一种**缺陷形态（`asset_check.py` 有两个，`backend/agent.py --selftest` 有两个（闸门退回 `can_use_tool`、白名单里丢掉 `ToolSearch`），`verify_portability.py` 有两个（`--static` 的 `rs_type_compat` 类型不兼容、`--selftest` 判据 8 的 NULL ⟷ 空串），`verify_constants.py` 有三个（清单外新增退化列、清单条目已过期——**必须成对**，只守前者的话那份清单会退化成只增不减的允许清单——再加数组普查那条），`verify_scale.py --selftest` 有两个（prompt 写死某一批的行数、同一个数抄两处只改了一处），`boot_test.mjs` 有四个：超时预算被改小、`warming` 被当成"后端不在"、降级不可逆、后端活着却给烘焙答案——同一处代码栽过三次；`run_eval.py --selftest` 有**十四个**，是全场最密的：判分器的形态闸、金标的口径、`knowledge/` 参考 SQL 的口径、漏斗题到方法卡的路由、漏斗「绝对值不可比」这条结论约束、金标的时间锚点不许写成逐表 `max()`，加上留存的七条——cohort 时间列、分子的 cohort 限定、「曲线不衰减时算不出留存」和「cohort 之间不可比」这两条**结论级**判据各自写在卡片里、判分器真的会因为它们判错（两道闸各有一条负测：形状闸 + 可比性闸），以及**形状闸得跟着曲线形状开合**（写死那一版在数据换成会衰减的批次之后开始要求 agent 说假话），再加**常规模式的文档路由**（`LITE_SUFFIX` 一刀切禁读 `analysis/` ⟷ 域索引写着"哪怕只是取数也要读"，两句话对冲、系统提示赢，那份口径硬约束就永远读不到）。它密不是因为它重要，是因为同一个错误在这里住过七个地方，而前两个闸全绿时 agent 在浏览器上照旧答错：它读的是知识卡片，不是金标）。它证明"该报时会报"，不证明检查器想得全。**L8 之外还有一处曾经的零覆盖已经补上**：`scripts/bench/` 六个 `--selftest` 现在挂进 `test_all.sh`，见下面「三条 arm 的物化、脱敏豁免与成本口径」。想得不全的部分就在这张表里 |
+
+## 三条 arm 的物化、脱敏豁免与成本口径（2026-09-02 / 09-07 实测）
+
+这一节记的是三 arm 架构自己带来的三类失效，都不在上面任何一层的判据面里。
+
+### 「重灌」在三条 arm 上不是一个动作
+
+2026-09-02 那次重灌产出的是新的 `s3://analytics-agent-raw/parquet/`，Redshift 从它 `COPY`，
+而 Athena 和 DuckDB 共读的 S3 Tables Iceberg 副本没有跟着灌，于是**三条 arm 里有两条落后一代**：
+`user_attributions.tracking_params`、`orders.shipping_address` / `cancel_reason` / `refund_reason`、
+`push_notifications.failure_reason` 这 5 列在 Redshift 上已是非常量，在另两条上还是假常量
+（"从空的变成了假的"那一批——**假常量比整列 NULL 难发现**：`IS NOT NULL` 通过、聚合出得来数、
+值本身也讲得通）。
+
+这件事之所以能瞒过整张检查网，原因很具体：种子固定、这轮只改了 5 列的取值规则，所以
+**35 张表的行数、数值求和、时间边界、布尔计数在三条 arm 上逐位相等**——`correctness.py
+--arms-only` 全绿是**正确的结论**，它按构造没有任何文本列判据。唯一照出来的是
+`query_correctness.py --values`（逐列 MIN/MAX）。两条推论：
+
+1. **登记桶的清除条件必须写「三条 arm 都读到重灌后的数据」，不是「重灌」。** 已改写进
+   `scripts/lakehouse/verify_constants.py` 的桶注释（`RELOAD_PENDING` 现在是空桶），
+   不只留在 commit message 里。
+2. **谁从哪份物化读、哪份物化被灌了，是重灌时必须逐条对的一栏。** 修的路径是
+   `scripts/lakehouse/load_parquet.py --probe / --apply`（Glue 外部表指向新 parquet +
+   Athena `INSERT`，`DELETE`+`INSERT` 而非 DROP 所以 Lake Formation 授权不丢），实测三张表 81.2s。
+
+顺带两条只有做这件事才会撞上的边界，都写在那个脚本里：Athena Iceberg `INSERT` 同时最多
+100 个分区写入器，`orders` 按 `day(placed_at)` 跨 91 天，得按月分批（这条现在有负测
+`partition-writers-over-limit` 钉着）；以及 Hive 外部表的 `timestamp` 是毫秒语义、
+Iceberg 目标是 `timestamp(6)`，同一时刻两种渲染（`22:44:25.000` ⟷ `22:44:25.000000`）
+会造出 32 条假差异——**判据要比的是时刻不是渲染**，而"毫秒够不够"这件事不能拿 Athena
+自己去验（它截断了也只会数出 0），是用本地 DuckDB `read_parquet` 数出三份源文件亚秒
+时间戳为 0 才敢放过的。
+
+### 没道理的红灯和掩盖缺陷的绿灯是同一个问题（2026-09-07）
+
+唯一照出装载不同步的 `query_correctness.py --values`，平时也一直报 2 处不一致
+（`users.email` / `users.phone`），原因是 Redshift 的动态脱敏在**聚合之前**生效，
+那两列在那条 arm 上本该不同；表级闸门同理在 `user_profiles.birth_date` 上红 2 处。
+三列现在登记在 `scripts/bench/correctness.py: MASKED`（两个闸门共用一份），判的是
+「对得上脱敏策略自身的变换」而不是「跟另两条相等」。**豁免是断言不是跳过**：明文 arm
+之间照旧互比，掩码值对不上策略照旧红。这件事和上面那段是同一个教训的两面——一盏没道理的
+红灯，跟一盏掩盖缺陷的绿灯，最终效果一样是没人再看它，而 2026-09-02 那次真差异的形态恰好
+也是两三个文本列。另外这一档以前不写 trace（函数在写 trace 之前就 return 了），于是「没
+跑过」和「跑过且干净」事后分不出来；现在落 `data/bench/query-values-<时间戳>.jsonl`。
+
+### `scripts/bench/` 曾经整个零覆盖
+
+同一天查出的：上面这三处（两盏没道理的红灯、成本口径）全是靠人读代码发现的，因为
+`test_all.sh` 里**没有一条断言碰过 `scripts/bench/`**——那几个 `--selftest` 写得挺细，
+但从来没人跑，判据坏掉不会让任何东西变红。成本那一栏的错正是这么活下来的：**整批摊薄**
+拿整批墙钟给每条 arm 记账，于是一条 arm 为另两条跑的时间付钱、同一段时间被收两遍，
+这一栏加起来超过整批实际花掉的钱；Athena 那一格反过来，它的 10MB 起步价是**每条查询**
+收的，把字节求和后只落一次，8 条里漏收 7 次。现在六个 `--selftest`（`arms` /
+`correctness` / `query_correctness` / `prices` / `timing` / `cost_cold`）都挂进
+`test_all.sh`，都不连云不花钱；摊薄那条钉的性质是**任何一条 arm 的金额都不许随另一条
+arm 的耗时变化**，双向各查一次，那正是旧实现做不到的事。
+
+### 模型不等于账单
+
+同日拿 `sys_serverless_usage` 结算了一遍冷启动：Redshift 自身耗时 37.6s、模型算 $0.048、
+**账单侧 $0.144，差 3 倍**。差在 60 秒下限的单位——它按**活动分钟**一段段收，跨挂钟分钟
+边界就多一段，活动后紧邻的空闲分钟也照收（那一遍占 05:34 / 05:35，加上 05:36 那个
+`compute=0` 的分钟，共 3 段）。一遍落在几个分钟上从「耗时之和」推不出来，所以 `timing.py`
+报下界并标明，账单侧真值走 `cost_cold.py --settle`。Athena 与 DuckDB 那两栏**没有做过
+同样的账单侧对照**，它们目前只靠计费规则本身站着。
 
 ## 改动 → 测试步覆盖矩阵
 
 | 改动 | 被哪一步覆盖 |
 |---|---|
 | `scripts/gen/pg_to_trino.py` | L0 自测 + L5 金标 dry-run |
-| `scripts/gen/fillers.py` / `tables.py` / `main.py` | L0 三个生成器自测（**要装 numpy，否则静默跳过**）：fillers、跨表闭环正例（106 条）、跨表闭环反例（44 个注入）。商品域（`_prep_products` / `_prep_product_tags`）另有 L2+ 的 `verify_semantics.py --from-csv` 和 `verify_resolution.py --from-csv`，但那两条**要手跑**、且要跑一次**全量**产出（分辨率类判据的通过线按全量推导，scale=1 的小样本必红） |
-| `scripts/gen/selftest_closures.py` **本身**（加断言 / 改判据 / 改 `NEG_CASES`） | **两侧都得跑**：`selftest_closures.py`（正例 106 条）和 `selftest_closures.py --negative`（44 个注入）。加了新断言就该同时加一个反例——不加不会有任何东西变红，而"106 → 107 条全绿"读起来和"多验了一件事"一模一样。改已有断言的消息文本会让对应反例的**期望片段**失配（报 `WRONG` 并打出实际消息），那是刻意的：片段就是把「这条判据在测哪件事」钉住的锚。注入函数只许读写 `t` 和深拷的 `cache`——`run_all_checks` 的入参边界是这一侧能存在的前提，往里塞对真 `ctx` 的写会污染后面每一个反例 |
+| `scripts/gen/fillers.py` / `tables.py` / `main.py` | L0 三个生成器自测（**要装 numpy，否则静默跳过**）：fillers、跨表闭环正例（150 条）、跨表闭环反例（66 个注入）。商品域（`_prep_products` / `_prep_product_tags`）另有 L2+ 的 `verify_semantics.py --from-csv` 和 `verify_resolution.py --from-csv`，但那两条**要手跑**、且要跑一次**全量**产出（分辨率类判据的通过线按全量推导，scale=1 的小样本必红） |
+| `scripts/gen/selftest_closures.py` **本身**（加断言 / 改判据 / 改 `NEG_CASES`） | **两侧都得跑**：`selftest_closures.py`（正例 150 条）和 `selftest_closures.py --negative`（66 个注入）。加了新断言就该同时加一个反例——不加不会有任何东西变红，而"150 → 151 条全绿"读起来和"多验了一件事"一模一样。改已有断言的消息文本会让对应反例的**期望片段**失配（报 `WRONG` 并打出实际消息），那是刻意的：片段就是把「这条判据在测哪件事」钉住的锚。注入函数只许读写 `t` 和深拷的 `cache`——`run_all_checks` 的入参边界是这一侧能存在的前提，往里塞对真 `ctx` 的写会污染后面每一个反例 |
 | `scripts/gen/semantics.yaml` | L0 `semantics.py --selftest`（配置自相矛盾）+ L2+ `verify_semantics.py --selftest`（判据有没有区分力）。**改价格带或白名单必须两条都跑**：它同时是生成器和检查器的真源，改错了两侧会一起用错的那份、一起变绿 |
 | `scripts/gen/profiles.yaml`（画像 ⟷ 消费的效应量与判据） | L0 `profiles.py --selftest`（21 项，13 项是反例）+ L0 `verify_correlation.py --selftest`（30 项，含审计实测那四个数必须判 FAIL）+ L0 跨表闭环里的 D-01 五条断言。**这份配置刻意分成三段**：`dimensions` 两侧共用、`judge` 只有检查侧读、`generate` 只有生成侧读，`load()` 返回三个独立数据类让这条边界结构化而不是靠自觉。唯一的例外是加载时断言「倍率跨度 ≥ 通过线 × 1.6」——它拦的是"生成出来的数据先天过不了自己的检查"，不是用倍率去推通过线。注意这条断言**对"有人把通过线调松"无能为力**，那件事只能靠 code review 和每条判据的 `why` 字段 |
 | `scripts/gen/tables.py` 的四个行为大表 builder（`build_post_likes` / `build_page_views` / `build_user_follows` / `build_push_notifications`）及它们依赖的 `fillers.py::children_per_parent` / `unique_pairs` / `from_pool` | L0 跨表闭环自测只查**计数对账**（`like_count` / `page_view_count` ⟷ 明细行数）。**形状**要手跑 L2+ `verify_behavior.py --from-csv <产出目录>`，**迭代 scale 1 就够**（1s 造数 + 1s 判读，分布形状不像分辨率类判据那样依赖全量）。改这四个 builder 必须跑：`--selftest` 只验判据有没有区分力，不会因为生成器变差而红。已知实测基线：scale 1 → **14 FAIL / 27**，逐项写在 `verify_behavior.py` 的 docstring 里，改完对着比；全量（scale 427，四表 40,581,089 行）→ **27 / 27 全过**，耗时 **119.39s**。**改到取数那一段（`_rows` 循环、累加器）就不能只跑 scale 1**：那里有过一处只在千万行量级现形的二次复杂度，见「没有自动化覆盖」那一栏。耗时记在本文档就是这条的兜底 |
-| `scripts/gen/budget.py`（表规模与缩放类） | L0 跨表闭环自测（scale=1）+ L2+ `verify_resolution.py`。**这里有过一处零覆盖的实例**：`products` 被声明成 SUB 缩放（scale=427 → 4,133 行）而 `tables.py` 里整类没有 builder，`main.py` / `dims_to_parquet.py` 反而各自去读 `data/csv` 那 200 行 v1 商品——「声明的规模 ⟷ 实际产出」当时没有任何断言，差 20 倍且全绿。**2026-08-28 数了一遍，同一处缺陷还剩 4 张表没修**：`data/csv` 的 35 张表里有 12 张不由生成器产出（`dims_to_parquet.py` 的 `DIMS`，逐字节透传 v1 值），其中 8 张在 `budget.py` 里声明为 FIXED——透传与声明一致，没问题；另外 **4 张声明为 SUB 却没有任何代码兑现**：`ad_campaigns` 50 → 声明 1,033、`ad_creatives` 144 → 2,976、`campaigns` 50 → 1,033、`coupons` 150 → 3,100（scale 427.039 下）。实测印证：全量产出目录 `/tmp/genFULL_csv` 只有 **23 个 CSV**，这 12 张一个都不在里面。和 `products` 那次的区别只是**它当时被撞见了**——判据仍然缺席，所以这 4 张的 20.7× 差距至今没有任何一盏灯 |
+| `scripts/gen/budget.py`（表规模与缩放类） | L0 跨表闭环自测（scale=1）+ L2+ `verify_resolution.py`。**这里有过一处零覆盖的实例**：`products` 被声明成 SUB 缩放（scale=427 → 4,133 行）而 `tables.py` 里整类没有 builder，`main.py` / `dims_to_parquet.py` 反而各自去读 `data/csv` 那 200 行 v1 商品——「声明的规模 ⟷ 实际产出」当时没有任何断言，差 20 倍且全绿。**2026-08-28 数了一遍，同一处缺陷还剩 4 张表没修**：`data/csv` 的 35 张表里有 12 张不由生成器产出（`dims_to_parquet.py` 的 `DIMS`，逐字节透传 v1 值），其中 8 张在 `budget.py` 里声明为 FIXED——透传与声明一致，没问题；另外 **4 张声明为 SUB 却没有任何代码兑现**：`ad_campaigns` 50 → 声明 1,033、`ad_creatives` 144 → 2,976、`campaigns` 50 → 1,033、`coupons` 150 → 3,100（scale 427.039 下）。实测印证：全量产出目录 `/tmp/genFULL_csv` 只有 **23 个 CSV**，这 12 张一个都不在里面。**这一处已经补上判据**：`main.check_table_coverage()` 现在断言「`DIMS` 里的表必须全声明 FIXED」，四张的声明也随之改成 FIXED（`budget.py` 里逐条留了注释）。所以"声明 ⟷ 兑现"这条不一致再出现会当场停下。**剩下的不是同一件事**：这四张表在全量下仍然只有 50 / 144 / 50 / 150 行，广告和券的维度分辨率跟 3,000 万级明细不匹配，CAC / ROI 的量级因此偏（`verify_literals --from-csv` 的 4 个 FAIL 就在这里）。那是数据真实度的缺口，要靠给它们写 builder 来补，不是靠断言 |
 | `scripts/lakehouse/verify_semantics.py` / `verify_resolution.py` / `verify_literals.py` / `verify_correlation.py` / `verify_behavior.py` | 各自的 `--selftest`（正反两组构造数据，合计 157 项）。**五个现在都接进了 L0**（无 numpy / 无云依赖，秒级；前三个是 2026-08-27 补挂的，理由写在 L2+ 那一节）。**都没有 L8 负测，而且不该有**：L8 要求「注入前是绿的」，这五个的正向那一支对现行库恒红，"从绿变红"这个信号产生不出来；它们还一律 `return 0`，退出码也不承载判定。红绿双侧夹具承担的就是 L8 那份保障。真正没覆盖的是**取数那一段**和**它们自己的复杂度**，各单列在上面「没有自动化覆盖」里。`verify_literals.py` 另有三个两条路共用的判据（`merge_col_verdicts` / `judge_posts` / `judge_device`）：**改它们等于同时改云上和离线两条路的结论**，这正是抽出来的目的——但也意味着改一处要两条路都跑过才算验完 |
 | `scripts/lakehouse/verify_behavior.py` 的 27 条判据本身 | L0 `verify_behavior.py --selftest`（79 项）。它是这批判据的**唯一**闸门，因为正向那一支对现行库必然 21/27 红，接进 `test_all.sh` 就是一盏永远红的灯。自测分六组，其中三组是别处没有的：①**每条判据 × 红绿两侧**（27×2 项）——同一条判据，全均匀夹具必须判 FAIL、强重尾夹具必须判 PASS，只验一侧证明不了判据有方向；②**集中度统计量 ⟷ 朴素实现逐位相等**（6 个随机直方图 × 9 个统计量）——直方图口径的 Gini/top-k 是整数算术推的，写错了报告照样打印得很像样；③**随机基线公式 ⟷ 四个审计实测点**，公式若错则 8 条集中度判据的通过线一起错。另外三组是 WEAK/FAIL/NOINPUT 三者分得开、通过线是闭的（`≥` 算过，且边界两侧的 μ 都在功效闸以上）、以及声明一致性（`CHECKS` ⟷ `TH` ⟷ `DEGENERATE_COLS` 三者互相不许有孤儿项） |
 | `scripts/gen/tables.py` 里 D-01 那条边（`_prep_user_profiles` → `_prep_orders` 的顺序、`mult[uid-1]` 的对齐、归一） | L0 跨表闭环的 D-01 五条断言（**scale 1 就能红**）。这里有一处刻意的分工：`verify_correlation.py` 在**产出**上量极差，看得见效应大小，看不见效应是怎么接上的。实测把对齐改成 `mult[uid]`（每个用户拿隔壁的倍率）：闭环断言在 scale 1 上报 0.49×（阈值 1.48×，差 3 倍）；而 L8 在 scale 1 上，**修好的和错位的生成器四条极差判据都是 WEAK**，只有方向约束偶然抓到——L8 要给出确定结论得跑到 scale 500（造数 51s）。所以闭环那条断言不是重复 L8，是把错位变成**迭代规模上**的确定性红灯 |
@@ -928,12 +1075,20 @@ reconcile 家族 8 个用例共用同一条基线命令，基线结果按命令�
 | `schema_manifest.yaml` | L0 `render.py --check`（改完要重跑无参 `render.py` 生成 15 个产物） |
 | `knowledge/domains/**` 手写卡片 | L2 四条路径 + L8 四个卡片类用例；**散文正文无覆盖**——而"散文正文"比听起来大：卡片里写在表结构描述那一栏的字面量（`user_profiles.md:13` 的默认值 `'China'`）就住在这里，见「隐形声明」那一节 |
 | `knowledge/**` 的生成卡片 | L0 `render.py --check`（别手改） |
-| `data/csv/**` | L0 `--preflight` + L3 **全量**（`--full`）+ L8 `csv-header-renamed` / `csv-value-changed` |
+| `data/csv/**` | L0 `--preflight` + L8 `csv-header-renamed` / `csv-value-changed`（后者显式指回这个目录）。**L3 已经不比它了**：云上装的是全量产出，L3 的 CSV 侧走 `data/loaded_row_counts.json` 记的目录。也就是说改这里的数据现在**不会**被 L3 察觉——它守的是"云 ⟷ 云上那份的真源"，不是这个目录 |
 | `scripts/lakehouse/load.py` | L3 |
+| `load.py` / `verify_load.py` 的 **CSV 扫描与聚合双路径** | L0 各自的 `--selftest`（`load` 那侧是 6 个夹具的缺陷矩阵，`verify_load` 那侧是一份构造表 9 项指标）。两个脚本各有一条 pyarrow 快路和一条标准库定义式路，**判据必须给出同一个结论**，漂开的表现是全量那一次悄悄换了口径而不是报错。退回标准库：`PREFLIGHT_ENGINE=stdlib`（扫描）/ `CSV_ENGINE=stdlib`（聚合，也认前者）。已知唯一分歧是小数位 > 4 的值——三边（arrow 报错 / Python half-even / Trino half-up）各一套，所以这种列不许存在 |
+| `gen_ddl.py` 的 `PARTITION_SPEC`（4 张表的 Iceberg 分区） | L0 `gen_ddl --selftest`：名单里的表和列必须真存在、列必须是 timestamp/date、变换名必须在 `_TIME_TRANSFORMS` 里，三种写错法各有一条拒绝断言；渲染侧另有两条位置闸（`)` 换行 `PARTITIONED BY (...)`，且前面**不许**有分号——写成 `);` 会让它变成一条独立语句，而 Athena 报的是一句和分区毫无关系的语法错）。列名写错在云上只报一句不提列名的 `Exception encountered when executing Iceberg query`，所以必须在本地拦。生成物那侧由 `gen_ddl --check` 守着。**没有覆盖的是「粒度选得对不对」**——那是量出来的，不是断言出来的，数据在 `PARTITION_SPEC` 上方 |
+| **重灌各步的先后顺序** | 没有自动覆盖，而它错起来不像错。`governance.py --apply` **必须排在 `02_mart.sql` 之后**：那份 SQL 里 13 张派生 / 集市表是 `DROP` + `CREATE` 重建的，先补授权再重建等于把授权又清掉 12 张。2026-09-01 按错的顺序跑过一次，`--verify` 报 12 张 `缺 SELECT`，而受限角色那侧的表现是 **`TABLE_NOT_FOUND`**——不是"没权限"，是目录里根本看不到，agent 会答「表不存在」，读起来像装载漏了表。正确顺序写在 `~/Desktop/数据整改记录.md` 的「四、重灌后的必跑项」 |
+| `load.py --recreate` | 没有自动覆盖，靠重灌那一次的实跑。2026-09-01 四张分区表都在真表上走过一遍：分区确实落上（`SHOW CREATE TABLE` 回读 `day(...)`），Lake Formation 授权确实掉了（拿 `orders` 单独量的：`governance.py --verify` 从 47 张变 46 张并点名 `orders: 缺 SELECT`），`--apply` 一把补回 47 张。**这条路是分区能生效的唯一途径**：`CREATE TABLE IF NOT EXISTS` 不改已存在的表，走默认的 `DELETE FROM` 灌进去的还是不分区的旧表，且没有任何一步会报错 |
+| `load.py` 的 `MAX_OPEN_PARTITIONS` / `check_partitions()` / `month_batches()` | L0 `--preflight`（本地判据，不连云）+ 重灌那一次的实跑。Athena 给 Iceberg 的 `INSERT` 只允许 **100 个并发分区写入器**，超了报 `ICEBERG_TOO_MANY_OPEN_PARTITIONS`，是硬上限、不可提额。2026-09-01 真撞过：`post_likes.created_at` 在 `data/csv` 里跨 365 天（新生成器只跨 91 天），一条 `INSERT` 直接炸。**`ORDER BY` 分区列不是解法**——试过，照样炸。解法是按月切批提交，每批 ≤31 个分区（离上限 3 倍余量），且因为各批的分区键**互不相交**，每个日分区只由一批写，所以不会因为切批多出小文件——实测四张表都是 1.00 文件/分区（`events` 90、`page_views` 90、`post_likes` 365、`orders` 91）。按行数切批没有这个性质。`check_partitions()` 判的是**最坏那一批**而不是整表基数，判红时给的动作是"把 `PARTITION_SPEC` 里这张表换成更粗的粒度"，因为按月已经是最细的切法。放在 `--preflight` 里是为了让它变成 3 秒的本地红灯，而不是灌到一半炸在云上——那一炸会中断重灌，且据 Athena 的报错原文它不会替你清理留下的数据文件（这次没留：manifest 没生成，表随后被 DROP 了） |
+| `load.py` 的 `DML_TIMEOUT` | 没有自动覆盖。它对着 Athena 的 **DML query timeout 配额**（us-west-2 实测 30 分钟，配额码 `L-E80DC288`，可提额，本账号没提过），刻意压低一分钟好让"灌不完"只有一种表现。真撞线时要做的是**提配额**，不是把这个数改大 |
+| `scripts/consistency/snapshot.py`（方言 / 判类 / 时间渲染） | L0 `--selftest`（方言分类 28 项 + 整条 SQL 4 项 + 脱敏 2 项 + 归一对账 7 项）+ 重灌那一次的 `--subset --compare`。**加后端要连带三件事**：判类按前缀还是按集合（Trino 的类型名带参数）、时间渲染（Trino 没有 `TO_CHAR`）、以及哪些列不参与对账（Postgres 侧是掩码列，湖仓侧是列级排除，`TrinoDialect.masked` 刻意为空集）。**Postgres 那一支的输出逐字节不许变**：两份归档基线和 `scripts/gen/main.py` 的 `_expected.json` 都按它产的，自测里那两条整 SQL 断言就是这条的锚 |
+| `scripts/gen/main.py::Expected`（预期值清单的键与值） | L0 三个生成器自测 + 重灌那一次的 `--subset --compare`。判据是「和 SQL 会返回什么逐字对上」：键按 **DDL** 出（不按这批数据里恰好有值的列）、没有非空值的列给 `null`（不给 `0.0000`）。这两条都是从假失败里学的——`channel_daily_costs.creative_id` 整列 NULL 时 SQL 的 `SUM` 返回 NULL，`subscriptions.cancelled_at` 整列 NULL 时清单里连键都没有，两种都会在对账时红，而数据其实是对的 |
 | `scripts/lakehouse/setup.py` | L0 `--selftest` + L1 `--verify` |
 | `scripts/lakehouse/reconcile.py` | L0 自测 + L2 + **L8 八类负测** |
 | `scripts/lakehouse/verify_enums.py` / `verify_doc_sql.py` | L0 自测 + L2 + L8 三个用例。`verify_enums.py` 的 `actual_values()` **改了取数那一段就要在真库上跑一次**：数组列走 `UNNEST` 那条分支的两处口径差（`n` 的含义、`<NULL>` 的含义）在构造夹具上看不出来，`--selftest` 只验解析器 |
-| `scripts/lakehouse/verify_constants.py`（判据 / 三份登记清单） | L0 `--selftest`（13 项分类器断言，含**两个方向的清单过期**）+ L2 连云普查 + L8 `degenerate-col-unlisted` / `degenerate-col-stale-entry`。**改清单必须两个方向都想过**：往里加一条很容易（变绿），而漏了"条目过期也要红"那一侧，清单就退化成只增不减的白名单。`DIMS_PASSTHROUGH` 的表名从 `dims_to_parquet.DIMS` **现读**——那边加一张透传表，这边会跟着红，这是刻意的 |
+| `scripts/lakehouse/verify_constants.py`（判据 / 五份登记清单） | L0 `--selftest`（标量 15 项 + 数组 9 项分类器断言，含**四个方向的清单过期**）+ L2 连云普查（标量列 `min`/`max`，数组列 `sum(cardinality)`）+ L8 `degenerate-col-unlisted` / `degenerate-col-stale-entry` / `array-col-stale-entry`。**改清单必须两个方向都想过**：往里加一条很容易（变绿），而漏了"条目过期也要红"那一侧，清单就退化成只增不减的白名单。`DIMS_PASSTHROUGH` 的表名从 `dims_to_parquet.DIMS` **现读**——那边加一张透传表，这边会跟着红，这是刻意的 |
 | `backend/db.py`（`validate` / `_FORBIDDEN`） | L0 只读边界自测 + L8 `readonly-guard-hole` |
 | `backend/db.py`（`backend_info` / `system_query`） | L6 `/health` 断言 + L5 dry-run |
 | `backend/db.py`（`AGENT_ROLE_ARN` / AssumeRole 那段） | L4 `--verify-backend` + L8 `gov-backend-not-assuming` |
@@ -1010,9 +1165,9 @@ L0 复跑 **33 / 0 ✅**。
 | 层 | 结果 |
 |---|---|
 | L0–L6 + L8 | **通过 53 · 失败 0 ✅**（`bash scripts/test_all.sh --l8`，exit 0）。其中 L0–L6 是 **52**，L8 整体那一项是第 53 条。相对上一批 51 → 53 的两条都是本轮新挂的：L0 的「退化列分类器 + 登记清单自测」和 L2 的「线上库退化列全部登记在册」 |
-| L8 负测 | 上一轮整套连跑 **43 / 43 全过 ✅**（**27 个离线 + 16 个连云**）；41 → 43 是那一轮新增的 `degenerate-col-unlisted` / `degenerate-col-stale-entry`，成对守新清单的两个方向。还原按 sha256 核对通过。**2026-09-17 本轮 43 → 49**：新增三个规模用例、一个金标锚点用例、一个留存结论闸的**反方向**用例（`retention-gate-hardcoded`：闸不许硬编码一句关于数据的结论）、一个常规模式的文档路由用例（`lite-mode-analysis-banned`），**离线 32 个整档连跑全过 ✅**，连云那个 `scale-lake-unregistered-batch` 单跑 PASS；其余 16 个连云用例本轮**没有重跑**（沿用上一轮结果）。**同日 49 → 50**：`judge_retention` 拆成两道独立的闸（可比性 · 形状）之后，负测也跟着拆成两条——新增 `retention-incomparable-gate-gone`，**离线 33 个整档连跑全过 ✅**，判分器自测 131 条断言全绿。顺带修了两个**锚点漂移**：`retention-verdict-gate-gone` 和 `kb-retention-verdict-gone` 的注入锚点被这一轮的改动挪走了，负测按设计显式 ERROR（"锚点出现 0 次"）而不是静默改别处——这正是那条"唯一子串替换"规则要的效果 |
+| L8 负测 | 上一轮整套连跑 **43 / 43 全过 ✅**（**27 个离线 + 16 个连云**）；41 → 43 是那一轮新增的 `degenerate-col-unlisted` / `degenerate-col-stale-entry`，成对守新清单的两个方向。还原按 sha256 核对通过。**2026-09-17 本轮 43 → 49**：新增三个规模用例、一个金标锚点用例、一个留存结论闸的**反方向**用例（`retention-gate-hardcoded`：闸不许硬编码一句关于数据的结论）、一个常规模式的文档路由用例（`lite-mode-analysis-banned`），**离线 32 个整档连跑全过 ✅**，连云那个 `scale-lake-unregistered-batch` 单跑 PASS；其余 16 个连云用例本轮**没有重跑**（沿用上一轮结果）。**同日 49 → 50**：`judge_retention` 拆成两道独立的闸（可比性 · 形状）之后，负测也跟着拆成两条——新增 `retention-incomparable-gate-gone`，**离线 33 个整档连跑全过 ✅**，判分器自测 131 条断言全绿。顺带修了两个**锚点漂移**：`retention-verdict-gate-gone` 和 `kb-retention-verdict-gone` 的注入锚点被这一轮的改动挪走了，负测按设计显式 ERROR（"锚点出现 0 次"）而不是静默改别处——这正是那条"唯一子串替换"规则要的效果。**同日 50 → 55**：`partition-writers-over-limit`（守 Iceberg 分区那条 100 个并发写入器的上限判据真的接在 `--preflight` 上）、`array-col-stale-entry`（数组普查那份清单的过期方向）、`kb-retention-incomparable-gone`（卡片里「cohort 之间不可比」那句的三处 must）、`portability-rs-type-incompat` / `portability-null-vs-empty`（`verify_portability.py` 的两个入口），**离线 37 个整档连跑全过 ✅**（连云 18 个沿用上一轮结果） |
 | L7 端到端（2026-09-17 重跑） | **27 / 27 ✅**（20:29 起，24.5 分钟，27 次 Bedrock 调用，模型 `global.anthropic.claude-opus-4-8`，均 55.0s/题、均读文档 2.4 次、均 SQL 0.7 条）。这一轮**必须跑**：改了 prompt（规模措辞、轴末表、`LITE_SUFFIX` 的例外）、两张语义卡片和判分器，而 L7 是唯一覆盖 `backend/agent.py` 的一层。上一轮那道红 `L5-retention-cohort` 本轮 **88.2s / 读文档 3 次 / 1 条 SQL**，理由「曲线在衰减，结论闸不适用（金标实测 5 个 cohort 的末周/首周 ≈ 0.50，阈值 0.8）」——读文档 3 次说明 lite 模式的例外确实生效了（修之前那份 `analysis/` 文档在常规模式下打不开）。报告覆盖在 `eval/report.md` / `.json` |
-| L0 跨表闭环 | 正例 **106 / 106**、反例 **44 / 44 按预期变红**（约 8s） |
+| L0 跨表闭环 | 正例 **150 / 150**、反例 **66 / 66 按预期变红**（约 9s，2026-09-01）。106/44 → 140/61 是成本与归因两族的判据，140/61 → 150/66 是 `events.properties` 那一族：4 种事件的形状 + 属性里的键 JOIN 得回 `products` / `orders` |
 | L2 `verify_constants.py` 连云普查（新增） | **退化列全部登记在册 ✅**：48 张表 / **468 个标量列**，389 列基数正常 + **14 待重灌 + 17 透传遗留 + 46 整列 NULL** 已登记 + 2 单行表，另有 **8 个数组列跳过并逐个打印**。耗时 **75s**。账算得平：389 + 33 + 46 = 468 |
 | 两个方向都**在真库上注入验过** | 不只是离线 `--selftest`：从清单里摘掉 `posts.share_count` → 真库跑出「不在任何清单里」；往清单里塞一条 `posts.title` → 跑出「已经不是常量了」。验完按 sha256 还原，字节相同。然后把这两次注入固化成上面那两个 L8 用例——**否则这盏新灯本身是没验过的** |
 | 修掉的两处套件红灯 | ① `profiles.py --selftest` 抛 `KeyError: '管理者'`：职业池对齐线上库时（12 → 15 个取值）删掉了 `管理者`，而自测里有 3 处硬写这个名字。**它是崩溃不是断言失败**，所以按 `/FAIL/` 抓的那层看不见它，按 `/全部通过/` 抓才看得见——这条教训写进了 `profiles.py` 的注释。修完 **21 项断言全过**。② `verify_enums.py` 报 `TYPE_MISMATCH: Cannot cast array(varchar) to varchar`：给 `interests` 补上声明之后，取数那边对数组列做 `CAST(... AS VARCHAR)` 直接炸。改成 `types` 驱动的 `UNNEST` 分支（见「隐形声明」形态 ②） |
