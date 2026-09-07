@@ -44,8 +44,8 @@ L0–L6 全绿只说明「现在没问题」，**不说明检查器还有效**�
 ## 用法
 
     python3 scripts/negative_tests.py --list        # 看用例清单
-    python3 scripts/negative_tests.py --offline     # 只跑不连云的 32 个（秒级）
-    python3 scripts/negative_tests.py               # 全部 49 个（要 AWS 凭证，约 4 分钟）
+    python3 scripts/negative_tests.py --offline     # 只跑不连云的 33 个（秒级）
+    python3 scripts/negative_tests.py               # 全部 50 个（要 AWS 凭证，约 4 分钟）
     python3 scripts/negative_tests.py -c enum-value-absent -c doc-sql-rotten
 
 退出码非 0 = 有检查器在缺陷面前保持了沉默（或负测自己的锚点失效了），两种都要处理。
@@ -489,13 +489,17 @@ CASES: list[Case] = [
         cmd=[PY, "eval/run_eval.py", "--selftest"],
         expect=r"找不到 `算不出留存`",
     ),
+    # judge_retention 里是**两道闸**，各自独立，所以这里也是两条用例。合成一条会留下
+    # 一个洞：两条闸的白名单不同、触发条件不同（形状那条只在曲线不衰减时生效，可比性
+    # 那条总是生效），只注入一条时另一条常常把散文拦下来，检查器照样红——红得却不是
+    # 因为被注入的那道闸没了。
     Case(
         id="retention-verdict-gate-gone",
         cloud=False,
-        guards="eval/run_eval.py --selftest（judge_retention 的结论闸）",
+        guards="eval/run_eval.py --selftest（judge_retention 的**形状**闸）",
         defect="上一条钉的是知识卡片里那句话还在，这条钉的是**判分器会不会因此判错**——"
-               "少了它，L7 的留存金标就退回「数值对就 PASS」，而那份把 P0 数据缺陷答成"
-               "「曲线平稳、留得住」的答案，数值恰恰全对，会安安静静进归档基线。"
+               "少了它，曲线平坦时 L7 的留存金标就退回「数值对就 PASS」，而那份把 P0 "
+               "数据缺陷答成「曲线平稳、留得住」的答案，数值恰恰全对，会安安静静进归档基线。"
                "闸是白名单（必须出现「算不出/不可信/独立抽样/假象」这类声明）而不是黑名单，"
                "因为**正确答案里就带着「别当成\"留存好\"的正面结论」**，任何按「留存好」"
                "拦的写法都会打到正确答案身上。第一版白名单还放了「别当」，结果被那份缺陷"
@@ -504,7 +508,24 @@ CASES: list[Case] = [
                   "    if not decaying and not any(k in prose for k in _RETENTION_CREDIBILITY):",
                   "    if False:")],
         cmd=[PY, "eval/run_eval.py", "--selftest"],
-        expect=r"结论报成「留得住」应判错",
+        expect=r"平坦曲线上光有「cohort 不可比」不够: 得到 True，期望 False",
+        forbid=r"全部通过",
+    ),
+    Case(
+        id="retention-incomparable-gate-gone",
+        cloud=False,
+        guards="eval/run_eval.py --selftest（judge_retention 的**可比性**闸）",
+        defect="留存判分器里「cohort 之间不可比」这道闸没了。它与曲线形状无关、任何批次上"
+               "都成立：所有 cohort 出自同一个活跃度模型，满窗那几周 D1 只差 0.9pp、"
+               "D7 只差 2.0pp。少了它，「11 月那批粘性最强，建议复盘 11 月的拉新渠道」"
+               "这种答案数值全对、右删失说明也对，会被判 PASS——**把噪声报成业务发现**。"
+               "注意另一道闸拦不住它：当前这批数据的曲线在衰减，形状闸整条不生效",
+        patches=[("eval/run_eval.py",
+                  "    if not _states_cohort_incomparable(prose):",
+                  "    if False:")],
+        cmd=[PY, "eval/run_eval.py", "--selftest"],
+        expect=r"数字对但把 cohort 差异读成业务结论应判错: 得到 True，期望 False",
+        forbid=r"全部通过",
     ),
     Case(
         id="doc-row-total-drift",

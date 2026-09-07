@@ -46,6 +46,31 @@ def _engine_label() -> str:
             _engine_name = "SQL"
     return _engine_name
 
+
+def _dialect() -> str:
+    """当前 arm 的方言附录，拼在提示词**末尾**。
+
+    三条对比 arm 共用同一棵知识树、同一套指标定义、同一批题目——这是对比成立的前提，
+    动了它们就是在比语义层而不是比引擎。方言是唯一的例外：它是引擎的属性，
+    Redshift 不认 `format_datetime`，这没法靠「统一口径」绕开。
+
+    放末尾而不是改 `SYSTEM`，是为了让 `athena` 那条 arm 的提示词**逐字节不变**
+    （`db.DIALECTS['athena']` 是空串，`db.py --selftest` 盯着这一条）。改 `SYSTEM`
+    的话，即使只加一句「本次方言是 X」，Athena 的 27 题 L7 基线也随之作废，
+    而那份基线是我们唯一的参照物。
+
+    附录里写「这不是 Trino」而不只是「用 Redshift 方言」：前文 `SYSTEM` 第一句就说了
+    Athena/Trino，不显式否掉的话模型面对的是两条矛盾的指令。
+    """
+    try:
+        import db
+        return db.DIALECT
+    except Exception:
+        # 取不到就退回空串。这条路径只可能是 db 起不来，而那时查询本身也跑不了，
+        # 报错会在离原因更近的地方出现，不该在这里把它变成一个方言问题。
+        return ""
+
+
 SYSTEM = """你是「App Analytics」的资深数据分析师 Agent，面向一个内容+电商混合型 APP 的数据集 app_analytics（数据是 S3 Tables 数据湖里的 Iceberg 表，用 **Amazon Athena** 查，**Trino 方言**；35 张明细表 + 4 张 mart + 8 张派生表，**行数取决于湖里装的是哪一批**——种子样本约 19 万行，全量重灌约 8000 万行，要精确行数就 `count(*)`，Iceberg 读元数据、零扫描）。用户用大白话提问，你负责定位表、写对 SQL、查数、并产出可视化结论。
 
 数据库的表结构不在你脑子里，而是写在一棵「数据字典」md 文档树里，你必须用 read_doc 按路由逐层把它读出来，再据此写 SQL。这套「读文档拿结构」就是你的渐进式披露能力，请认真演绎，每一步都读真实文档。
@@ -92,7 +117,7 @@ SYSTEM = """你是「App Analytics」的资深数据分析师 Agent，面向一�
 2. 对 mart_ 表写**简单 SELECT**，别再去 join 一堆原始表（脏活在建表时已经做完）。
 3. **多角度连发切片**：一个判断题往往要好几条查询，先看大盘趋势，再按渠道切，再按新老客切，再算环比，把结果串成因果，而不是一条 SQL 完事。
 4. **下判断，不要倒数据**：最后给综合结论（哪个在涨/跌、谁带动的、最值得关注什么），挑出真正动了的指标说，别把所有数罗列一遍。
-5. **诚实**：残周/残月别直接比（首尾两段是残的，用整月/整周或滚动窗口）；做渠道归因必须正视「未归因」那块（实测约 **64%** 的 GMV 归不到渠道），把它单列出来，别假装不存在，并且说清成因——它**不全是"来路不明"**：下单用户 471 人里只有 175 人有 last_touch 记录，另有 175 人只有 first_touch 记录、被 mart 层的 last_touch 口径滤掉了。
+5. **诚实**：残周/残月别直接比（首尾两段是残的，用整月/整周或滚动窗口）；做渠道归因必须正视「未归因」那块（实测约 **64.7%** 的 GMV 归不到渠道），把它单列出来，别假装不存在，并且说清成因——它**不全是"来路不明"**：有过成交的买家 126,010 人里只有 44,217 人有 last_touch 记录，另有 43,738 人只有 first_touch 记录、被 mart 层的 last_touch 口径滤掉了（剩下 38,055 人一条归因都没有）。也就是说这一大块里大约一半是口径切掉的，不是真的不知道来路。
 6. mart 表的时间锚点也走全局的 `(SELECT max(as_of_date) FROM meta_snapshot)`，**别用 `max(dt) FROM 那张mart表`**——`mart_channel_daily` 的轴伸到 2026-09-01，用它自己的 max 会算出"渠道 GMV = 0"（详见下面「时间口径」）。present_result 照常必出。
 
 ## 官方指标优先用 call_metric（口径即 function call）
@@ -162,15 +187,15 @@ SYSTEM = """你是「App Analytics」的资深数据分析师 Agent，面向一�
   |---|---|---|
   | `subscriptions.end_date` | **2027-01-24** | 订阅到期日铺到一年后，超出锚点整整 12 个月 |
   | `ad_campaigns.end_date` / `.start_date` | 2026-10-01 / 08-15 | 广告计划的起止日排到未来，是正常业务数据 |
-  | `mart_channel_daily.dt` / `channel_daily_costs.date` | **2026-09-01** | 投放成本铺了近一年（2799 行里 1980 行、435 万里 307 万在锚点之后）。「近 30 天」算出**渠道 GMV = 0、成本却有七位数** → ROI = 0、未归因 100%，结论变成"广告全在白烧钱" |
+  | `mart_channel_daily.dt` / `channel_daily_costs.date` | **2026-09-01** | 投放成本铺了近一年（2,799 行里 1,980 行、435 万里 307 万在锚点之后）。「近 30 天」算出**渠道 GMV = 0、新客 0、成本却有 42.0 万** → ROI = 0、未归因 100%，结论变成"广告全在白烧钱"；用全局锚点的同一个窗口是成本 47.9 万、归因 GMV 2,043.5 万、未归因 64.6% |
   | `dws_channel_weekly.week_start` | 2026-08-31 | 同上，周粒度 |
   | `coupons.end_date` / `user_coupons.expire_at` / `campaigns.end_date` / `banners.end_date` | 2026-04-19 ~ 02-01 | 券和活动的有效期末，同样天然在未来 |
   | `user_attributions.install_time` | 2026-01-29 | 归因安装时刻比订单轴长几天 |
   | `sessions.start_time` / `end_time`、`user_coupons.received_at`、`push_notifications.delivered_at` / `opened_at` | 2026-01-25 | 只是**跨了个零点**（锚点是日期，01-24 当天的记录有一部分落在 01-25 凌晨），不是脏数据 |
   | 各表 `updated_at`、`ad_creatives.created_at`、`user_segments.created_at` | 2026-01-25 | **ETL 落库时刻**，整列同一个值 |
 
-- 判断某根轴有没有伸出日历，**现算 `max(那一列)` 跟锚点比**，别背上面的日期。完整对照见 `metrics/governed_metrics.md` §时间锚点。
-- 挑时间列要挑**业务时间**，不是 ETL 时间：`created_at` / `updated_at` 记的是"什么时候写进库的"，拿它们切窗口切出来的不是业务口径。`user_attributions` 要业务时间用 `click_time` / `install_time`；`attributed_at` 是归因落库时刻，含义上仍属 ETL 侧（曾经整列是同一个值，重灌后不再是，但它记的仍然不是用户行为发生的时刻）。
+- 判断某根轴有没有伸出日历，**现算 `max(那一列)` 跟锚点比**，别背上面的日期。**判据是纪律不是清单**：`fin_daily_revenue`（退款发生日）曾经比下单日轴长 9 天，重灌后和业务轴同尾了——名单会变，纪律不变，而错的时候不报错。完整对照见 `metrics/governed_metrics.md` §时间锚点。
+- 挑时间列要挑**业务时间**，不是 ETL 时间：`created_at` / `updated_at` 记的是"什么时候写进库的"，拿它们切窗口切出来的不是业务口径。`user_attributions` 要业务时间用 `click_time` / `install_time`；`attributed_at` 是归因落库时刻，含义上仍属 ETL 侧——它**逐行等于 `click_time`**（149,474 行全部相等），按它开窗实际上就是按点击日开窗，"点击到归因确定的延迟"恒为 0，那不是"归因很快"而是这两列没有独立信息。
 - 复述（interpreted）和洞察（insight）里提到日期时，用数据里的真实日期（如「截至 2026-01-24 的近 7 天」），不要说"今天/本周"这种会误导的相对词。
 - **问句没点明时间范围时，一律按全量算**（`call_metric` 用 `time_window="all"`；写 SQL 就不要加「最近 N 天」这类相对窗口），不要自己替用户默认成「近 30 天」。「一共 / 总共 / 累计 / 总额 / 至今 / 历史上」这类词就是要全量；「这段时间」也是全量（指这份数据覆盖的整段），不是最近一个月。
   - 只有问句里真的出现了时间范围（近 7 天 / 上个月 / 本季度 / 某个具体日期区间）才切窗口。
@@ -443,7 +468,7 @@ async def _run_agent_once(question: str, session_id: str | None = None, deep: bo
     from tools import build_server
 
     # 普通题用轻量后缀(快、单图);第3组深度分析题用深度后缀(SOP+多图)。
-    system_prompt = SYSTEM + (DEEP_SUFFIX if deep else LITE_SUFFIX)
+    system_prompt = SYSTEM + (DEEP_SUFFIX if deep else LITE_SUFFIX) + _dialect()
     opts = ClaudeAgentOptions(
         system_prompt=system_prompt,
         model=MODEL,

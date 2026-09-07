@@ -129,8 +129,12 @@ RAW_BUCKET = os.environ.get("RAW_BUCKET", "analytics-agent-raw")
 STAGING_PREFIX = "athena-staging/"
 AGENT_STAGING_PREFIX = STAGING_PREFIX + "agent/"
 
-POLL_INITIAL = 0.15
-POLL_MAX = 2.0
+# 轮询节奏。日常用宽一点（少打 API），**计时基准要调窄**：这个间隔会整体
+# 加到客户端墙上时钟上，而三条 arm 的间隔不同（DuckDB 是进程内，根本不轮询），
+# 于是「谁快」里会掺进「谁的轮询设得松」。实测：一条引擎 690ms 的查询，
+# 默认节奏下墙上时钟 2230ms。见 scripts/bench/timing.py。
+POLL_INITIAL = float(os.environ.get("ATHENA_POLL_INITIAL", "0.15"))
+POLL_MAX = float(os.environ.get("ATHENA_POLL_MAX", "2.0"))
 
 
 class AthenaError(RuntimeError):

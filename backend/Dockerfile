@@ -19,7 +19,23 @@ WORKDIR /app
 
 # 先装依赖,利用层缓存
 COPY backend/requirements.txt /app/backend/requirements.txt
-RUN pip install --no-cache-dir -r /app/backend/requirements.txt
+# 依赖优先从 backend/wheelhouse/ 装,装不到才回 pypi。这不是加速,是为了让构建能完成:
+# claude-agent-sdk 的 manylinux wheel 有 96MB,而这条链路上大文件传到一半就断
+# (主机上 pip 也一样,6 次尝试只拿到 10.7MB/96MB;同一批里 46 个小 wheel 全部一次过,
+# 所以是尺寸相关而非 pypi 或 pip 的问题)。wheelhouse 用 curl -C - 断点续传攒齐,
+# 之后构建不再碰网络。
+#
+# 用 --mount=type=bind 而不是 COPY:wheelhouse 有 250MB,COPY 会把它留在镜像层历史里,
+# 而这个镜像要推 ECR——在一条 96MB 都传不完的链路上,白胖 250MB 是实打实的风险。
+# bind mount 只在这一步存在,不进任何层。
+#
+# wheelhouse 为空时行为与原来完全一致(--find-links 指向空目录就是纯走 pypi),
+# 所以 docker-compose.cloud.yml 那条路径不受影响。重建 wheelhouse:
+#   ./backend/.venv/bin/python -m pip download --platform manylinux_2_17_x86_64 \
+#     --only-binary=:all: --python-version 3.11 -d backend/wheelhouse -r backend/requirements.txt
+RUN --mount=type=bind,source=backend/wheelhouse,target=/wheels \
+    pip install --no-cache-dir --retries 10 --timeout 120 \
+      --find-links /wheels -r /app/backend/requirements.txt
 
 # 业务代码:server.py 用相对路径找 ../web、tools.py 找 ../knowledge,
 # 目录布局必须是 /app/backend + /app/web + /app/knowledge

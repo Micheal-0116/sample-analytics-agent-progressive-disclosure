@@ -52,7 +52,32 @@ REPORT_JSON = HERE / "report.json"
 # --dry-run 的产物单独放：它只证明金标 SQL 能在当前后端上跑通，不含 agent 的判定结果。
 # 写进同一个 report.json 会让 md 和 json 悄悄脱钩——md 还是上一次全量跑的 26/26，
 # json 已经被换成 golden_ok 记录，两个文件都"存在且看着正常"。这坑我们踩过一次。
-REPORT_DRYRUN_JSON = HERE / "report.dryrun.json"
+
+
+def report_dryrun_json(tag: str) -> Path:
+    """dry-run 产物路径，**也按 arm 分文件**，理由跟 `report_json` 不完全一样。
+
+    全量报告分文件是为了别覆盖基线；这里是为了让三条 arm 的金标结果**能放在一起比**。
+    金标 SQL 在某条 arm 上「跑通了」和「算出同一个数」是两件事，后者要靠横向比对，
+    而横向比对的前提是三份产物同时存在。原来这个路径是写死的，连着跑两条 arm，
+    第二条把第一条覆盖掉——于是只能看到「当前这条 arm 通了」，永远比不成。
+    """
+    return HERE / (f"report.dryrun.{tag}.json" if tag else "report.dryrun.json")
+
+
+def report_json(tag: str) -> Path:
+    """报告落盘路径。**非 athena 的 arm 自动带后缀**。
+
+    这不是为了整齐。三条 arm 的题目和判分器完全相同，输出路径原来是写死的
+    `report.json`，于是跑 duckdb 会把 athena 那份基线**静默覆盖**——而基线是
+    L7 唯一的历史参照（提示词改动要靠它判回归）。默认按 arm 分文件之后，
+    忘记加 `--tag` 也不会覆盖，这比"记得加"可靠。
+    """
+    return HERE / (f"report.{tag}.json" if tag else "report.json")
+
+
+def report_md(tag: str) -> Path:
+    return HERE / (f"report.{tag}.md" if tag else "report.md")
 
 
 # ---------------------------------------------------------------- utilities
@@ -134,7 +159,7 @@ async def run_agent_on(question: str) -> dict:
     ev_rows: list[dict] = []        # 每次 run_sql 的 {columns, rows}
     result: dict = {}
     errors: list[str] = []
-    n_docs = 0
+    docs: list[str] = []            # 读过的卡片路径（判红时要知道它到底读了没）
     t0 = time.perf_counter()
     async for ev in run_agent(question):
         t = ev.get("type")
@@ -146,7 +171,7 @@ async def run_agent_on(question: str) -> dict:
             # call_metric 的权威数也算 agent 的查询证据
             ev_rows.append({"columns": ev.get("columns", []), "rows": ev.get("rows", [])})
         elif t == "stage" and ev.get("key") == "doc":
-            n_docs += 1
+            docs.append(str(ev.get("detail") or ""))
         elif t == "result":
             result = ev
         elif t == "error":
@@ -156,7 +181,8 @@ async def run_agent_on(question: str) -> dict:
         "rowsets": ev_rows,
         "result": result,
         "errors": errors,
-        "n_docs": n_docs,
+        "docs": docs,
+        "n_docs": len(docs),
         "n_sql": len(ev_sql),
         "elapsed_s": round(time.perf_counter() - t0, 1),
     }
@@ -327,13 +353,60 @@ def judge_funnel(case, goldens, evidence, defaults) -> tuple[bool, str]:
     return False, "漏斗步骤数值命中不足"
 
 
-# 「这份数据算不出留存」的声明方式。**右删失/观测窗不在这里面**——那是另一回事,
-# 也正是那次答错时唯一给出的 caveat：它解释了边缘的 0，没解释中间那片为什么是平的。
+# 「cohort 之间不可比」的声明方式。**右删失/观测窗不在这里面**——那是另一回事,
+# 也正是那次答错时唯一给出的 caveat：它解释了边缘的 0，没解释满窗那几周之间为什么
+# 不能排名。
 #
-# 每一项都必须指向**机制或定论**（数据为什么算不出、结论因此不能用），不能是
-# 泛化的否定词。第一版里放了「别当」和「不能当作」，结果那份缺陷答案**通过了**——
+# 每一项都必须指向**机制或定论**（为什么不可比、结论因此不能下），不能是泛化的
+# 否定词。第一版里放了「别当」和「不能当作」，结果那份缺陷答案**通过了**——
 # 它的右删失那句写着「别当真实下跌」，于是"本该不算数的 caveat"恰好成了放行凭证。
 # 白名单的每一项都得自己问一遍：它会不会被答案里另一句无关的正确话满足？
+#
+# **2026-09-01 加了这一条靶子。** 它和下面那条「平坦曲线要声明算不出留存」是
+# **两件独立的事**，都归 judge_retention 管，别把它们当成同一条的两个版本：
+#   - 形状（纵向）：曲线不衰减时，留存结论整体不可用 → `_RETENTION_CREDIBILITY`；
+#   - 可比性（横向）：所有 cohort 出自同一个活跃度模型，满窗几周之间 D1 差 0.9pp、
+#     D7 差 2.0pp，"哪批留得最好"没有可读的答案 → 这一条，**与形状无关，总是要求**。
+# 全量重灌之后曲线是衰减的（实测 D1 59.4% / D7 22.3% / D14 14.7%，断崖在 D1），
+# 于是形状那一路走不到；只留形状那一条闸，"10 月那批粘性最强"这种答案就没人拦了。
+# 两头那两周是不完整的周，偏高的是窗口边缘不是用户质量。
+#
+# 选词上有一处是这次新踩的：**"不可比"这三个字不能单独进白名单**。右删失那句
+# 标准写法是「近期 cohort 窗口不完整，不能和老 cohort 比」——它天然在谈可比性，
+# 单收"不可比"等于把那句本该不算数的 caveat 又变成放行凭证（和第一版"别当"同一个坑）。
+# 所以要么带上范围（`cohort 之间不可比`），要么指向机制（同一个模型 / 生成器），
+# 要么指向动作（不要排名）。
+_RETENTION_INCOMPARABLE = ("cohort 之间不可比", "cohort之间不可比",
+                          "没有差别", "没有差异", "差异不可读", "不可读",
+                          "同一个活跃度模型", "同一套活跃度模型",
+                          "同一个分布", "同分布", "不是用户质量",
+                          "生成器", "合成数据", "不构成业务结论",
+                          "不能当业务基准", "别当业务基准", "不是真实产品")
+
+# "别排名"这个动作有太多种说法，逐个往上面那串里塞是个填不满的坑：第一次实测就栽在
+# 这上面——真 agent 写的是「不建议排名」，而白名单里躺着"不能/不要/别/不做排名"四个，
+# 一个都没命中，闸把一份**完全正确**的答案判红了。所以否定 + 动作这一类改成模式匹配，
+# 否定词与动作之间留 14 个字的余地（"没有必要排名""不建议做横向排名"都收得进来）。
+# 余地给到 14 是因为中间常常夹一个英文词：「无需对 cohort 做横向排名」，"cohort"
+# 一个词就吃掉 6 个字符——按中文语感估 8 个字会正好卡在这种句子上（自测里有这一条）。
+# 「没有可读答案」是同一句话的另一种落法，一并收。
+# 注意范围仍然要卡住：动作词里**没有**光秃秃的"比"——右删失那句
+# 「不能和老 cohort 比」正是这个形状，收它等于让本该不算数的 caveat 放行。
+_RETENTION_INCOMPARABLE_RE = re.compile(
+    r"(不|别|勿|无需|无法|没有|不必)[^。；\n]{0,14}(排名|排序|横向比较|做比较)"
+    r"|没有可读(的)?答案|不存在可读(的)?答案")
+
+
+def _states_cohort_incomparable(prose: str) -> bool:
+    """散文里有没有声明「cohort 之间不可比」。两条通路：固定说法 + 否定动作的模式。"""
+    return (any(k in prose for k in _RETENTION_INCOMPARABLE)
+            or bool(_RETENTION_INCOMPARABLE_RE.search(prose)))
+
+
+# 「这一批数据算不出留存」的声明方式——**只在曲线不衰减时**要求（见 judge_retention）。
+# 和上面那份是两条独立的判据：上面钉 cohort 之间不能排名，这里钉整条曲线不可信。
+# 同一条纪律：每一项都必须指向机制或定论，泛化的否定词会被答案里另一句无关的
+# 正确话满足（第一版放了「别当」，被右删失那句「别当真实下跌」放行过）。
 _RETENTION_CREDIBILITY = ("算不出", "不可用", "不可信", "独立抽样", "假象",
                           "不是真实留存", "无法反映", "没有建模", "数据缺陷",
                           "不构成业务结论", "样本局限", "与注册生命周期无关")
@@ -385,11 +458,23 @@ def judge_retention(case, goldens, evidence, defaults) -> tuple[bool, str]:
     这个 mode 的存在理由和 `funnel` 相反，值得写清楚。漏斗那次是**数值**错了
     （394/385/396/373，结算 > 浏览），所以形态闸盯的是数值。留存那次数值**全对**
     ——44.7 / 41.7 / 42.1 与独立实测分毫不差，分子也正确地限定在了 cohort 内——
-    错的只有结论那五个字：「曲线平稳、留得住」。v1 种子样本的活跃度与注册生命周期是
-    独立抽样的，曲线不衰减是项目自己审计出来的 P0，而 agent 把它报成了正面业务发现。
-    纯数值判分会给这种答案判 PASS。
+    错的只有结论那几个字：「曲线平稳、留得住，10 月那批粘性最强」。纯数值判分会给
+    这种答案判 PASS，因为它错的地方一个数字都不涉及。
 
-    ## 为什么这条闸不能写死「必须说算不出留存」
+    ## 两条闸，互相独立，都在这个函数里
+
+    1. **横向：cohort 之间不可比** —— 总是要求。所有 cohort 出自同一个活跃度模型，
+       满窗几周之间 D1 差 0.9pp、D7 差 2.0pp，"哪批留得最好"没有可读的答案。
+       右删失说明**不算**——那次答错时右删失那句是完全正确的，正是它让整段话听起来
+       严谨；它只解释了边缘的 0，不解释满窗那几周之间为什么不能排名。
+    2. **纵向：曲线不衰减时，整条留存结论不可用** —— 只在形状判为"不衰减"时要求。
+
+    两条盯的是不同的错：第 1 条拦「把 cohort 之间的噪声报成业务发现」，第 2 条拦
+    「把一条压根没建模用户生命周期的平坦曲线报成"留得住"」。全量重灌之后曲线在衰减，
+    第 2 条这一路走不到（所以它由 `--selftest` 的固定夹具覆盖，见下），但换一批数据
+    它随时回来——两条都留着，不是同一条的两个版本。
+
+    ## 为什么第 2 条不能写死「必须说算不出留存」
 
     第一版就是写死的，然后数据被换掉了：新生成器给用户配了活跃半衰期
     （`scripts/gen/tables.py` 的 `ENGAGEMENT_HALFLIFE`），全量批次实测
@@ -397,10 +482,10 @@ def judge_retention(case, goldens, evidence, defaults) -> tuple[bool, str]:
     **要求 agent 说一句假话**：这一批数据是算得出留存的。判据钉在数据的性质上、
     而数据可以换，就必然出现这种反转——所以形状改成**现从金标量**：
 
-    - 曲线不衰减（W_last/W_first ≥ `RETENTION_DECAY_MAX`）→ 结论闸生效，散文里必须
+    - 曲线不衰减（W_last/W_first ≥ `RETENTION_DECAY_MAX`）→ 形状闸生效，散文里必须
       出现"这一批数据算不出留存"这个意思；
-    - 曲线正常衰减 → 闸不适用，只比数值（此时反过来照抄那句警告也是错的，但这里
-      **不做黑名单**，理由见下）。
+    - 曲线正常衰减 → 形状闸不适用，只比数值（此时反过来照抄那句警告也是错的，但这里
+      **不做黑名单**，理由见下）。第 1 条闸不受影响，照旧要求。
 
     量不出形状（金标里没有 pct 那一份）→ 按最严的口径走，即仍然要求声明。判据瞎了
     就该从严，不该静默放行。
@@ -413,7 +498,7 @@ def judge_retention(case, goldens, evidence, defaults) -> tuple[bool, str]:
     不是在**禁止**某句话存在。禁止型的写法这里刻意没用：正确答案里就写着
     『别当成"留存好"的正面结论』，任何以「留存好」为特征的黑名单都会把它误杀。
 
-    还有一件事值得写下来：在**当前**这批数据上，结论闸这一路是走不到的（曲线在衰减）。
+    还有一件事值得写下来：在**当前**这批数据上，形状闸这一路是走不到的（曲线在衰减）。
     所以它的两个分支都由 `--selftest` 里的固定夹具覆盖（平坦曲线 → 必须拦；衰减曲线 →
     必须放行），不靠"湖里正好装着哪一批"来体检——否则换一批数据就等于悄悄少了一道闸。
     """
@@ -427,16 +512,25 @@ def judge_retention(case, goldens, evidence, defaults) -> tuple[bool, str]:
         shape = (f"金标实测 {n_cohorts} 个 cohort 的末周/首周 ≈ {ratio:.2f}"
                  f"（{'衰减' if decaying else '不衰减'}，阈值 {RETENTION_DECAY_MAX}）")
 
+    # 闸一（横向，总是要求）：cohort 之间不可比。
+    if not _states_cohort_incomparable(prose):
+        return False, ("结论里没有声明「cohort 之间不可比」：所有 cohort 出自同一个"
+                       "活跃度模型，满窗那几周 D1 只差 0.9pp、D7 只差 2.0pp，"
+                       "答成「某批 cohort 留得最好/最差」就是把噪声报成了业务发现。"
+                       "右删失说明不能替代这一条，"
+                       "见 knowledge/analysis/retention_curve.md 顶部那节")
+
+    # 闸二（纵向，只在曲线不衰减时要求）：整条留存结论不可用。
     if not decaying and not any(k in prose for k in _RETENTION_CREDIBILITY):
         return False, (f"结论里没有声明「这一批数据算不出留存」：{shape}——曲线平坦是"
                        "活跃度与注册生命周期独立抽样的结果（v1 种子样本的 P0），"
                        "把它答成「留得住/粘性好」就是把数据缺陷报成了业务发现。"
-                       "右删失说明不能替代这一条，"
-                       "见 knowledge/analysis/retention_curve.md 顶部那节")
+                       "「cohort 之间不可比」是另一条，不能替代这一条，"
+                       "见 knowledge/analysis/retention_curve.md 顶部那两节")
     tol = case["judge"].get("tolerance_pct", defaults["tolerance_pct"])
     min_hit = case["judge"].get("min_hit", 6)
     nums = agent_numbers(evidence)
-    prefix = ("曲线在衰减，结论闸不适用" if decaying else "结论已声明数据限制")
+    prefix = ("曲线在衰减，形状闸不适用" if decaying else "结论已声明数据限制")
     for g in goldens:
         vals = [float(v) for v in _flat_values(g["rows"]) if isinstance(v, (int, float))]
         if not vals:
@@ -476,6 +570,7 @@ async def run_case(case: dict, defaults: dict, dry_run: bool) -> dict:
         evidence = await run_agent_on(case["question"])
         rec["retried_infra"] = True
     rec.update(elapsed_s=evidence["elapsed_s"], n_docs=evidence["n_docs"],
+               agent_docs=evidence["docs"],
                n_sql=evidence["n_sql"], agent_sqls=evidence["sqls"],
                agent_errors=evidence["errors"],
                has_result=bool(evidence["result"]))
@@ -485,6 +580,12 @@ async def run_case(case: dict, defaults: dict, dry_run: bool) -> dict:
 
     ok, detail = JUDGES[case["judge"]["mode"]](case, goldens, evidence, defaults)
     rec.update(status="pass" if ok else "fail", detail=detail)
+    # 结论级的闸（funnel / retention）判的是**散文**，而散文此前一个字都没进报告：
+    # 判红时只看得到"没声明某句话"，看不到 agent 究竟说了什么，于是"它真没说"和
+    # "白名单太窄"这两种情况在报告上分不开——要区分就得再跑一次真 agent（约 100s
+    # 加一次 Bedrock 调用）。判红时把交付散文一起记下来，这个区分就免费了。
+    if not ok:
+        rec["prose"] = _delivered_prose(evidence)[:2000]
     return rec
 
 
@@ -492,7 +593,8 @@ def render_report(records: list[dict], meta: dict) -> str:
     done = [r for r in records if r["status"] in ("pass", "fail")]
     npass = sum(1 for r in done if r["status"] == "pass")
     lines = ["# Eval Report", "",
-             f"- 运行时间: {meta['ts']}  · 模型: {meta['model']}",
+             f"- 运行时间: {meta['ts']}  · 模型: {meta['model']}"
+             + f"  · arm: **{meta.get('arm', '(未记录)')}**",
              f"- 通过率: **{npass}/{len(done)}**"
              + (f" ({npass/len(done)*100:.0f}%)" if done else ""),
              f"- 平均耗时: {meta['avg_s']}s/题 · 平均读文档 {meta['avg_docs']} 次 · 平均 SQL {meta['avg_sql']} 条", ""]
@@ -517,8 +619,14 @@ def render_report(records: list[dict], meta: dict) -> str:
         lines += ["", "## 失败详情", ""]
         for r in fails:
             lines += [f"### {r['id']} — {r['question']}",
-                      f"- {r.get('detail','')}",
-                      "- agent SQL:", "```sql",
+                      f"- {r.get('detail','')}"]
+            if r.get("agent_docs") is not None:
+                lines.append("- agent 读过的卡片: "
+                             + ("、".join(r["agent_docs"]) or "(一张都没读)"))
+            if r.get("prose"):
+                # 结论级的闸判的就是这段话，不贴出来没法判断是 agent 没说还是闸太窄
+                lines += ["- agent 交付的结论散文:", "```text", r["prose"], "```"]
+            lines += ["- agent SQL:", "```sql",
                       *(r.get("agent_sqls") or ["(无)"]), "```", ""]
     return "\n".join(lines)
 
@@ -784,17 +892,31 @@ def selftest() -> int:
                              f"不是 cohort 成员 `{coh_alias}.user_id`："
                              f"实测这么写第 1 周是 219/43 = 509%")
 
-    # 8d) 数字对了、结论仍可以是错的。这一组是 Q3 的窟窿：留存曲线在 v1 种子样本上
-    # 平坦（45.0/43.0/42.1/41.1/43.0），agent 把它答成「曲线平稳、留得住」，
-    # 还配了一句完全正确的右删失说明——听起来很严谨，而结论是把项目自己的 P0
-    # 数据缺陷报成了正面业务发现。这条事实此前只写在 `docs/`，agent 从不读。
-    # 两份文档现在写的是**判据**（W4/W1 ≥ 0.8 算不衰减）而不是结论，因为全量批次的
-    # 曲线已经衰减了；这里钉的三个串是判据那段话的锚，删掉就等于把这一节抽空。
+    # 8d) 数字对了、结论仍可以是错的。这一组是 Q3 的窟窿，而它有**两个器官**，
+    # 卡片里各写一段、这里各钉一组锚：
+    #   - 形状：曲线平坦时（v1 种子样本 45.0/43.0/42.1/41.1/43.0）答「曲线平稳、
+    #     留得住」，把项目自己的 P0 数据缺陷报成正面业务发现。卡片写的是**判据**
+    #     （W4/W1 ≥ 0.8 算不衰减）而不是结论，因为全量批次的曲线已经衰减了。
+    #   - 可比性：矩阵全对，却把 cohort 之间的噪声（满窗几周 D1 差 0.9pp）读成
+    #     「10 月那批粘性最强」。这一条与形状无关，任何批次都成立。
+    # 两组事实此前都只写在 `docs/`，agent 从不读。
+    #
+    # 不可比那一组钉的**形态**收窄过一次：原来只要求裸子串「cohort 之间不可比」出现过，
+    # 而改写之后这句话在那张卡片里有 5 份副本（顶部小标题、结论段、可照抄的引用块、
+    # chart 段、右删失段），于是 `kb-retention-verdict-gone` 那条负测——它按"锚点必须
+    # 恰好出现一次"的规矩只改得动一处——注入完 must 依然满足，检查器 exit 0，用例把它
+    # 报成**假阴性**。实际是判据把"这句话在不在"定义得太松：5 份副本里少掉 4 份还是绿的。
+    # 现在逐个钉**位置不同、各自唯一**的三处：agent 最先读到的小标题、它照抄进
+    # risk finding 的引用块、以及判分器那句"盯的就是它"。删掉任意一处都判红。
     for rel, musts in [
         ("knowledge/analysis/retention_curve.md",
-         ["算不出留存", "act.user_id = coh.user_id", "W4/W1"]),
+         ["算不出留存", "W4/W1", "act.user_id = coh.user_id",
+          "## ⚠️ cohort 之间不可比",
+          "> cohort 之间不可比、不要排名：",
+          '**risk finding 里必须有一句"cohort 之间不可比、不要排名"**']),
         ("knowledge/metrics/core_metrics.md",
-         ["留存结论不可用", "analysis/retention_curve.md", "W4/W1"]),
+         ["留存结论不可用", "W4/W1", "cohort 之间不可比",
+          "analysis/retention_curve.md"]),
         ("knowledge/domains/behavior/_index.md", ["analysis/retention_curve.md"]),
     ]:
         p = HERE.parent / rel
@@ -804,8 +926,9 @@ def selftest() -> int:
                 fails.append(f"{rel} 不存在，无法核留存口径/路由")
             elif must not in p.read_text():
                 fails.append(f"{rel} 里找不到 `{must}`：留存题会读不到"
-                             f"「曲线不衰减时算不出留存」这条判据，"
-                             f"平坦曲线会被答成「留得住」")
+                             f"「曲线不衰减时算不出留存」或「cohort 之间不可比」"
+                             f"这两条约束之一——平坦曲线会被答成「留得住」，"
+                             f"几周之间不到 1pp 的差会被答成「哪批留得最好」")
 
     # 8e) 上面那一路的**前提**：agent 在常规模式下真的会去读那份 `analysis/` 文档。
     #
@@ -842,11 +965,13 @@ def selftest() -> int:
 
     # 9) 留存判分器的结论闸。这一组和第 1–5 组对称,但盯的维度相反:
     # 漏斗那次错在**数值**(结算 > 浏览),留存这次数值**全对**、分子也对、
-    # 右删失说明也对,错的只有结论那五个字「曲线平稳、留得住」。纯数值判分会判 PASS。
+    # 右删失说明也对,错的只有结论那几个字「曲线平稳、留得住,10 月那批粘性最强」。
+    # 纯数值判分会判 PASS。
     #
-    # 夹具是**两条曲线**，不是一条：结论闸只在"曲线不衰减"时生效，而当前这批数据的
-    # 曲线是衰减的（见 judge_retention 的 docstring）。两个分支都得有固定夹具，
+    # 夹具是**两条曲线**，不是一条：形状那条闸只在"曲线不衰减"时生效，而当前这批数据
+    # 的曲线是衰减的（见 judge_retention 的 docstring）。两个分支都得有固定夹具，
     # 否则换一批数据就等于悄悄少了一道闸、或者反过来开始要求 agent 说假话。
+    # 不可比那条闸与形状无关，两条曲线上都必须生效。
     r_case = {"judge": {"mode": "retention", "tolerance_pct": 5.0, "min_hit": 3}}
     # 平坦（v1 种子样本实测量级）：末周/首周 ≈ 0.95，判为不衰减 → 结论闸生效
     r_goldens = [{"label": "matrix counts", "rows": [[41, 18, 19, 19, 17],
@@ -864,41 +989,70 @@ def selftest() -> int:
                            "kpis": [], "followups": []},
                 "rowsets": [{"columns": [], "rows": [list(nums)]}]}
 
-    # 9a) 事故本体:数字全对,结论把 P0 数据缺陷报成了正面业务发现 → 必须判错
-    BAD = ("留存矩阵已出:首周约 44.7%,到第 2/4 周基本不再衰减,曲线平稳、留得住。"
-           "⚠️ 右下角那几个 0 是观测窗未到(右删失),别当真实下跌。")
-    ok, why = judge_retention(r_case, r_goldens, r_ev(BAD), defaults)
-    check("数字对但结论报成「留得住」应判错", ok, False)
-    if "算不出留存" not in why:
+    # 9a) 事故本体（**横向**那条闸）:数字全对,结论把 cohort 之间的噪声报成了业务发现。
+    # 故意放在**衰减**曲线上：纵向那条闸此时不参与,所以这一条测到的只可能是横向那条。
+    BAD = ("留存矩阵已出:11 月那批 D1 59.5%、12 月末那批 58.6%,**越老的 cohort 粘性越强**,"
+           "建议复盘 11 月的拉新渠道。⚠️ 右下角那几个 0 是观测窗未到(右删失),别当真实下跌。")
+    ok, why = judge_retention(r_case, d_goldens, r_ev(BAD), defaults)
+    check("数字对但把 cohort 差异读成业务结论应判错", ok, False)
+    if "cohort 之间不可比" not in why:
         fails.append(f"该失败的理由应指向结论而不是数值，实际: {why}")
 
     # 9b) 修复后的真实答案 → 必须判对。注意它里面写着『别当成"留存好"的正面结论』,
-    # 所以任何以「留存好」为特征的**黑名单**写法都会把正确答案误杀 —— 这就是这道闸
+    # 所以任何以「留存好」为特征的**黑名单**写法都会把正确答案误杀 —— 这就是这两道闸
     # 只用白名单(要求某句话存在)、不用黑名单(禁止某句话出现)的原因。
-    GOOD = ("横向看几乎不衰减,满窗的 4 个 cohort W1→W4 一直在 40–48% 徘徊。这是样本里"
-            "活跃度与注册生命周期独立抽样的假象,别当成\"留存好\"的正面结论。右下三角的 0 "
-            "是右删失。")
-    ok, why = judge_retention(r_case, r_goldens, r_ev(GOOD), defaults)
-    check("声明了数据限制且数值命中应判对", ok, True)
+    GOOD = ("曲线单调衰减、断崖在 D1(D1 59.4% → D7 22.3% → D14 14.7%)。但满窗那几周之间"
+            "D1 只差 0.9pp、D7 只差 2.0pp:所有 cohort 出自同一个活跃度模型,"
+            "cohort 之间不可比、不要排名,别当成某批用户\"留存好\"的正面结论。"
+            "右下三角的 0 是右删失。")
+    ok, why = judge_retention(r_case, d_goldens, r_ev(GOOD), defaults)
+    check("声明了 cohort 不可比且数值命中应判对", ok, True)
+
+    # 9b2) 真 agent 的说法和白名单里的字**不会逐字相同**。这三条是 2026-09-01 实测
+    # 那次的原话与它的近邻：第一条当时被判红了（白名单里躺着"不能/不要/别/不做排名"
+    # 四个，agent 写的是「不建议排名」），闸把一份完全正确的答案拦下来了。
+    # 现在走否定+动作的模式匹配，这三条都必须通过。
+    for phr in ("各 cohort 之间差异很小（满窗 W1 仅差 2.9pp），这份样本里"
+                "\"哪批用户留得更好\"没有可读答案，不建议排名。",
+                "满窗那几周之间差不到 1pp，无需对 cohort 做横向排名。",
+                "cohort 之间没有必要排序，差值在噪声量级。"):
+        ok, why = judge_retention(r_case, d_goldens, r_ev(phr), defaults)
+        check(f"真 agent 说法应判对: {phr[:14]}…", ok, True)
 
     # 9c) 只给右删失说明**不算**声明数据限制:那句话本身正确,但它只解释边缘的 0,
-    # 不解释中间那片为什么是平的 —— 而且正是它让那段错结论听起来很严谨。
+    # 不解释满窗那几周之间为什么不能排名 —— 而且正是它让那段错结论听起来很严谨。
+    # 这条 fixture 同时是白名单的**选词考题**:它自己就在谈可比性("不能和老 cohort 比"),
+    # 所以白名单里放光秃秃的"不可比"会被它满足,闸就空转了。
     ONLY_CENSOR = ("留存矩阵已出。右下角那几个 0 是观测窗未到(右删失),不是真实下跌,"
-                   "近期 cohort 的留存窗口不完整,不能和老 cohort 比。")
-    ok, why = judge_retention(r_case, r_goldens, r_ev(ONLY_CENSOR), defaults)
+                   "近期 cohort 的留存窗口不完整,不能和老 cohort 比。"
+                   "从满窗那几周看,11 月那批留得最好。")
+    ok, why = judge_retention(r_case, d_goldens, r_ev(ONLY_CENSOR), defaults)
     check("只说右删失不应算作声明了数据限制", ok, False)
 
     # 9d) 结论闸不能越权:结论合格但数值不对时,理由该是数值不命中(同第 3 条的纪律)
-    ok, why = judge_retention(r_case, r_goldens, r_ev(GOOD, nums=(1, 2, 3)), defaults)
+    ok, why = judge_retention(r_case, d_goldens, r_ev(GOOD, nums=(1, 2, 3)), defaults)
     check("结论合格但数值错应判错", ok, False)
-    if "算不出留存" in why:
+    if "cohort 之间不可比" in why or "算不出留存" in why:
         fails.append(f"数值不命中不该被报成结论问题: {why}")
 
-    # 9e) 另一个分支:曲线**确实在衰减**时,结论闸必须让路。写死"必须说算不出留存"的
-    # 那一版在数据换成全量批次后开始要求 agent 说假话——这一批是算得出留存的
+    # 9e) **纵向**那条闸:曲线平坦时,横向那句声明齐了也不够 —— 两条闸互相不能替代。
+    # 这一对是它的两面:同一段散文,加上"算不出留存"的意思才放行。
+    ok, why = judge_retention(r_case, r_goldens, r_ev(GOOD), defaults)
+    check("平坦曲线上光有「cohort 不可比」不够", ok, False)
+    if "算不出留存" not in why:
+        fails.append(f"平坦曲线上该失败的理由应指向曲线可信度，实际: {why}")
+    GOOD_FLAT = GOOD + ("另外这一批的曲线整条是平的(W1≈W4),活跃度与注册生命周期"
+                        "是独立抽样的,这一批数据算不出留存。")
+    ok, why = judge_retention(r_case, r_goldens, r_ev(GOOD_FLAT), defaults)
+    check("平坦曲线上两条声明都齐了应判对", ok, True)
+
+    # 9f) 纵向那条闸的另一个分支:曲线**确实在衰减**时它必须让路。写死"必须说算不出留存"
+    # 的那一版在数据换成全量批次后开始要求 agent 说假话——这一批是算得出留存的
     # （71.6 → 37.2，前陡后平）。判据钉在数据的性质上而数据会换，就必然有这种反转。
+    # 注意这段散文里横向那句仍然写着("不做横向排名")：让路的只有纵向那一条。
     PLAIN = ("满窗的 4 个 cohort，W1 约 71.6% 一路降到 W4 的 37.2%，前陡后平，"
-             "是正常的留存衰减形态。末周那几个 0 是右删失。")
+             "是正常的留存衰减形态。几周之间的差在噪声量级，不做横向排名。"
+             "末周那几个 0 是右删失。")
     ok, why = judge_retention(r_case, d_goldens, r_ev(PLAIN), defaults)
     check("曲线在衰减时不该再要求声明「算不出留存」", ok, True)
     if "衰减" not in why:
@@ -906,11 +1060,11 @@ def selftest() -> int:
     # 同一段散文放到平坦曲线上必须被拦下——证明放行确实来自形状,不是白名单变松了
     ok, _ = judge_retention(r_case, r_goldens, r_ev(PLAIN), defaults)
     check("同一段散文在平坦曲线上仍应判错", ok, False)
-    # 9f) 量不出形状(金标里没有 pct 那份)要**从严**:判据瞎了不能静默放行
+    # 9g) 量不出形状(金标里没有 pct 那份)要**从严**:判据瞎了不能静默放行
     ok, _ = judge_retention(r_case, [d_goldens[0]], r_ev(PLAIN), defaults)
     check("量不出曲线形状时应回到最严口径", ok, False)
 
-    # 9g) 金标自己的口径(同第 6 组对金标做的事):留存金标必须按 registered_at 分 cohort、
+    # 9h) 金标自己的口径(同第 6 组对金标做的事):留存金标必须按 registered_at 分 cohort、
     # 且分子 JOIN 回 cohort 名单。真源错了下游全错。
     rc = next((c for c in spec["cases"] if c["id"] == "L5-retention-cohort"), None)
     ran += 1
@@ -984,6 +1138,9 @@ async def main() -> int:
     ap.add_argument("--cases", default=str(CASES_PATH),
                     help=f"用例文件（默认 {CASES_PATH.name}；口径陷阱题用 {TRAPS_PATH.name}）")
     ap.add_argument("--dry-run", action="store_true", help="只验证金标 SQL 可执行")
+    ap.add_argument("--tag", default=None,
+                    help="报告文件名后缀。默认按 DB_BACKEND 取（athena 不加后缀，"
+                         "保持基线路径不变），显式给了就用给的")
     ap.add_argument("--selftest", action="store_true",
                     help="离线自测判分器（不连库不调模型）")
     args = ap.parse_args()
@@ -997,12 +1154,9 @@ async def main() -> int:
     if not cases_path.is_file():
         print(f"用例文件不存在：{cases_path}"); return 2
     # 非默认用例集的报告单独命名。共用 report.md 的话，跑一次 3 题的陷阱集就会把
-    # 27 题的报告盖掉，而两份文件都"存在且看着正常"——同 REPORT_DRYRUN_JSON 那条教训。
-    tag = "" if cases_path.name == CASES_PATH.name else f".{cases_path.stem.replace('cases_', '')}"
-    report_md = HERE / f"report{tag}.md"
-    report_json = HERE / f"report{tag}.json"
-    report_dryrun_json = (REPORT_DRYRUN_JSON if not tag
-                          else HERE / f"report.dryrun{tag}.json")
+    # 27 题的报告盖掉，而两份文件都"存在且看着正常"——同 report_dryrun_json 那条教训。
+    case_tag = ("" if cases_path.name == CASES_PATH.name
+                else cases_path.stem.replace("cases_", ""))
 
     spec = json.loads(cases_path.read_text())
     cases = spec["cases"]
@@ -1012,6 +1166,13 @@ async def main() -> int:
         cases = [c for c in cases if c["id"] in args.case]
     if not cases:
         print("没有匹配的用例"); return 2
+
+    # athena 是基线，路径不变；另两条 arm 各自成文件。
+    # 两个维度都要进文件名：**arm** 和**用例集**。少了任何一个都会有一对跑法共用
+    # 同一个路径而互相覆盖（duckdb 全量 vs. athena 全量；athena 全量 vs. 陷阱集）。
+    arm_tag = args.tag if args.tag is not None else (
+        "" if db.BACKEND == "athena" else db.BACKEND)
+    tag = ".".join(x for x in (arm_tag, case_tag) if x)
 
     if not db.ping():
         print("数据库不可达（先跑 scripts/localpg/up.sh + load.sh）"); return 2
@@ -1028,20 +1189,26 @@ async def main() -> int:
         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
         "model": os.environ.get("ANTHROPIC_MODEL", "(default)"),
         "cases": cases_path.name,
+        # 哪条 arm 是这份报告最重要的一条元信息：三条 arm 的题目、金标、判分器
+        # 完全相同，唯一的变量就是它，不记下来这份报告就没法归属。
+        "arm": db.BACKEND,
         "avg_s": round(sum(r.get("elapsed_s", 0) for r in done) / len(done), 1) if done else "-",
         "avg_docs": round(sum(r.get("n_docs", 0) for r in done) / len(done), 1) if done else "-",
         "avg_sql": round(sum(r.get("n_sql", 0) for r in done) / len(done), 1) if done else "-",
     }
-    out_json = report_dryrun_json if args.dry_run else report_json
+    out_json = report_dryrun_json(tag) if args.dry_run else report_json(tag)
     out_json.write_text(json.dumps({"meta": meta, "records": records},
                                    ensure_ascii=False, indent=2, default=str))
     if not args.dry_run:
-        report_md.write_text(render_report(records, meta))
+        md = report_md(tag)
+        md.write_text(render_report(records, meta))
         print(f"\n通过 {sum(1 for r in done if r['status']=='pass')}/{len(done)}"
-              f" · 报告: {report_md.relative_to(HERE.parent)} / {report_json.name}")
+              f" · arm={meta['arm']} · 报告: {md.relative_to(HERE.parent)}"
+              f" / {out_json.name}")
     else:
         bad = [r for r in records if r["status"] == "golden_error"]
         print(f"\n金标验证: {len(records)-len(bad)}/{len(records)} OK"
+              f" · arm={meta['arm']}"
               + (f"；失败: {[r['id'] for r in bad]}" if bad else ""))
         print(f"（只验金标，未调模型；产物 {out_json.name}，未动 report.md/report.json）")
     return 0 if all(r["status"] in ("pass", "golden_ok") for r in records) else 1

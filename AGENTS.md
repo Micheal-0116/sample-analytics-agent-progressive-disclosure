@@ -60,7 +60,7 @@
   (`.github/workflows/offline.yml`: `--l0` + `negative_tests.py --offline` + the CDK
   policy assertions). CI covers **nothing** above L0 — see `docs/test-plan.md`.
 - `bash scripts/test_all.sh --l8` appends the fault-injection negative tests
-  (`scripts/negative_tests.py`, 49 cases): it temporarily edits repo files and restores
+  (`scripts/negative_tests.py`, 50 cases): it temporarily edits repo files and restores
   them with a sha256 check. Layer meanings and the gaps with **no** automated coverage
   are in `docs/test-plan.md`.
 - `backend/.venv/bin/python backend/db.py` runs the read-only SQL guard self-test.
