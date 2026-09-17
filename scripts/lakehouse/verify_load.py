@@ -76,6 +76,14 @@ sys.path.insert(0, str(_HERE))
 CSV_DIR = Path(os.environ.get("CSV_DIR") or ROOT / "data" / "csv")
 SCALE = decimal.Decimal("0.0001")          # 与 Athena 的 DECIMAL(38,4) 对齐
 
+
+def _rel(p: Path) -> Path:
+    """能写成仓库相对路径就写，不能就原样。全量产出在仓库外（`~/analytics-agent-data/`），
+    `relative_to` 对它会抛——而这些路径只出现在**报错信息**里，不该由排版把它挤成崩溃。
+    """
+    return p.relative_to(ROOT) if p.is_relative_to(ROOT) else p
+
+
 # CSV 里的 NULL 就是空字段。生成器不写 \N，也不写 'NULL' 字面量。
 NULLS = {""}
 
@@ -417,11 +425,11 @@ def loaded_row_counts() -> tuple[dict[str, int], str, list[str]]:
     """
     if not LOADED_SNAPSHOT.is_file():
         return {}, str(LOADED_SNAPSHOT), [
-            f"找不到装载快照 {LOADED_SNAPSHOT.relative_to(ROOT)}——"
+            f"找不到装载快照 {_rel(LOADED_SNAPSHOT)}——"
             "它是 connection.md 那几个数的比对基准，缺了这条检查就悬空了"]
     snap = json.loads(LOADED_SNAPSHOT.read_text(encoding="utf-8"))
     tables = {k: int(v) for k, v in snap["tables"].items()}
-    tag = (f"{LOADED_SNAPSHOT.relative_to(ROOT)}（{snap['source']} 那次装载，"
+    tag = (f"{_rel(LOADED_SNAPSHOT)}（{snap['source']} 那次装载，"
            f"scale {snap['scale']} / seed {snap['seed']} / 轴止 {snap['as_of']}）")
 
     csv_counts = csv_row_counts()
@@ -502,13 +510,26 @@ def _resolve_csv_dir() -> int | None:
 
     规则：没有显式给 `CSV_DIR=` 时，用装载快照记录的那个目录（`data/loaded_row_counts.json`
     的 `source`）。那个目录不在本机就**判红并说清怎么办**——"没法对账"不等于"对账通过"，
-    这一条不允许静默放过。
+    这一条不允许静默放过。**快照本身缺失也一样判红**：原来这里 `return None` 退回
+    `CSV_DIR` 的默认值 `data/csv`，于是"不知道云上装的是哪一份"被降级成了"就当它装的是
+    种子那一份"。这条路径有两种落点，都坏：湖里是全量时印出一屏假差异（同上一段），
+    湖里恰好就是种子那一份时印出**装载完整 ✅**——而它并没有验证过这件事，它只是没有
+    别的目录可比。快照是手工维护的中间产物（见 `LOADED_SNAPSHOT` 上方），"忘了写"是
+    它最常见的状态，所以这里必须是硬失败而不是默认值。
     """
     global CSV_DIR
     if os.environ.get("CSV_DIR"):
         return None                       # 显式指定的优先，包括故意指向别的产出
     if not LOADED_SNAPSHOT.is_file():
-        return None
+        print(f"没法做 CSV ⟷ Athena 对账 ❌\n"
+              f"  找不到装载快照 {_rel(LOADED_SNAPSHOT)}，"
+              f"所以不知道云上这份数据是从哪个目录装进去的。\n"
+              f"  两条出路：① 照那个文件的形状补一份（`source` 指向装载用的 CSV 目录，"
+              f"外加 `scale` / `seed` / `as_of` / `tables` 逐表行数）——它是手工维护的，"
+              f"每次 `load.py` 之后都该更新；② `CSV_DIR=<装载用的产出目录>` 显式指定。\n"
+              f"  **不会**默认拿 {_rel(CSV_DIR)} 去比：那只是 `CSV_DIR` 的默认值，"
+              f"不是任何一次装载的证据。")
+        return 1
     snap = json.loads(LOADED_SNAPSHOT.read_text(encoding="utf-8"))
     src = Path(snap["source"])
     if src == CSV_DIR:
@@ -520,7 +541,7 @@ def _resolve_csv_dir() -> int | None:
               f"  data/csv 是 v1 的 19 万行样本，跟云上这份无关，所以不拿它比。")
         return None
     print(f"没法做 CSV ⟷ Athena 对账 ❌\n"
-          f"  云上这份数据的 CSV 真源是 {src}（见 {LOADED_SNAPSHOT.relative_to(ROOT)}），"
+          f"  云上这份数据的 CSV 真源是 {src}（见 {_rel(LOADED_SNAPSHOT)}），"
           f"它已经不在本机了。\n"
           f"  两条出路：① 重跑生成器把它造回来——"
           f"`python3 scripts/gen/main.py --scale {snap['scale']} --seed {snap['seed']} "
@@ -667,6 +688,72 @@ def _selftest_engines() -> int:
     return bad
 
 
+def _selftest_resolve_csv_dir() -> int:
+    """`_resolve_csv_dir()` 的四条分支，全部用临时目录，不碰真快照。
+
+    钉住的是**"没法对账"必须判红**这一条：缺快照、或快照记的目录不在本机，都得返回
+    非零退出码，且不许把 `CSV_DIR` 留在默认值上继续跑下去——那会让 L3 拿 `data/csv`
+    去比一个不是从它装出来的湖。显式给了 `CSV_DIR=` 是唯一的例外（人已经说明白比谁）。
+    """
+    import contextlib
+    import io as _io
+    import tempfile
+
+    global CSV_DIR, LOADED_SNAPSHOT
+    keep_dir, keep_snap, keep_env = CSV_DIR, LOADED_SNAPSHOT, os.environ.get("CSV_DIR")
+    bad = 0
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            src = tmp / "genFULL_csv"
+            src.mkdir()
+            snap = tmp / "loaded.json"
+
+            def run(case: str, want_rc, want_dir: Path) -> None:
+                nonlocal bad
+                buf = _io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = _resolve_csv_dir()
+                if rc != want_rc or CSV_DIR != want_dir:
+                    bad += 1
+                    print(f"  FAIL _resolve_csv_dir {case}：返回 {rc!r}（期望 {want_rc!r}）、"
+                          f"CSV_DIR={CSV_DIR}（期望 {want_dir}）")
+
+            def snapshot(source: Path) -> None:
+                snap.write_text(json.dumps(
+                    {"source": str(source), "scale": 427.07, "seed": 42,
+                     "as_of": "2026-01-24", "tables": {}}), encoding="utf-8")
+
+            os.environ.pop("CSV_DIR", None)
+            LOADED_SNAPSHOT = snap
+
+            # ① 快照缺失 → 判红，且 CSV_DIR 不动（不许退回默认值去比）
+            CSV_DIR = keep_dir
+            run("缺快照", 1, keep_dir)
+
+            # ② 快照记的目录不在本机 → 判红
+            snapshot(tmp / "gone")
+            CSV_DIR = keep_dir
+            run("源目录已不在", 1, keep_dir)
+
+            # ③ 快照记的目录在 → 改指到它，继续
+            snapshot(src)
+            CSV_DIR = keep_dir
+            run("源目录在", None, src)
+
+            # ④ 显式 CSV_DIR= 优先于快照，连快照都不必存在
+            LOADED_SNAPSHOT = tmp / "nope.json"
+            os.environ["CSV_DIR"] = str(src)
+            CSV_DIR = keep_dir
+            run("显式指定", None, keep_dir)
+    finally:
+        CSV_DIR, LOADED_SNAPSHOT = keep_dir, keep_snap
+        os.environ.pop("CSV_DIR", None)
+        if keep_env is not None:
+            os.environ["CSV_DIR"] = keep_env
+    return bad
+
+
 def selftest() -> int:
     bad = 0
 
@@ -731,6 +818,7 @@ def selftest() -> int:
         print(f"  FAIL 标签顺序与 SELECT 不对应：{labels}")
 
     bad += _selftest_engines()
+    bad += _selftest_resolve_csv_dir()
 
     # 文档声明的行数 ⟷ CSV 实测。放在 --selftest 里是因为它不连云、几百毫秒，
     # 于是每次 `bash scripts/test_all.sh`（L0）都跑得到——文档漂移要在第一层就红。
@@ -744,6 +832,7 @@ def selftest() -> int:
         return 1
     print("  类型分类 17 例、时间归一 4 例、求和格式 4 项、探针 SQL 6 项")
     print(f"  CSV 聚合两条路径（{_engine()[1]} / stdlib）对同一份构造数据算出同一组 9 项指标")
+    print("  CSV 真源解析 4 条分支：缺快照判红、源目录不在判红、源目录在改指、显式 CSV_DIR 优先")
     # 出处照 loaded_row_counts() 现说，不写死目录名：默认那条路比的是装载快照而不是
     # data/csv（那份是 v1 的 19 万行），印错出处会让人以为这条检查覆盖了 data/csv。
     print(f"  knowledge/connection.md 的行数声明 ⟷ {loaded_row_counts()[1]}：7 项相等")
