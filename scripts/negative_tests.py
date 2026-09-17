@@ -439,9 +439,11 @@ CASES: list[Case] = [
         guards="eval/run_eval.py --selftest（留存 cohort 的时间列）",
         defect="`users` 上 `created_at` 和 `registered_at` **两列都存在**，所以 cohort "
                "写错列时 EXPLAIN 通过、SQL 出结果、行数也正常——只是分出来的是另一批人"
-               "（实测 500/500 行两列不相等）。这是「检查器验的是另一个维度」的第三种形态："
-               "`verify_doc_sql.py` 查语法，语法没错，错的是语义。"
-               "旧版本这段确实写的是 `created_at`",
+               "（种子那一批实测 500/500 行两列不相等）。这是「检查器验的是另一个维度」的"
+               "第三种形态：`verify_doc_sql.py` 查语法，语法没错，错的是语义。"
+               "旧版本这段确实写的是 `created_at`。全量重灌之后两列**逐行相等**（实测），"
+               "所以现在写错列不再分出另一批人——这条钉的是**卡片点名哪一列**，"
+               "不是当下的数值差异：两列相等是这一批数据的偶然，不是口径",
         patches=[("knowledge/metrics/core_metrics.md",
                   "DATE_TRUNC('week', CAST(registered_at AS date)) AS cohort_week",
                   "DATE_TRUNC('week', CAST(created_at AS date)) AS cohort_week")],
@@ -507,15 +509,18 @@ CASES: list[Case] = [
     Case(
         id="doc-row-total-drift",
         cloud=False,
-        guards="scripts/lakehouse/verify_load.py --selftest（文档行数 ⟷ CSV 实测）",
-        defect="knowledge/connection.md 里的全库行数与真源不符——**agent 数不出这个数**"
+        guards="scripts/lakehouse/verify_load.py --selftest（文档规模声明 ⟷ 装载真源实测）",
+        defect="knowledge/connection.md 里的全库规模与真源不符——**agent 数不出这个数**"
                "（治理角色读不到 user_messages），只能照抄卡片，于是自信地报一个错的规模",
+        # 注入打在**张数**上而不是行数上：行数随重灌变（这里曾写死种子那一批的
+        # 189,672，全量重灌后锚点命中 0 次，负测自己先炸了），张数不变。同一条判据、
+        # 同一条报错路径（check_doc_totals 的 eq()），但锚点不再绑在某一批数据上。
         patches=[("knowledge/connection.md",
-                  "35 张原始表 189,672 行", "35 张原始表 189,700 行")],
+                  "35 张原始表", "34 张原始表")],
         cmd=[PY, "scripts/lakehouse/verify_load.py", "--selftest"],
         expect=r"文档行数声明",
     ),
-    # 上一条守的是**种子那一侧**（文档 ⟷ data/csv）。规模判据另有三条守另一侧：湖里装的是哪一批
+    # 上一条守的是**文档 ⟷ 装载真源**这一侧。规模判据另有三条守另一侧：湖里装的是哪一批
     # —— 紧跟着的两条离线（声明原文、声明次数），加上离线段末尾那条连云的
     # `scale-lake-unregistered-batch`（实测 ⟷ 已登记批次）。三条各盯一种失效，
     # 缺哪条都会留下一种"看起来绿了"。

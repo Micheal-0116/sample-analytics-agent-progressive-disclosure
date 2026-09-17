@@ -835,7 +835,7 @@ sha256 核对。第一步是关键：少了它，一个本来就红的检查器�
 | `degenerate-col-stale-entry` | `verify_constants` 方向二 | 往清单里塞一条**已经不退化**的列。只守方向一的话那份清单会退化成只增不减的白名单：某列被修好之后条目永远留着，"已修"和"未修"在报告上长得一样 |
 | `doc-sql-rotten` | `verify_doc_sql` | 卡片示例 SQL 引用不存在的列 |
 | `csv-value-changed` | `verify_load` | 改一个 CSV 数值（行数对但求和不对） |
-| `doc-row-total-drift` | `verify_load --selftest` | 改 `knowledge/connection.md` 里的全库行数（**agent 数不出这个数**，治理角色读不到 `user_messages`，只能照抄卡片） |
+| `doc-row-total-drift` | `verify_load --selftest` | 改 `knowledge/connection.md` 里的全库规模声明（**agent 数不出这个数**，治理角色读不到 `user_messages`，只能照抄卡片）。注入打在**张数**上而不是行数上：行数随重灌变，锚点绑在某一批数据上会让负测自己先炸（重灌到 7994 万行那次就炸了），张数不变而报错路径相同 |
 | `scale-prompt-hardcoded` | `verify_scale --selftest` | 把 prompt 里的「行数取决于湖里装的是哪一批」换回写死的「35 张明细表，约 19 万行」。**这就是本库真实发生过的那个状态**：五处文档声明 19 万行、湖里装着 7994 万行、L0–L6 全绿——数量级差 427 倍而没有一盏灯，因为整个对账层比表、比列、比枚举、比退化列、比装载忠实，**从不比规模** |
 | `scale-decl-half-edited` | `verify_scale --selftest` | 把 `backend/run.sh` 里两处「约 19 万行」中的一处改掉。判据钉的是**出现次数**而不是「只准出现一处」：真要求去重，判据就变成在管别人的散文；钉次数则一改一漏立刻红（2 → 1），而正当的多处引用不受干扰 |
 | `kb-golden-pertable-max` | `eval/run_eval.py --selftest` | 把 `L1-dau-latest` 的金标锚点从 `meta_snapshot` 换回 `max(event_time) FROM events`。**这是修之前 9 条金标的真实样子**：评测在奖励一个知识库明令禁止的写法。它比 `current_date` 那种错难发现得多——多数表的轴末恰好等于锚点，逐表 max 算出来和正确答案一样，只有踩到伸出业务日历的轴才分叉（`sessions.start_time` 越到 2026-01-25，`L3-churn-30d` 的窗口整体推后一天） |
