@@ -12,11 +12,26 @@ L2 后面另挂一组**不编号、不是闸门**的数据真实性报告器（�
 
 ```bash
 bash scripts/test_all.sh              # L0–L6，约 3 分钟（L3 抽查 3 张表）
+bash scripts/test_all.sh --l0         # 只跑 L0，不连云、不要凭证，exit 0 可判（CI 跑的是这一档）
 bash scripts/test_all.sh --full       # L3 换成全量 35 张表（多约 1 分钟）
 bash scripts/test_all.sh --l8         # 追加 L8 负测（43 个用例，约 4 分钟，会临时改文件再还原）
 ```
 
 L7（端到端 agent）不在里面：它烧 Bedrock token 并覆盖 `eval/report.md`，该有人看着跑。
+
+### CI 覆盖到哪一层（`.github/workflows/offline.yml`）
+
+CI **只跑离线那一档**：`test_all.sh --l0`（33 条）+ `negative_tests.py --offline`（27 个用例）
++ CDK 那 9 条执行角色策略断言（`Template.fromStack`，纯合成）。三步都不连云。
+
+L1–L7 不在 CI 里，而这是个**刻意的缺口**：那几层要能连这个账号的凭证（S3 Tables / Glue /
+Athena / Lake Formation / Bedrock），而公开示例仓库里不该放长期 key。所以 offline 绿了只说明
+离线断言全绿，**不说明云上那条路是通的**——本文档「没有自动化覆盖」一节列的缺口一条都没被 CI 补上。
+
+`--l0` 这个档是为它加的：在这之前"只跑离线那几十条"只能整套跑下去、在 AWS 身份那道闸上吃一个
+`exit 1`，于是全绿的 L0 被包在非零退出码里，按退出码判成败的东西一律读成失败。
+`--l0` 与 `--full` / `--l8` / `--ask` 互斥且显式报错（那三个都在 L1 之后）——静默忽略的话
+`--l0 --l8` 会给出一份「L0 全绿、exit 0、而负测一条没跑」的报告。
 
 ## 前置条件
 
@@ -36,7 +51,10 @@ cd backend && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 ## L0 静态自测（无云依赖，秒级）
 
-31 项，全部是纯函数级断言（其中 3 项生成器自测要 numpy、1 项 boot() 契约要 node，缺了打 note、不算 FAIL）。改了 `scripts/` 下任何生成器/解析器/改写器，**先跑这一层**。
+33 项，全部是纯函数级断言（其中 3 项生成器自测要 numpy、1 项 boot() 契约要 node，缺了打 note、不算 FAIL）。改了 `scripts/` 下任何生成器/解析器/改写器，**先跑这一层**（`--l0` 就只跑它）。
+
+注意那两个「缺了打 note」的依赖在 CI 里是**装上的**（`scripts/requirements.txt` + `setup-node`）：
+note 不算 FAIL 是给本机开的方便，如果 CI 也让它跳过，那批断言会在一片绿灯里一直不跑。
 
 | 检查 | 挂了说明什么 |
 |---|---|
@@ -190,9 +208,13 @@ python3 scripts/lakehouse/setup.py --verify        # 只读核查，可随便跑
 ```
 
 预期 `基建齐备 ✅`：表桶 `analytics-agent-tables`、namespace `app_analytics`、
-Athena workgroup `analytics-agent-wg`、以及表桶已联邦进 Glue。
+**两个** Athena workgroup（管理侧 `analytics-agent-wg` 与 agent 专用
+`analytics-agent-ro-wg`，各自的结果位置必须落在 `athena-staging/` 与
+`athena-staging/agent/`）、以及表桶已联邦进 Glue。
 
 挂了说明什么：联邦掉了（namespace 不再映射成 Glue database）、workgroup 被删、
+**agent workgroup 的结果位置被改到管理侧那个前缀上**（那一条报 ❌ 而不是 ⚠️：
+共享前缀等于 agent 能读到管理侧查询结果里的明文 PII），
 或凭证指向了另一个账号/区域。
 
 ## L2 元数据对账（四条独立路径）
@@ -330,11 +352,16 @@ python3 scripts/lakehouse/verify_behavior.py    --selftest --why      # --why �
 ```
 
 **五个现在两条路都能跑到底**（`verify_literals.py --from-csv` 是 2026-08-28 补的，之前
-它只有 Athena 一条路，于是生成器的字面值修复没有任何一条路验得到——云上是 v1 数据、
-已决定不重灌）。`verify_behavior.py` 是印证做得最实的一个：不带参数走 Athena（18 个
+它只有 Athena 一条路，于是生成器的字面值修复没有任何一条路验得到——当时云上是 v1 规模、
+已决定不重灌；**2026-09-17 更正：湖后来还是被重灌成 8000 万行那一批了**，见「一处与
+phase-2 任务书不符」那节顶部的补充）。`verify_behavior.py` 是印证做得最实的一个：不带参数走 Athena（18 个
 聚合查询），`--from-csv` 走逐行流式，两条路都把结果收进同一个 `Facts`、喂给同一批纯
-判据函数，跑出来 27 个结论逐位相同——**这说明两份实现对得上，不说明数据对**，
-`data/csv` 正是灌进 Athena 的那一份（见本文档「两端不独立」那一栏）。补 `verify_literals`
+判据函数，跑出来 27 个结论逐位相同——**这说明两份实现对得上，不说明数据对**，两端本来就
+不独立（见本文档「两端不独立」那一栏）。**2026-09-17 起这里还多了一层麻烦**：湖已重灌成
+8000 万行那一批，`data/csv` 不再是灌进 Athena 的那一份，所以两条路现在读的是**两份不同规模
+的数据**，"27 个结论逐位相同"这个印证在当前湖上不再成立（分布形状的判据大多仍成立，但逐位
+相同不该再期待）。要重新拿到那个印证，得让 `--from-csv` 那条路读全量产出目录而不是
+`data/csv`。补 `verify_literals`
 时按同一条线抽出了三个共用判据（`merge_col_verdicts` / `judge_posts` / `judge_device`，
 `verify_literals.py:185` 起），**PASS/FAIL 的合成规则一行都没有复制第二份**：这类规则
 （谁盖谁、EMPTY 算不算过）本身是判据的一部分，复制两份就会出现「云上判 FAIL、离线判
@@ -452,6 +479,16 @@ L8 那份保障，只是不叫 L8。**真正剩下的缺口是取数那一段**�
 
 ### 一处与 phase-2 任务书不符：v3 的库整体都是 v1 规模
 
+> **⚠️ 2026-09-17：这一节已经被现实推翻,但刻意留着,因为它记的是「潜伏缺陷显形」的全过程。**
+> 本节下面所有实测数字是 **2026-08 湖里还装着 `data/csv/` 种子**时量的。那之后湖被重灌成
+> 8000 万行那一批(新生成器 `scale≈427`,由 `feat/data-reload-80m` 的 `load_parquet.py` 灌,
+> 本分支上没有那个脚本)。**逐条对照下面第 2 点的预言**:`products` 现在是 **4,133**(生成器
+> 补上 builder 了),`orders` 854,140、`order_items` 1,804,371 —— 也就是「谁灌一次全量数据它
+> 就当场显形」这句话已经兑现。**仍然没兑现的是维度侧**:`coupons` 150、`ad_campaigns` 50
+> 一动没动,于是 `user_coupons` 970 万条核销只指向 150 张券(见下面「`budget.py` 声明的规模
+> ⟷ 生成器实际产出」那一栏)。当前规模与核查命令见
+> [deployment.md](deployment.md#数据说明)。
+
 任务书 D-02 写的是「事实表按 427 倍放大了，维度表还是 v1 原样，平均每个 SKU 被下单约
 9,021 次」。实测本库**不是这样**：
 
@@ -487,6 +524,24 @@ python3 scripts/lakehouse/verify_load.py -t users -t orders  # 抽查
 
 挂了说明什么：装载丢行、类型映射掉精度、时区偏移。
 
+**⚠️ 2026-09-17 起这一层在本仓库开发账号上必然红，原因不在装载**。湖已重灌成 8000 万行那
+一批，而这个检查比的是 `data/csv/` 种子 ⟷ Athena，两端根本不是同一份数据（`order_items`
+CSV 4,225 ⟷ Athena 1,804,371）。**读到这盏红灯先分清是哪一种**：
+
+| 现象 | 含义 |
+|---|---|
+| 行数/求和差出 427 倍量级 | 湖里是重灌后那批，不是装载缺陷。要覆盖那一批得用 `feat/data-reload-80m` 的 `verify_load.py`（它对的是全量产出的 `_expected.json`，不是 `data/csv/`） |
+| 差一点点（少几行、尾数不同、时间偏几小时） | 才是这一层要抓的：装载丢行、精度、时区 |
+
+修法**已经存在并实测验过**（2026-09-17，在 `feat/data-reload-80m` 的临时 worktree 里对同一个
+湖跑出 `装载完整 ✅`）：`_resolve_csv_dir()` 从装载快照 `data/loaded_row_counts.json` 的 `source`
+反推该跟哪份 CSV 对账。这一层与另外三盏红灯的逐条归因、修法与验证输出，见本文档末尾
+「最近一次实测（2026-09-17）」。
+
+**更该警惕的是它反过来的那一面**：如果湖里被人用 `load.py` 灌回了种子，这个检查会**全绿**
+——绿的同时湖已经从 8000 万行退回 22 万行。这盏灯的绿只保证「`data/csv/` 那一份完整地在湖
+里」，**不保证湖里没有别的、更大的一份被它覆盖掉了**。
+
 ## L4 治理层（最小权限角色 + 列级排除）
 
 ```bash
@@ -513,16 +568,24 @@ python3 scripts/lakehouse/governance.py --apply           # 建角色 + 发 LF �
 
 | 检查 | 独有覆盖 | 少了它会怎样 |
 |---|---|---|
-| `--selftest`（离线） | 策略清单（`EXCLUDE_COLUMNS` / `DENY_TABLES`）⟷ 验收契约（`MUST_NOT_READ_*`）互相覆盖；IAM 策略窄不窄 | 有人把一列从策略里拿掉，云上照发照过，探针也照样全绿 |
-| `--verify`（连云） | 授权面比对 **+ 以 agent 角色实测 16 条探针**：该读到的读到、该读不到的读不到 | 授权齐不等于查得动；也发现不了「授权面对但边界不在」 |
+| `--selftest`（离线） | 策略清单（`EXCLUDE_COLUMNS` / `DENY_TABLES`）⟷ 验收契约（`MUST_NOT_READ_*`）互相覆盖；IAM 策略窄不窄（含两个 workgroup 的结果前缀是否分开，配了三个正对照） | 有人把一列从策略里拿掉，云上照发照过，探针也照样全绿 |
+| `--verify`（连云） | 授权面比对 **+ 以 agent 角色实测 18 条探针**：该读到的读到、该读不到的读不到（含 Iceberg 元数据表 `users$files` / `users$snapshots`——它们的 `file_path` 列是直读旁路的入口，而 `db.py` 的只读闸门放行这种 SELECT）；**外加结果集隔离探针**（对管理侧 `athena-staging/` 的 list / get / put 三样都必须被拒） | 授权齐不等于查得动；也发现不了「授权面对但边界不在」，以及「目录层排掉了但结果 CSV 还能读」 |
 | `--verify-backend` | 后端确实在用受限凭证：`backend_info()["identity"]` 是那个角色，且它读不到 `users.email` | 角色建好了、权限发了，而 `db.py` 仍用 admin 凭证——治理全在，只是没接上 |
 
 `--selftest` 里那两份清单**刻意不互相推导**：验收契约要是从策略现算，
 L8 的 `gov-policy-loosened` 注入完自测照样全绿。同一个理由，它还专门盯
-**`csv/` 那个旁路**——中转库 `analytics_agent_raw` 里是明文 CSV 外部表，
-Lake Formation 完全看不见它，所以角色的 S3 读被钉死在 `athena-staging/`，
-这条断言配了正反两个对照（挖一个 `csv/*` 的洞必须被抓到）。少了它，上面所有列级
-授权都是装饰，而云上探针一条都不会红。
+**两条明文旁路**：
+
+1. **`csv/` 中转库**——`analytics_agent_raw` 里是明文 CSV 外部表，Lake Formation
+   完全看不见它，所以角色的 S3 读被钉死在 `athena-staging/agent/` 这一个前缀上，
+   这条断言配了正反两个对照（挖一个 `csv/*` 的洞必须被抓到）。
+2. **Athena 自己的查询结果**——结果集是明文行数据的 CSV，落在 workgroup 的
+   `OutputLocation` 下。所以 agent 走**自己的** workgroup（`analytics-agent-ro-wg`）、
+   读写面只到 `athena-staging/agent/`；管理侧那半边它既读不到（否则治理探针自己跑的
+   `SELECT email FROM users LIMIT 1` 那一行明文就在那儿）也写不到（否则它能覆盖
+   对账脚本要读回的结果对象）。列级排除管的是「查得到吗」，管不了「结果放哪儿」。
+
+少了这两条，上面所有列级授权都是装饰，而云上探针一条都不会红。
 
 `--apply` 的安全边界：只建不删。给角色打 `Project` 标签，**遇到同名但没这个标签的
 角色直接拒绝动它**；LF 权限只发不撤（LF 授权是可叠加的，所以多出来的宽授权由
@@ -578,6 +641,54 @@ agent 写的 SQL 和 agent 看得见的目录——`SELECT *` 里没有这些列
 | 治理层完全没生效时，4 条「读不到」探针报绿 | 失败原因白名单里有 `does not exist`，而 `CATALOG_NOT_FOUND: Catalog '…' does not exist` 正好撞上它。查询压根没走到权限判定那一步 | `is_denial()`：先用 `_NOT_A_DENIAL` 排除基础设施级失败，再看像不像拒绝。顺序是刻意的；selftest 里有 5 条真实出现过的基础设施报错做负对照 |
 | Athena 报 `TABLE_NOT_FOUND`，而表在 Glue 里查得到 | 联邦 catalog 把 Glue 请求转发给 S3 Tables 服务时用的是**调用方身份**，角色一个 `s3tables:` 动作都没有。Glue 那层的报错是不带来源的 `Access Denied`，到 Athena 只剩 `TABLE_NOT_FOUND` | `S3TablesRead` 语句（七个动作，逐个 bisect 出来的）；selftest 钉住 `GetTableData` 必须在策略里 |
 | `--apply` 每次都报「0 张已符合，47 张新发」 | `list_permissions` 的 `Resource` 是**精确**过滤器而不是范围过滤器：拿 `Table{TableWildcard:{}}` 去问，那 47 条 `TableWithColumns` 一条都不返回。LF 的 grant 本身幂等，所以既不报错也不出错，只是**永远看不出**授权面有没有被人改过 | 逐表查 + `--apply` 发完**回读核对**。同一个 bug 在 `backend/catalog.py::_governance` 里还有一份，后果更糟：`available: true` 而 `granted_tables: 0`，UI 会正常地画一个"0 / 48 已授权、48 张表全部未授权"的面板 |
+
+### 云上那半边的治理证据：`{"op": "health"}` 与中继的 `/health`
+
+上面三条检查（`--selftest` / `--verify` / `--verify-backend`）都是**本地**发起的：
+`--verify-backend` 读的是本机进程的 `db.backend_info()["identity"]`。云上那半边——
+AgentCore Runtime 里那个容器**以谁的身份查数**——原来在外面没有任何证据。它的失效方式
+是最坏那种：`AGENT_ROLE_ARN` 掉了的容器用 exec role 查数（没有列级边界），而它答起来和
+正常容器**一模一样**。`runtime_config._require_governance()` 让配错的容器起不来，但
+「起不来」在外面看是 5xx，看不出是治理还是别的。
+
+所以 Runtime 上有一条**不进模型**的旁路，中继上有一个字段：
+
+```bash
+# ① 直接问 Runtime（要 bedrock-agentcore 权限；SSE，取 type=health 那一帧）
+aws bedrock-agentcore invoke-agent-runtime \
+  --agent-runtime-arn "$RUNTIME_ARN" --qualifier DEFAULT \
+  --runtime-session-id health-probe-000000000000000000000000000000000 \
+  --content-type application/json --accept text/event-stream \
+  --payload '{"op":"health"}' /dev/stdout
+
+# ② 经中继看（不带认证，ALB 探活走的就是这条）
+curl -s https://<relay-host>/health
+# {"ok":true,"runtime":true,
+#  "governance":{"wired":true,"role":"analytics-agent-ro","ageMs":41230}}
+# ageMs 是这份缓存的年龄：读到 wired 的同时要知道它是多久前探到的。
+
+# ③ 要完整 ARN（带账号 ID）必须带有效 JWT，走同一份缓存、不额外调上游。
+#    JWT 也可以放 x-id-token 头。验不过时回 identity:null——明说"没给"，
+#    而不是装作没这个字段（后者读起来像"云上没有这个信息"）。
+curl -s -H "Authorization: Bearer $ID_TOKEN" 'https://<relay-host>/health?identity=1'
+# governance 里多出 identity（完整 assumed-role ARN）、engine、workgroup
+```
+
+几处形状是刻意的，改之前先读这几行：
+
+| 约束 | 为什么 | 代价（如果反过来做） |
+|---|---|---|
+| `{"op":"health"}` **不进模型**（`main.py::agent_invocation` 第一个分支就 return） | 这条路径会被 ALB 探活间接触发 | 每次探活走一次 Bedrock，就是一笔按分钟计的账单 |
+| 中继 `/health` **绝不 await 上游**：回缓存 + 后台刷新，TTL 5 分钟 + 单飞去重 | ALB 探活必须永远快、永远 200 | 探活超时 → task 被摘出目标组；或者每次探活打一次 `InvokeAgentRuntime` |
+| 探不到时 `wired: null`，不是 `false` | `null` = 不知道，`false` = 确认没接上 | 把「探不到」说成「没接上」，会让人去查一个不存在的治理故障 |
+| 刷新失败**不影响** `/health` 的 200 | 那是探活端点，不是诊断端点 | 少一个诊断字段 → 整个 task 被摘掉 |
+| 默认只回 `governance.role`（角色名）+ `wired`，不回 ARN | `/health` 不带认证，而完整 ARN 里有账号 ID | 账号 ID 挂在公网未认证端点上 |
+| 固定 `runtimeSessionId`（`health-probe-…`） | `main.py::_get_client` 换 session 就 disconnect 重连暖客户端 | 探针把 Runtime 的暖客户端反复重建，每次 8–10s |
+
+**这一节仍然是人工跑的。** `test_all.sh` 的 L4 只打本地进程、L6 只打本地 `uvicorn`，
+两条都到不了云上那个容器；上面三条命令要一个已部署的 Runtime + 中继。它属于
+「没有自动化覆盖」里「云上副本 `analyticsagent/` 的运行时行为」那一栏——加了这个字段之后
+云上治理身份**看得见**了，但仍然没有任何一盏灯会因为它变红。
 
 ## L5 查询路径
 
@@ -750,6 +861,7 @@ reconcile 家族 8 个用例共用同一条基线命令，基线结果按命令�
 
 | 缺口 | 为什么没覆盖 / 怎么补 |
 |---|---|
+| **文档里写的规模 ⟷ 湖里实际的规模** | **2026-09-17 实测到的实例,不是假设**：`docs/deployment.md`、`docs/data-audit.md`、`docs/data-walkthrough.md`、`database/00_schema_overview.md`、`PROJECT_STATUS.md` 五处都写着「当前部署约 22 万行、数据源是仓库里的 `data/csv/`」——而湖早就被重灌成 **8000 万行**那一批（`orders` 854,140 而不是 2,000，差 427 倍）。这五句**写的时候都是对的，是湖在它们底下被换掉了**。没有任何一层会红：`reconcile.py` 比表和列、`verify_enums.py` 比枚举取值、`verify_load.py` 比 `data/csv/` ⟷ Athena，**没有一个比文档散文里的数字**——而 `verify_load.py` 更糟，它在一个装了 8000 万行的湖上跑仍然会因为「CSV 那 2,000 行都在」而全绿。**代价是可操作的**：照 `deployment.md` 原来那句「改完 `data/csv/` 后跑 `load.py`」执行，就是拿 2,000 单订单 `DELETE`+`INSERT` 覆盖掉 854,140 单，命令正常退出、`verify_load.py` 随后全绿。已改成把「仓库交付的那一份」和「某个账号的湖此刻装的那一份」分开写，并在两处灌数指令上加了先核查再灌的告警。**怎么补**：判据很便宜——把「湖里 `orders` 的行数」和文档里声明的规模比一次，不等就红（要么文档过期、要么湖被人换了，两种都该有人看）。没现在补是因为它要引入「文档里的数字」这种新真源形态，得先想清楚声明写在哪（候选：一份 `docs/scale.json`，文档和检查都从它读），属于下一批 |
 | **治理的「值级掩码」** | LF 没这个原语，落成了列级排除（列不可见），不是"测试缺失"而是**能力下降**，写在 L4 那一节。想要真掩码得上 Glue Catalog View，那条路的代价也写在那儿 |
 | **除 agent 外的其他访问者** | L4 只约束 `analytics-agent-ro` 这一个角色。谁还有这个账号的 LF/S3 权限（包括跑 `--apply` 的那个 admin），没有任何检查断言 |
 | **CLI 是否真的执行 `PreToolUse` 的拒绝** | `backend/agent.py --selftest`（L0）验的是两件**静态**的事：两侧 options 确实把闸门装在 `hooks` 上（AST 核对），以及直接调那个 hook 函数时放行/拒绝的**返回形状**对。它证明不了 CLI 收到那个形状后真的会拦——那一层只在 2026-08-24 用活探针验过一次：可达工具从 25 个降到 6 个、直接要求执行 shell 被拒、诱导读 `.env.local` 的注入被拒。**SDK 换一次 hook 语义或拒绝形状的键名，自测照样全绿而闸门已经死了**——和 `can_use_tool` 被 `bypassPermissions` 架空是同一种失效。要补就得像 `--ask` 那样烧一次真调用，断言 init 消息里的可达工具集合 |
@@ -772,7 +884,7 @@ reconcile 家族 8 个用例共用同一条基线命令，基线结果按命令�
 | **「`budget.py` 声明的规模 ⟷ 生成器实际产出」没有任何断言** | `budget.BASE` 是唯一声明每张表规模与缩放类的地方，但没有一条检查把它和 `main.py` 真正写出来的行数对起来。这不是假设，是已经栽过一次又剩了四次的实例：`products` 声明 SUB（4,133）而整类没有 builder、被 `data/csv` 的 200 行盖掉，差 20 倍全绿；修完之后 `ad_campaigns` / `ad_creatives` / `campaigns` / `coupons` 四张仍是同一状态（声明 1,033 / 2,976 / 1,033 / 3,100，实际透传 v1 的 50 / 144 / 50 / 150）。**这一栏的危险性全在重灌那一刻**：现在库里是 v1 规模，声明与产出的差距看不出后果；一灌全量，转化侧 ×427 而广告/券/活动侧不动，`user_coupons` 会变成 970 万行核销只指向 150 张券（每张券发出约 6.5 万次，v1 是 151 次）、`user_attributions` 14.9 万条归因只指向 50 个活动。判据是现成的、也很便宜——`main.py` 写完每张表后拿 `budget.table_rows(scale)` 对一遍行数，声明与产出不等就炸；透传那 12 张要么改成 FIXED（承认它们不缩放），要么给它们写 builder。**刻意先记下来不动**：改 `budget.BASE` 的类别会移动全量产出的每一个数，属于下一批 |
 | **计数器与「本该解释它」的那一列零相关（`verify_correlation.py` 只盖了画像 ⟷ 消费这一对）** | D-01 补的 `verify_correlation.py` 建立了「两列之间该有效应量」这类判据，但它的判据面只有**画像属性 ⟷ 消费金额**。同一形态在别处仍然零覆盖，2026-08-28 在全量产出（`/tmp/genFULL_csv`）上量到两处，都记在这里而**没修**：①**帖子的传播量与它的曝光时长无关**——36.16 万条已发布帖子，曝光天数 0–91 天，`corr(曝光天数, like_count) = +0.0035`，`view_count +0.0034`、`share_count +0.0016`、`comment_count −0.0009`；按曝光时长四分档看平均赞数是 41.4 / 42.0 / 42.6 / 42.5，**一根平线**。真实社区里累计计数是随暴露时间单调累积的，所以"昨天发的"和"三个月前发的"在这份数据里点赞数同分布；②**`product_tags` 的标签与商品的销售表现无关**——4,133 个 SKU、按 `tag_name` 分组看「该组平均 `sold_count` / 全体平均」，全部落在 **0.88×–1.11×**（每组 n≈390，这个跨度就是噪声）；反方向也一样，销量前 10% 的 SKU 平均带 **0.650** 个 `promotion` 标签、后 10% 带 **0.645**（1.01×），`corr(sold_count, promotion 标签数) = −0.0080`、`corr(sold_count, 标签总数) = −0.0117`。也就是说「限时特惠/满减 到底带不带得动销量」这个问题在这份数据上恒为"没区别"。两处的共同点和 `unit_price` 那条一样：**每一列单看都合法、每一张表单看都自洽，坏的是两列之间该有的那个方向**，而现有的每一层——闭环自测（查的是恒等式）、`verify_behavior`（查的是单列分布形状）、`verify_correlation`（只有画像 ⟷ 消费）——都不查它。要补得把「A 与 B 之间该有 ρ ≥ x」抽成一张可声明的表（像 `profiles.yaml` 的 `judge:` 那样），而不是再逐条手写判据 |
 | **agent 的判断质量** | L7 的 27 题只覆盖有金标的数值题。洞察/归因的措辞、分层选择（何时该走治理层）靠人读 `report.md` |
-| **扫描字节 / 成本** | `run_query` 已经返回 `bytes_scanned`，但没有任何阈值断言，UI 也不显示它。一道题从 0 字节变成扫全表不会有人发现 |
+| **扫描字节 / 成本** | `run_query` 返回 `bytes_scanned`，**唯一的消费者是模型自己**：`run_sql` 的工具描述说明了这个字段是成本读数，系统提示词的「查询成本」一节要求它据此收窄窗口和列。那是软约束，不是断言——没有任何阈值检查，UI 也不显示它，所以一道题从 0 字节变成扫全表不会有人发现。真正的硬护栏只有工作组的 `BytesScannedCutoffPerQuery`（`scripts/lakehouse/setup.py`），它拦的是单条查询的上限，不是"这道题比上周贵了 10 倍" |
 | **前端探针预算的真实上界** | L6 那条断言量的是**本机**冷启动延迟（≥ 2× 才算过），它证明不了别人机器/别的网络上不会更慢。`boot_test.mjs` 也只验行为（慢探针要能上线、探不通才降级），不验"多慢算慢"。真正的兜底不再是那个数字，而是**降级可逆**：重试 3 发 + 降级后退避重探 + 标签页可见时重探 + 提问前重探，外加降级时页面明确带上声明。所以「这台机器/这条网络就是更慢」最坏只是**晚几秒**上线，而不是这一页永久离线。剩下的真缺口是「网络烂到 `/health` 长期不通」——那时页面只能、也应该显示离线演示模式 |
 | **`web/index.html` 里展示用的 SQL 字符串** | 那是给观众看的文本，不进数据库，方言错了没有任何东西会红。人工核对 |
 | **v1 本地 Postgres 分支** | `db.py` 的 postgres 路径、`docker-compose.cloud.yml`、顶层 `database/*.sql` **刻意不覆盖**，边界见 [legacy.md](legacy.md) |
@@ -834,7 +946,46 @@ reconcile 家族 8 个用例共用同一条基线命令，基线结果按命令�
 | `analyticsagent/` 的其余部分（`main.py` 暖客户端 / `knowledge_store.py` / `runtime_config.py` 的硬失败 / `Dockerfile` / `agentcore.json`） | **无自动化覆盖**。2026-08-20 已部署并人工复验过 `README.md` 里那三条，但每次改动都得重新手跑一遍 |
 | `docs/**` | **无覆盖**，人工评审 |
 
-## 最近一次实测（2026-08-28 下半天，退化列体检 + 隐形声明那一批）
+## 最近一次实测（2026-09-17，把「4 盏红灯」逐条归因到机制并验证修法）
+
+这一轮**没动数据、没动云上资源、没动 prompt**，做的是一件纯核对的事：把
+`bash scripts/test_all.sh` 在本仓库开发账号上那个 **通过 50 · 失败 4** 拆开，逐条量出机制，
+并证明修法存在、已实现、真能变绿。起因是我先前把这四条写成了「只能给出原因、没办法修复」
+——那个判断是错的。
+
+四条的共同点：**比的两端不是同一批数据**。本分支交付 `data/csv/` 种子（189,707 行），湖里是
+8000 万行那批（scale 427.07 / seed 42，2026-08-31 从 `~/analytics-agent-data/genFULL_csv` 灌入）。
+所以修法的落点不在本分支，而在栈里做重灌的那一支 `feat/data-reload-80m`（PR #15，`9be4a39`）。
+验法：`git worktree add /tmp/wt15`，拿那一支的检查器对**同一个湖**跑，四条全绿。
+
+| 红灯 | 机制（实测） | 修在哪 | 该支上的实测输出 |
+|---|---|---|---|
+| L2 枚举一致 | 只有一列：`sessions.utm_campaign`。卡片（`knowledge/domains/behavior/sessions.md`）写的是 v1 的 6 个占位值并带「实测行数 745/732/708/702/695/679」，湖里是生成器 `tables.py::CAMPAIGNS` 的 **39 个**真活动名（各 ~4.6–4.7 万行）+ 315,925 NULL | #15 重生卡片：39 个活动名，并**删掉实测行数那一列**——那一列本身就是一个会过期而且过期时是绿的声明 | `枚举一致 ✅  4 列取值与卡片相符`；`sessions.utm_campaign 39 种取值 +315925 NULL` |
+| L2 退化列登记 | **38** 条清单过期：13 条 `RELOAD_PENDING` 已被重灌兑现（`users.created_at` / `posts.like_count` / `payments.refund_amount` …）、24 条 `ALL_NULL_PINNED` 现在有值（`page_views.page_url` 12,895,806 个非空、`user_coupons.coupon_code` 9,709,436、`events.ip_address` 8,541,400）、1 条 `DIMS_PASSTHROUGH` 不再是常量（`channel_daily_costs.created_at`）。**这是设计意图**：清除条件一旦兑现也判 FAIL，否则清单会变成"写上就永远绿" | #15：`RELOAD_PENDING` 清空、`DIMS_PASSTHROUGH` 收到 15 列 / 11 张表（`channel_daily_costs` 移出——它其实是生成表，2,799 行）、新增第四本 `BY_DESIGN_CONST`、数组列纳入普查 | `退化列全部登记在册 ✅  427 个标量列基数正常 + 6 个数组列有真元素，0 待重灌 + 15 透传遗留 + 2 刻意常量 + 24 整列 NULL + 0 整列空数组 已登记` |
+| L3 装载完整 | 比 `data/csv/` ⟷ Athena，两端差 427 倍（`order_items` 4,225 ⟷ 1,804,371） | #15 的 `verify_load.py`：`CSV_DIR` 环境覆盖 + `_resolve_csv_dir()` 从装载快照 `data/loaded_row_counts.json` 的 `source` 反推该跟谁对账，源目录不在就**大声失败**、明说"不会退回 `data/csv` 去比" | `装载完整 ✅  3 张表的行数、数值求和、时间边界、布尔计数全等`（`-t users -t orders -t order_items`） |
+| L5 退款 clamp | 这条钉的是**数据前提**而不是代码：「退款全量 ≠ 轴内」要有区分力，前提是存在越过 `as_of_date` 的退款。重灌后**轴外 0 条**（全量 9,897,495.82 == 轴内 9,897,495.82），钉子随之红——**是缺陷自己消失了**，clamp 没坏（`clamp_to_anchor` 本来就是 per-metric 声明的，`refund_amount` 上刻意为 False） | #15 把断言换到机制层：钉**编译出来的 SQL 里有没有 clamp 谓词**（与数据规模无关），数值比对降级成一条 ⚠️「这批数据里没有越过 as_of_date 的 refund_amount，数值比对无区分力」 | `✅ 编译 SQL 里 clamp 谓词不在  refund_amount` + 那条 ⚠️；整层 `14 条恒等式 + 2 条缺陷锚点 + 5 条指标层语义钉子全部成立 ✅` |
+
+**本批唯一改在本分支的代码，也是这轮真正的教训**：`test_all.sh` 的 `grep_run()` 失败时只印
+`tail -20`，而 L2 那份失败清单是 **38 行**——于是日志上只露出后 18 条，**被截断和"就这么多"
+在报告上长得一模一样**。我按 18 条估了问题规模，把 13 条 `RELOAD_PENDING` + 1 条
+`DIMS_PASSTHROUGH` 整个漏掉，还差点据此把 `channel_daily_costs` 从 `dims_to_parquet.DIMS` 里
+删掉（方向正好反了：它是生成表）。改法是截断时多印一行「上面还截掉了 N 行」并给出复跑命令。
+**这条缺陷与本套件反复点名的那一类同形**：不是给出错的答案，是让人读不出自己看的是残片。
+L0 复跑 **33 / 0 ✅**。
+
+**在 #15 上顺带发现两处，记在这里，不在本分支修：**
+
+1. `_resolve_csv_dir()` 在装载快照**缺失**时返回 `None`，然后静默退回 `data/csv`。快照是
+   gitignored 的，所以一个新克隆的仓库会拿 8000 万行的湖去比 189,707 行的种子，印出的正是
+   这个函数写来防的那条红灯（第一次在 `/tmp/wt15` 里跑就撞上了，把快照拷进去才对得上）。
+   快照缺失应当是**硬失败**，与"源目录不在"同一档。
+2. `scripts/gen/selftest_closures.py` 的 `ENUM_SUPERSET_OK["sessions.utm_campaign"]` 豁免在
+   #15 重生卡片之后已经**打不中**（自测原话：`刻意超集豁免 1 列：未命中`）。它自己写的清除
+   条件是"全量重灌 + 重生卡片"，两件都已发生，按本库的规矩该删。留着它等于给这一列留了一道
+   会吞掉第 40 个活动名的静默豁免——`enum-superset-exemption-void` 那个负测守的是"豁免被滥用
+   到别的列"，守不到"豁免已经失效"。
+
+## 上一批实测（2026-08-28 下半天，退化列体检 + 隐形声明那一批）
 
 这一轮**没动数据、没动云上资源、没动 prompt**，加的是一层新判据和两处已有判据的补洞。
 起因是上一轮末尾欠着的两条尾巴，查下去发现它们不是两个孤立缺陷，而是**同一个类**的
@@ -958,7 +1109,7 @@ reconcile 家族 8 个用例共用同一条基线命令，基线结果按命令�
 | L0 | 18 项；生成器那 2 项因本机没装 numpy 记 note（不算 PASS 也不算 FAIL）。比上一轮多的那一项是工具白名单边界自测（`backend/agent.py --selftest`） |
 | L6 | 探针相关断言实测：`/health` 首次响应 **2012ms**（单发预算 8000ms；这个数现在由本地常量 `_PING_WAIT_S`/`_INFO_WAIT_S` 定上限，不再由 Athena 决定——见下面那次回归）、数据层预热 **5s**（前端等 `warming` 的窗口 ≈45s；这个数由 Athena 决定，同机器实测 5s～13.5s 都出现过）、`dataLayer` 三态在位 |
 | L3 | 抽查 3 张表；`--full` 35 张亦通过 |
-| L4 | 三条断言**全部在云上跑通**：`--selftest` 离线过、`--verify` 以 agent 角色实测 16 条探针、`--verify-backend` 确认后端用的是受限凭证（`/health` 的 `identity` 就是治理角色） |
+| L4 | 三条断言**全部在云上跑通**：`--selftest` 离线过、`--verify` 以 agent 角色实测 18 条探针（assume 完先 `get_caller_identity()` 确认身份，否则 AssumeRole 被拒时负向探针会假绿）、`--verify-backend` 确认后端用的是受限凭证（`/health` 的 `identity` 就是治理角色） |
 | L7 | **27/27**（2026-08-24，工具闸门改成 `PreToolUse` hook 之后重跑），模型 `global.anthropic.claude-opus-4-8`，均 51.9s/题、均读文档 2.4 次、均 SQL 0.8 条（`eval/report.md`；基线归档在 `eval/baseline/eval.lakehouse-athena.post-funnel-retention-fix.md`+`.json`，那是 2026-08-23 那轮）。**同日前一轮是 26/27**，唯一失败的 `L3-channel-cost-total` 是模型跑完 SQL 后**没调 `present_result`**（`has_result=false`，`agent_errors` 为空），不是口径或 SQL 错。闸门被排除在成因之外靠的是实测而不是推理：给 hook 加上日志连跑三轮，闸门只见到那 6 个白名单工具、**拒绝 0 次**；该题此后连过 5 次。判据留着不放松——`run_eval.py` 只在"一条 SQL 都没发"时重试（瞬时 infra 的签名），少了 `present_result` 不重试，因为那也可能是真回归 |**这是漏斗与留存口径修完后的第一次全量**：`L4-funnel` 的判定理由从「命中 golden[all-time distinct users]」变成「命中 golden[all-time **subset funnel**]」——上一轮的 26/26（`post-anchor-fix.*`，保留为历史）通过率一样，但判的是错口径的金标，**两轮之间的差别不在通过率**。新增 `L5-retention-cohort`（判分模式 `retention`）实测理由是「结论已声明数据限制；命中 golden[weekly matrix pct] 16/16 个数值」。其余 25 题状态与理由未变；读文档次数有几处运行间抖动（`L1-dau-latest` 3 → 0 等），**不是判定依据** |
 | L6+ | `/ask` 流式契约通过（`--ask`）：过期 `session_id` 不再打死整轮，收到 `stage/resume` + 新 UUID + 带 KPI 的 `result` |
 | L8 | **38/38**（24 个离线 + 14 个连云，含两个工具白名单用例 `tool-gate-shadowed` / `tool-gate-toolsearch-locked`，三个 `gov-*`、`cloud-copy-drift`、`doc-row-total-drift`，四个探针用例 `probe-budget-too-tight` / `probe-warming-treated-as-dead` / `probe-degrade-is-permanent` / `probe-baked-answer-while-backend-alive`，两个 `shell-*` 静态资源用例，四个漏斗用例 `funnel-shape-gate-gone` / `funnel-golden-subset-gone` / `kb-funnel-subset-gone` / `kb-funnel-route-gone`，以及四个留存用例 `kb-retention-cohort-column` / `kb-retention-numerator-unbounded` / `kb-retention-verdict-gone` / `retention-verdict-gate-gone`）。其中 `gov-backend-not-assuming` 在整套连跑时红过一次，原因是本机 AWS 凭证跑到一半过期（报的是凭证获取失败，不是那个缺陷的消息）——**负测要求消息匹配，所以它没被算成通过**，刷新凭证后单跑该用例 PASS |

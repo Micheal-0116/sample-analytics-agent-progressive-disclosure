@@ -6,9 +6,12 @@
 > （`database/0[1-8]_*.sql` = 声明态唯一真源，进 git、走评审）。改表结构改这里。
 >
 > 差别只在**方言和运行时**：现行形态是 S3 Tables（Apache Iceberg）+ Amazon Athena，
-> Glue Data Catalog 里 48 张表、约 22 万行（其中 35 张原始表约 19 万行），查询用
-> **Trino 方言**，本文和顶层 `*.sql` 里的 `::` 强转、`interval '30 days'` 那类写法
-> 在 Athena 上不合法。数据规模与 v1 一致（湖仓装载的就是 `data/csv/` 那批种子数据）。
+> Glue Data Catalog 里 48 张表，查询用 **Trino 方言**，本文和顶层 `*.sql` 里的 `::` 强转、
+> `interval '30 days'` 那类写法在 Athena 上不合法。
+>
+> **行数不写在这里**：`data/csv/` 种子灌完是约 22 万行（35 张原始表约 19 万行），但某个账号
+> 的湖里此刻装的是哪一批要单独确认——本仓库开发账号 2026-09-17 实测已经是 8000 万行那一批。
+> 表结构两者相同，这份文档说的是**结构**。规模见 [deployment.md](../docs/deployment.md#数据说明)。
 >
 > 另：v2 的 Redshift 形态（`database/redshift/`，含 GRANT + 动态脱敏的治理层）已随
 > Redshift 整体退役，留作记录；**数据层治理尚未在湖仓上重新实现**。

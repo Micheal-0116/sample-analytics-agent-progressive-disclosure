@@ -29,7 +29,7 @@ v1 的数据在本地/Aurora PostgreSQL(35 张表、约 19 万行),元数据是�
 - **评测基线**:27 条金标用例在 Athena 上 **27/27** 全过(`eval/`,2026-08-23,漏斗与留存口径修完后的第一次全量);金标 SQL 保持 Postgres 方言,运行时改写(`scripts/gen/pg_to_trino.py`)。
 - **这次搬迁的两笔代价,明说**:(1) SQL 方言换成了 **Trino**,`::` 强转、`date + 7`、`DISTINCT ON`、`interval '30 days'` 全都不合法——系统提示、指标 SQL、知识库示例都跟着改写成了 `interval '30' day`;(2) **治理层换了原语**:Redshift 的动态脱敏(列在、值变成掩码)在 Lake Formation 里没有等价物,落成了**列级排除**(那几列干脆不在授权面里),见[安全](#安全)。
 
-v3 目前**没有**的东西:8000 万行的生成器路径(`scripts/gen/` → Parquet → COPY),以及**值级掩码**——Lake Formation 没有这个原语,那是 Redshift 的能力。湖仓装载的是仓库里提交的 CSV 种子数据(原始表约 19 万行),脚本是 `scripts/lakehouse/load.py`。v2 的设计与踩坑归档在 [docs/architecture-v2-redshift-glue.md](docs/architecture-v2-redshift-glue.md);v1 的 PostgreSQL 路径(本地容器)还能跑,但已是 **legacy——保留、不再维护**,边界见 [docs/legacy.md](docs/legacy.md)。
+v3 目前**没有**的东西:8000 万行的生成器路径(`scripts/gen/` → Parquet → COPY),以及**值级掩码**——Lake Formation 没有这个原语,那是 Redshift 的能力。`scripts/lakehouse/load.py` 灌的是仓库里提交的 CSV 种子数据(原始表约 19 万行)。**这句说的是仓库里有什么,不是某个湖此刻装了什么**——本仓库开发账号的湖后来被重灌成了 8000 万行,而 `load.py` 会覆盖它,所以重新灌数前先核一下行数,见 [docs/deployment.md](docs/deployment.md#数据说明)。v2 的设计与踩坑归档在 [docs/architecture-v2-redshift-glue.md](docs/architecture-v2-redshift-glue.md);v1 的 PostgreSQL 路径(本地容器)还能跑,但已是 **legacy——保留、不再维护**,边界见 [docs/legacy.md](docs/legacy.md)。
 
 ## 它长什么样
 
@@ -90,7 +90,7 @@ v3 目前**没有**的东西:8000 万行的生成器路径(`scripts/gen/` → Pa
 
 - **AWS 账号 + 已开通 Amazon Bedrock 模型访问**:在 Bedrock 控制台为你的 Region 申请所用模型(默认 Claude Opus 4.8)的访问权限。本项目通过跨区推理 profile(`global.anthropic.claude-opus-4-8`)调用。
 - **AWS 凭证**:走标准链(`~/.aws`、环境变量或 EC2 实例角色)。默认后端(`athena`)对 Athena 和 Glue 用 IAM 认证,本机不落数据库密码。
-- **一个灌好数据、已联邦进 Glue 的 S3 表桶,外加一个 Athena workgroup**:DDL 在 `database/iceberg/`,一次性建桶与装载在 `scripts/lakehouse/`(`setup.py` 建表桶 `analytics-agent-tables`、namespace `app_analytics` 和 workgroup `analytics-agent-wg`;`load.py` 灌 CSV)。Athena 按扫描字节计费,没有"空转"成本——但 workgroup 的查询结果位置是一个普通 S3 桶,拆资源时别忘了它。
+- **一个灌好数据、已联邦进 Glue 的 S3 表桶,外加一个 Athena workgroup**:DDL 在 `database/iceberg/`,一次性建桶与装载在 `scripts/lakehouse/`(`setup.py` 建表桶 `analytics-agent-tables`、namespace `app_analytics` 和**两个** workgroup——管理侧 `analytics-agent-wg` 与 agent 最小权限角色专用的 `analytics-agent-ro-wg`;`load.py` 灌 CSV)。两个刻意分开:workgroup 的 `OutputLocation` 决定**明文结果 CSV** 落在哪个 S3 前缀,共用一个的话 agent 角色能从管理侧的结果文件里读回 Lake Formation 已排除的列。Athena 按扫描字节计费,没有"空转"成本——但查询结果位置是一个普通 S3 桶,拆资源时别忘了它。
 - **Python 3.11**:后端运行。
 - **Node.js 20+ 与 Claude Code CLI**:`npm install -g @anthropic-ai/claude-code`。Claude Agent SDK 会把 `claude` CLI 作为子进程拉起,必须在 `PATH` 上。(Docker 镜像已内置;本地 `run.sh` 路径需你自己装。)
 - *(仅 v1 legacy 路径)* **Docker + Docker Compose** 或 **PostgreSQL 16**:本地容器库(`DB_BACKEND=postgres`,见 [docs/legacy.md](docs/legacy.md))。
@@ -224,7 +224,7 @@ sample-analytics-agent-progressive-disclosure/
 
 ## 清理
 
-默认路径连的是你自己建的 AWS 资源,用完请拆除:删 **S3 表桶**(`analytics-agent-tables`,Iceberg 表随桶一起删)、指向它的 **Glue 联邦目录条目**、**Athena workgroup**(`analytics-agent-wg`)以及它的**查询结果暂存桶**,治理层的 **IAM 角色**(`analytics-agent-ro`)和发给它的 **Lake Formation 授权**。Athena 没有空转成本(按扫描字节计费),所以这里会持续产生费用的是 S3 存储,不是计算。**云上 Web 部署**还要额外拆:Fargate 中继 + ALB、Cognito 用户池、站点 S3 桶,并 disable + delete CloudFront 分发。
+默认路径连的是你自己建的 AWS 资源,用完请拆除:删 **S3 表桶**(`analytics-agent-tables`,Iceberg 表随桶一起删)、指向它的 **Glue 联邦目录条目**、**两个 Athena workgroup**(`analytics-agent-wg` 和 `analytics-agent-ro-wg`)以及它们的**查询结果暂存桶**(`athena-staging/`,连下面的 `agent/` 子前缀一起),治理层的 **IAM 角色**(`analytics-agent-ro`)和发给它的 **Lake Formation 授权**。Athena 没有空转成本(按扫描字节计费),所以这里会持续产生费用的是 S3 存储,不是计算。**云上 Web 部署**还要额外拆:Fargate 中继 + ALB、Cognito 用户池、站点 S3 桶,并 disable + delete CloudFront 分发。
 
 跑过 `agentcore deploy` 的话还有一套:`AgentCore-analyticsagent-default` 栈、`analytics-agent/runtime` secret、`analytics-agent-knowledge` 桶(**开了版本控制,要删掉所有版本才删得动桶**)、exec role 上的 `lakehouse-runtime-access` 内联策略,以及 `analytics-agent-ro` 信任策略里加进去的 exec role principal(**改它,别整份覆盖——你自己的开发者 principal 也在里面**)。CDK bootstrap 那套(`CDKToolkit` 栈、assets 桶、container-assets ECR、5 个角色)是**账号级共享的**,账号里还有别的 CDK 项目就别删。步骤见 [docs/deployment.md](docs/deployment.md)。
 

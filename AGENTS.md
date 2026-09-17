@@ -54,6 +54,11 @@
 - `backend/.venv/bin/python backend/test_agent.py "最近 7 天每天的 DAU 是多少？"`
   runs a minimal agent smoke question.
 - `bash scripts/test_all.sh` runs the full local test suite (L0–L6).
+- `bash scripts/test_all.sh --l0` runs only L0 — no AWS calls, no credentials, and it
+  exits 0 when L0 is green (the full run exits 1 at the AWS-identity gate without
+  credentials, so its exit code cannot express "L0 passed"). This is what CI runs
+  (`.github/workflows/offline.yml`: `--l0` + `negative_tests.py --offline` + the CDK
+  policy assertions). CI covers **nothing** above L0 — see `docs/test-plan.md`.
 - `bash scripts/test_all.sh --l8` appends the fault-injection negative tests
   (`scripts/negative_tests.py`, 43 cases): it temporarily edits repo files and restores
   them with a sha256 check. Layer meanings and the gaps with **no** automated coverage

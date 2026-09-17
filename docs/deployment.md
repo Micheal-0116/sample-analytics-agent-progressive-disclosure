@@ -51,6 +51,8 @@ python3 scripts/lakehouse/setup.py             # 建表桶 + namespace + workgro
 python3 scripts/lakehouse/gen_ddl.py --check   # 声明态是否跟真源一致
 python3 scripts/lakehouse/athena.py --file database/iceberg/01_tables.sql   # 48 张表
 python3 scripts/lakehouse/load.py              # data/csv/ → Iceberg,35 张基表灌数
+                                               # ⚠️ 只在**空湖**上这么跑。已有数据的湖先看
+                                               #    下面「数据说明」的「重新灌数前先确认」
 python3 scripts/lakehouse/athena.py --file database/iceberg/02_mart.sql     # 派生/集市层
 
 python3 scripts/lakehouse/verify_load.py       # CSV 真源 ⟷ Athena 现查,逐表比行数/求和
@@ -80,8 +82,11 @@ LF 授权只发不撤(LF 权限可叠加,所以多出来的宽授权由 `--verif
 `reconcile.py` 的 `--catalog` 默认读 `GLUE_CATALOG_ID`,那个写法**要带账号前缀**
 (`<账号>:s3tablescatalog/<表桶>`),跟 Athena 用的 `s3tablescatalog/<表桶>` 不是一回事,
 见 [knowledge/connection.md](../knowledge/connection.md)。
-云资源名默认 `analytics-agent-tables`(表桶)/ `analytics-agent-wg`(workgroup),
-要改名复制 `.env.local.example` 成 `.env.local` 覆盖。
+云资源名默认 `analytics-agent-tables`(表桶)/ `analytics-agent-wg`(管理侧 workgroup)
+/ `analytics-agent-ro-wg`(agent 专用 workgroup,结果落 `athena-staging/agent/` 子前缀),
+要改名复制 `.env.local.example` 成 `.env.local` 覆盖。**两个 workgroup 不能合成一个**:
+查询结果 CSV 是明文行数据,共用结果前缀等于让最小权限角色从管理侧的结果文件里
+读回 Lake Formation 已经排除掉的列(`scripts/lakehouse/athena.py` 里写了完整理由)。
 
 ### AgentCore 部署产生的资源(路径 D)
 
@@ -102,11 +107,26 @@ aws secretsmanager create-secret --name analytics-agent/runtime --secret-string 
 # 2. 知识树上传(镜像里没有,冷启动从 S3 拉)
 aws s3 sync knowledge/ s3://<知识桶>/knowledge/ --exclude "*" --include "*.md"
 
-# 3. exec role 的内联策略:读 secret + 读知识桶 + sts:AssumeRole 治理角色。
-#    **刻意不给 athena/glue/s3tables** —— 让 AssumeRole 成为拿到数据的唯一路径,
-#    治理层就不是"可选项"而是入口。exec role 自己零数据面权限。
-#    还要把 exec role 加进 analytics-agent-ro 的信任策略(别覆盖掉原有的开发者 principal)。
+# 3. 把 exec role 加进治理角色 analytics-agent-ro 的**信任策略**。
+#    这一步没法在 CDK 里做:被信任方(exec role)是这个栈建的,而信任策略长在
+#    另一个角色上、由 scripts/lakehouse/governance.py 管——那个脚本先跑。
+#    栈的 GovernanceRoleArnOutput 输出的就是要改的那个角色的 ARN。
+#    `governance.py --apply` 是 merge 语义:它把 exec role 并进去,不覆盖原有的
+#    开发者 principal(本地跑 backend/run.sh 靠的就是那一条)。
 ```
+
+exec role 的**内联策略**不在这张手工清单里了 —— 它是
+[`analyticsagent/agentcore/cdk/lib/cdk-stack.ts`](../analyticsagent/agentcore/cdk/lib/cdk-stack.ts)
+的 `wireExecutionRole()`,`agentcore deploy` 一起发。四条 Allow(读 secret、
+`ListBucket` 按 `knowledge/` 前缀限、读知识树、`sts:AssumeRole` 治理角色)加**一条显式
+Deny**(`athena:*` / `glue:*` / `s3tables:*` / `lakeformation:*`)。原来这三行字就是全部
+真源:角色由 `agentcore deploy` 建出来、权限靠人手 `put-role-policy` 补,于是换个干净
+账号重来一次,得到的是一个「起得来、答不出数」的 Runtime,而且没有任何一处断言过这份
+策略长什么样。那条 Deny 才是重点:「exec role 零数据面权限」只在没人加过权限时成立,
+而加一条(一个 managed policy、一次调试留下的授权)是很像样的一步。显式 Deny 压得住
+后来的任何 Allow,`AGENT_ROLE_ARN` 因此一直是拿到数据的唯一路径;它**不**限制 agent
+查数——assume 出来的会话是另一个 principal,策略另算。断言在
+`analyticsagent/agentcore/cdk/test/cdk.test.ts`(`npx jest`)。
 
 ⚠️ **exec role 是部署之后才存在的**,所以先起来的那批容器拿不到 secret。补完 IAM
 **旧容器不会自愈**(module 级配置一个容器只跑一次),得让它们换代——重新
@@ -236,9 +256,10 @@ SSM 版本参数)**是账号级共享的**,这个账号还有别的 CDK 项目�
 **湖仓那条**:撤治理层授权(`aws lakeformation revoke-permissions`,principal 是
 `arn:aws:iam::<账号>:role/analytics-agent-ro`;`governance.py --verify` 会列出当前有哪些)
 → 删那个 IAM 角色(先 `delete-role-policy --policy-name lakehouse-read` 再 `delete-role`)
-→ 删 S3 Tables 表桶 `analytics-agent-tables`(先删表再删 namespace 再删桶)→ 删 Athena
-workgroup `analytics-agent-wg` → 清空并删 Athena 查询结果暂存桶 → 撤掉 Lake Formation
-里给本账号加的授权。**没有 Redshift workgroup 要拆**(v2 遗留说法,已不适用)。
+→ 删 S3 Tables 表桶 `analytics-agent-tables`(先删表再删 namespace 再删桶)→ 删**两个**
+Athena workgroup(`analytics-agent-wg` 和 `analytics-agent-ro-wg`;只删一个的话另一个
+会连着它的结果前缀一直留在账号里)→ 清空并删 Athena 查询结果暂存桶(`athena-staging/`
+连它下面的 `agent/` 子前缀一起)→ 撤掉 Lake Formation 里给本账号加的授权。**没有 Redshift workgroup 要拆**(v2 遗留说法,已不适用)。
 
 删角色前先把后端的 `AGENT_ROLE_ARN` 清掉,否则它启动时 AssumeRole 失败会直接报错
 (那是刻意的:配了却 assume 不到,静默退回 admin 凭证比报错危险得多)。
@@ -346,13 +367,49 @@ terminate EC2 → 删 SG → 删 instance-profile / role → 删 Cognito 用户�
   `(SELECT max(as_of_date) FROM meta_snapshot)` 为锚点,**别用 `current_date`/`now()`**,
   也**别用各表自己的 `max(dt)`**(`fin_daily_revenue` 到 2026-02-02,
   `channel_daily_costs`/`mart_channel_daily` 到 2026-09-01,按各自 max 取窗口会互相错位)。
-- **规模(现行 / 湖仓)**:Glue 目录 **48 张表、约 22 万行**(35 张基表 189,672 +
-  8 张派生 27,982 + 4 张集市 2,432 + 1 张 meta)。数据源是仓库里的 `data/csv/`。
-- **重新灌数**:改完 `data/csv/` 后 `python3 scripts/lakehouse/load.py`,再
-  `verify_load.py` 对账。`scripts/gen/main.py --target-rows 80000000` 那条 8000 万行的
-  生成路径是 v2 留下的,**尚未接到湖仓装载链路上**,当前部署跑的不是它。
-- **这是种子数据,不是真实规模**:25 种事件、15 个页面、6 种流量来源的分布几乎完全均匀,
-  漏斗算不出衰减、热门榜排的是噪声。统计形状不可外推——细节见
+- **规模(仓库交付的那一份)**:`data/csv/` 是 `scripts/gen/main.py --scale 1` 的小样,
+  灌完是 Glue 目录 **48 张表、约 22 万行**(35 张基表 189,672 + 8 张派生 27,982 +
+  4 张集市 2,432 + 1 张 meta)。照上面「建湖仓数据层」从空湖跑一遍,得到的就是这一份。
+- **⚠️ 湖里当前装的是哪一批,和上面这个数字不是一回事**。这两件事必须分开读:前者是
+  仓库里有什么,后者是某个 AWS 账号的湖此刻有什么,后者会在文档底下被人改掉。
+  **本仓库开发账号 2026-09-17 实测**:湖里是 **8000 万行**那一批(`scale≈427`),不是种子:
+
+  | 表 | 湖里现查 | `data/csv/` 种子 | 倍数 |
+  |---|---|---|---|
+  | `page_views` | 12,895,806 | 30,196 | 427× |
+  | `user_coupons` | 9,709,436 | 22,735 | 427× |
+  | `events` | 8,541,400 | 20,000 | 427× |
+  | `order_items` | 1,804,371 | 4,225 | 427× |
+  | `orders` | 854,140 | 2,000 | 427× |
+  | `users` | 213,535 | 500 | 427× |
+  | `products` | 4,133 | 200 | 20.7×(按 `budget.py` 声明生成) |
+  | `coupons` / `ad_campaigns` | 150 / 50 | 150 / 50 | 1×(透传,**没随规模走**) |
+
+  它是 `scripts/gen/main.py --target-rows 80000000` 出 parquet、再由
+  `scripts/lakehouse/load_parquet.py` 灌进去的 —— **不是** `load.py` 从 `data/csv/` 灌的。
+  那两个脚本随「数据层重灌至 8000 万行」那一批(分支 `feat/data-reload-80m`)进来,
+  **不在本分支上**,所以在本分支的代码里找不到能产出这个规模的路径,这不是矛盾。
+- **⚠️ 重新灌数前先确认湖里是哪一批**。`load.py` 的幂等是**逐表 `DELETE FROM` 再
+  `INSERT`**,幂等的前提是两次灌的是同一份源。在一个已经装了 8000 万行的湖上跑它,
+  等于拿 2,000 单订单**覆盖掉** 854,140 单,而且它会正常退出、`verify_load.py` 随后
+  还会全绿(它比的就是 `data/csv/` ⟷ Athena)。判据是一条命令:
+
+  ```bash
+  AWS_REGION=us-west-2 backend/.venv/bin/python -c "
+  import sys; sys.path.insert(0, 'scripts/lakehouse')
+  from athena import Client
+  print(Client().execute('SELECT count(*) FROM orders')['rows'])"
+  # 2,000 → 种子;854,140 → 8000 万那批,别跑 load.py
+  ```
+
+  确认是种子之后,改完 `data/csv/` 再 `python3 scripts/lakehouse/load.py`,并跑
+  **全量** `verify_load.py`(35 张表)对账。
+- **上面那张表本身没有任何检查盯着**:对账层比的是表、列、枚举取值
+  (`reconcile.py` / `verify_enums.py`),**不比文档散文里的行数**。所以这段话过期的时候
+  它是绿的 —— 这正是本仓库反复栽的那个失效模式。看到它就顺手用上面那条命令核一遍。
+- **这不是真实规模,放大到 8000 万也不是**:25 种事件、15 个页面、6 种流量来源的分布
+  几乎完全均匀,漏斗算不出衰减、热门榜排的是噪声。**这些是抽样方式的性质,不随行数变**
+  ——灌到 8000 万只会让噪声的样本变大,形状照旧,统计形状一律不可外推。细节见
   [data-walkthrough.md](data-walkthrough.md) 铁律三。
 
 ## 常见问题
