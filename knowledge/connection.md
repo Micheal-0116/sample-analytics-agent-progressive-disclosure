@@ -94,9 +94,15 @@ Iceberg 的 `count(*)` 是**读元数据**得出的，精确且扫描 0 字节�
 
 **同样禁止拿该表自己的 `max(时间列)` 当今天。** 这条比上一条隐蔽：它不返回空集，
 而是返回一个错的数。`channel_daily_costs` / `mart_channel_daily` 的轴铺到 2026-09-01
-（投放成本铺了近一年），`fin_daily_revenue` 的轴是退款发生日、比下单日晚 9 天。
+（投放成本铺了近一年），最远的 `subscriptions.end_date` 到 2027-01-24。
 用各表自己的 max 当锚点，「最近 30 天渠道 GMV」会算成 0，ROI 跟着变成 0。
-全表的轴对照写在 `metrics/governed_metrics.md`。
+全库 91 个时间列的轴末普查表写在 `metrics/governed_metrics.md` §时间锚点。
+
+> 本文件**面向人**（见 `README.md` 的文档表），agent 运行时不会读它。所以
+> `meta_snapshot` 的列清单和上面这套锚点规则，真源在 agent 读得到的两处：
+> `domains/_index.md`（路由第一步必读）和 `metrics/governed_metrics.md`。
+> 这里是同一套规则的人读副本，改了那边记得对一遍。`reconcile.py` 的 `CARD_EXEMPT`
+> 钉的是 `domains/_index.md`，不是本文件。
 
 ## Trino 与 Postgres 的方言差异（写 SQL 时注意）
 

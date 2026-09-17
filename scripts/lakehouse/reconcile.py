@@ -91,9 +91,15 @@ MART_DDL = ROOT / "database" / "iceberg" / "02_mart.sql"
 # meta_snapshot 存数据集的"今天"锚点，是**全局**关注点而非某个业务域的表——每个带时间的
 # 查询都要用它，塞进 knowledge/domains/<某域>/ 会给出错误的路由信号。
 #
+# 成文位置必须是 **agent 读得到**的那份。原来这里指的是 knowledge/connection.md，
+# 而那个文件在 knowledge/README.md 里明写着「面向人，非 agent 运行时」：于是唯一记着
+# 这张表长什么样的文档，恰好是 agent 永远不会打开的那一个，prompt 却在教它
+# `SELECT max(as_of_date) FROM meta_snapshot`。列清单现在写在总索引
+# knowledge/domains/_index.md（prompt 第 1 步必读）里，豁免跟着指过去。
+#
 # 这不是盲跳过：A 检查会真去读那个文件、确认它确实提到了这张表。豁免本身也要对账，
 # 否则「加进豁免名单」就变成了掩盖问题的后门。
-CARD_EXEMPT = {"meta_snapshot": "knowledge/connection.md"}
+CARD_EXEMPT = {"meta_snapshot": "knowledge/domains/_index.md"}
 
 
 # ---------------------------------------------------------------- 类型归一化

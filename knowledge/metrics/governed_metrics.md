@@ -78,12 +78,23 @@ SELECT sum(refund_amount) AS refund_amount FROM fin_daily_revenue
 ## 时间锚点（通用）
 - 静态样本，数据落在 **2025-10-27 ~ 2026-01-24**。
 - 「最近 / 上周 / 本月」一律以 **`meta_snapshot.as_of_date` = 2026-01-24** 为今天，**禁用 `current_date`/`now()`**。`call_metric` 的时间窗已经统一用这个锚点，所以各指标的「最近 7 天」是同一段日期，可以互相对比。
-- ⚠️ **手写 SQL 时不要用「表自身 `dt` 的 max()」当今天** —— 各表轴末根本不齐，用它会静默给出错数：
-  | 表 | 轴末 | 说明 |
-  |---|---|---|
-  | `orders` / `mart_daily_kpi` | 2026-01-24 | 业务上真正的「今天」 |
-  | `fin_daily_revenue` | 2026-02-02 | 退款轴，尾巴比订单长 9 天 |
-  | `channel_daily_costs` / `mart_channel_daily` | **2026-09-01** | 投放成本铺了近一年，**910 行里 597 行、145 万里 94.6 万落在订单轴之后** |
-  | `dws_channel_weekly` | 2026-08-31 | 同上 |
+- ⚠️ **手写 SQL 时不要用「表自身时间列的 max()」当今天** —— 各表轴末根本不齐，用它会静默给出错数。下面是**全库 91 个日期/时间列的普查**（2026-09-17 实测），只列超出锚点的那些；没列进来的列轴末都 ≤ 2026-01-24：
+  | 表.列 | 轴末 | 超出多少 | 说明 |
+  |---|---|---|---|
+  | `orders.placed_at` / `mart_daily_kpi.dt` / `fin_daily_revenue.dt` | 2026-01-24 | — | 业务上真正的「今天」，即锚点本身 |
+  | `subscriptions.end_date` | **2027-01-24** | +1 年 | 订阅到期日，年费订阅铺到一年后。21354 行、242 个不同取值 |
+  | `ad_campaigns.end_date` | **2026-10-01** | +8 月 | 广告计划结束日 |
+  | `channel_daily_costs.date` / `.created_at` / `mart_channel_daily.dt` | **2026-09-01** | +7 月 | 投放成本铺了近一年：2799 行里 **1980 行**、435 万里 **307 万**落在锚点之后 |
+  | `dws_channel_weekly.week_start` | 2026-08-31 | +7 月 | 同上（周粒度） |
+  | `ad_campaigns.start_date` / `.created_at` | 2026-08-15 | +7 月 | 计划开始日也能排到未来 |
+  | `coupons.end_date` | 2026-04-19 | +3 月 | 券的有效期末 |
+  | `user_coupons.expire_at` | 2026-02-24 | +1 月 | 领券记录的过期时刻 |
+  | `campaigns.end_date` | 2026-02-11 | +18 天 | 营销活动结束日 |
+  | `banners.end_date` | 2026-02-01 | +8 天 | Banner 下线日 |
+  | `user_attributions.install_time` | 2026-01-29 | +5 天 | 归因安装时刻 |
+  | `sessions.start_time`/`end_time`、`user_coupons.received_at`、`push_notifications.delivered_at`/`opened_at` | 2026-01-25 | +1 天 | **只是跨了个零点**：锚点是**日期**，01-24 当天的会话/发券/推送有一部分落在 01-25 凌晨。不是脏数据 |
+  | `user_segments`/`event_definitions`/`ad_campaigns`/`banners`/`campaigns` 的 `updated_at`、`ad_creatives.created_at` | 2026-01-25 | +1 天 | **ETL 落库时刻**，整列同一个值（灌数那一瞬）。这类列不是业务时间，不能拿来切窗口 |
+- 上表里除了「跨零点」和「ETL 落库」两类，其余都是**业务上正常的未来日期**（计划/订阅/券的结束日天然在未来）。它们不是错误，错的是拿它们当「今天」。
+- **绝对日期会随重灌变**（上面这批是 scale 427 那次）。判断一根轴有没有伸出日历，现算 `max(...)` 跟 `(SELECT max(as_of_date) FROM meta_snapshot)` 比，别背日期。
 - 所以**开时间窗必须写上界**：只写 `dt > 锚点 - interval '30' day` 会把成本表里九月的行也捞进来（实测 CAC 从真值 2880 变成 15137，不报错）。正确写法是 `dt > 锚点 - interval '30' day AND dt <= 锚点`。
 - 残周 / 残月不要直接和整周 / 整月比（首尾两段是残的）。
