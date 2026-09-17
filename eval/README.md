@@ -15,10 +15,14 @@ cd backend && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 # 从仓库根目录跑（默认 DB_BACKEND=athena，与 agent 走同一条只读边界）
 ./backend/.venv/bin/python eval/run_eval.py --dry-run   # 先验金标 SQL（不调模型，约 1 分钟）
-./backend/.venv/bin/python eval/run_eval.py             # 全量 26 题（每题 35~75s）
+./backend/.venv/bin/python eval/run_eval.py             # 全量 27 题（每题 35~75s）
 ./backend/.venv/bin/python eval/run_eval.py --level 1 2 # 只跑 L1/L2
 ./backend/.venv/bin/python eval/run_eval.py --case L4-funnel
+./backend/.venv/bin/python eval/run_eval.py --cases eval/cases_traps.json  # 口径陷阱题 3 题
 ```
+
+`--cases` 指哪份用例集（默认 `cases.json`）。第二份是 **`cases_traps.json`**（3 题，见下
+「口径陷阱题」），它的报告写到 `report.traps.md` / `report.traps.json`，不覆盖主用例集的。
 
 产出：`report.md`（通过率汇总 + 逐题明细 + 失败题的 agent SQL）与 `report.json`
 （原始记录，供跨配置横向对比）。`--dry-run` 写的是 **`report.dryrun.json`**，不碰上面
@@ -56,6 +60,7 @@ cd backend && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 | `toplist` | 排行题（Top10 页面、Top5 帖子） | 前 K 名命中率 ≥ `min_hit`（默认 60%，模糊排行题放宽） |
 | `pair` | 两值对比题（有券 vs 无券客单价、周环比） | 两个值都须命中 |
 | `funnel` | 漏斗题 | **先验形态**：交付的 funnel 图必须单调不增，非单调直接判错（理由点明形态，不是"数值没命中"）；再比各步骤数值，允许漏 1 步 |
+| `retention` | 留存题（`L5-retention-cohort`） | 除数值外还有一道**结论闸**：这份数据算不出真实留存（活跃度与注册生命周期独立抽样），交付里必须声明这条数据限制，只解释右删失不算 |
 
 判分对象是 agent 的**全部数值/文本证据**：`run_sql` 的每个结果集、`call_metric` 的
 权威数、`present_result` 的 kpis 和 chart 标签。这样"SQL 对但只在 KPI 卡片里展示"
@@ -72,6 +77,20 @@ cd backend && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
   里，**读对表文档**才写得对，这正是 progressive disclosure 要证明的能力。
   （卡片里的枚举取值本身由 `scripts/lakehouse/verify_enums.py` 盯着，防止它自己漂移。）
 
+### 口径陷阱题（`cases_traps.json`，3 题）
+和 `cases.json` 同构、同一套判分器，但考的不是"算得对不对"，而是**会不会掉进另一张
+长得很像的表**——这是这套架构上最典型的错法：不报错、数看着合理、口径是别的。
+
+| id | 问题 | 正确的源 | 掉进去会怎样 |
+|---|---|---|---|
+| `TRAP-total-orders` | 总订单数 | `orders` 全表 | `dwd_orders_valid` 只含有效订单，数偏小 |
+| `TRAP-fin-net-revenue-dec` | 某月财务口径净收入 | `fin_daily_revenue.net_revenue` | 拿 GMV 口径顶：没减退款，且轴是下单日不是退款发生日 |
+| `TRAP-roi-tmp-table` | 各渠道 ROI 排名 | `mart_channel_daily` 现算 | `tmp_campaign_roi_analysis` 的 `attributed_gmv` / `roi` **整列 NULL**（登记在 `scripts/lakehouse/verify_constants.py`），排名全 NULL |
+
+这份用例集**不进默认全量跑**（它问的是判断题、判分靠数值证据，误判成本比主用例集高），
+是一份需要时手动跑的补充集。结构与"金标不许直接查陷阱表"这两件事由
+`run_eval.py --selftest` 第 10 组盯着（L0 就会红），所以文件坏了不必等一次带模型的跑。
+
 ### 附带度量
 除对错外每题还记录：**耗时、read_doc 次数、SQL 条数**。要做「文档路由 vs 无路由」的
 对照实验，跑两种配置各生成一份 `report.json` 对比这三列即可（无路由配置可把系统提示里
@@ -81,7 +100,7 @@ cd backend && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 - 判分基于数值/文本证据匹配，是**充分不必要**判定：极端情况下 agent 靠巧合数字蒙对
   会误判为过（数值题都带小数容差，概率很低）；insight 文本质量不在评测范围。
-- `run_eval.py` 顺序执行（每题一个新 session），26 题全量约 23 分钟（实测平均
+- `run_eval.py` 顺序执行（每题一个新 session），27 题全量约 23 分钟（实测平均
   51.9s/题）、每题一次 Opus 多轮调用，注意 Bedrock 费用。
 - 用例锚定 schema 而非行数据的具体值，但 `value_hint` 是按当前 CSV 写的注释，
   重新生成数据后 hint 会过时（不影响判分）。

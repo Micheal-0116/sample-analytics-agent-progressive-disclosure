@@ -5,6 +5,7 @@
     ../backend/.venv/bin/python run_eval.py --level 1 2                # 只跑 L1/L2
     ../backend/.venv/bin/python run_eval.py --case L1-users-count      # 只跑单题
     ../backend/.venv/bin/python run_eval.py --dry-run                  # 只验金标 SQL，不调模型
+    ../backend/.venv/bin/python run_eval.py --cases cases_traps.json   # 陷阱题（3 题，见下）
 
 原理：
   1. 每题的金标口径写成 1..N 条「可接受的」golden SQL（cases.json），运行时经与
@@ -40,6 +41,12 @@ sys.path.insert(0, str(BACKEND))
 import db  # noqa: E402  (backend/db.py — 与 agent 同一个只读边界)
 
 CASES_PATH = HERE / "cases.json"
+# 第二份用例集：**口径陷阱题**（`cases_traps.json`，3 题）。它跟 cases.json 同构，
+# 分开放是因为它问的不是"算得对不对"，而是"会不会掉进那张长得很像的表里"——
+# 总订单数掉进 dwd_orders_valid（1601 ≠ 2000）、净收入拿 GMV 口径顶（偏高 16%）、
+# ROI 掉进 tmp_campaign_roi_analysis（roi 整列 NULL，见 verify_constants.py 的清单）。
+# 用 `--cases cases_traps.json` 跑；报告写到 report.traps.* 里，不覆盖主用例集的报告。
+TRAPS_PATH = HERE / "cases_traps.json"
 REPORT_MD = HERE / "report.md"
 REPORT_JSON = HERE / "report.json"
 # --dry-run 的产物单独放：它只证明金标 SQL 能在当前后端上跑通，不含 agent 的判定结果。
@@ -773,6 +780,41 @@ def selftest() -> int:
                 fails.append(f"留存金标 {g['label']} 没把 activity 按 user_id 关联回 "
                              f"cohort 名单：分子会变成全站活跃，留存率超 100%")
 
+    # 10) 第二份用例集 cases_traps.json 的结构与"陷阱"这件事本身。
+    #
+    # 这一组的由来是：这个文件写完之后**全库没有一个引用**，谁也不会发现它坏了。
+    # 现在 `--cases cases_traps.json` 是它的入口，这里是它的离线闸——文件被改坏
+    # （judge mode 打错、金标里混进了那张陷阱表）在 L0 就红，不用等一次带模型的跑。
+    ran += 1
+    if not TRAPS_PATH.is_file():
+        fails.append(f"{TRAPS_PATH.name} 不存在：`--cases {TRAPS_PATH.name}` 这条入口是空的")
+    else:
+        t_spec = json.loads(TRAPS_PATH.read_text())
+        ran += 1
+        if "defaults" not in t_spec or not t_spec.get("cases"):
+            fails.append(f"{TRAPS_PATH.name} 与 cases.json 不同构（缺 defaults / cases）")
+        t_ids = [c.get("id") for c in t_spec.get("cases", [])]
+        ran += 1
+        if len(set(t_ids)) != len(t_ids):
+            fails.append(f"{TRAPS_PATH.name} 里有重复的 case id：{t_ids}")
+        # 陷阱题的全部价值在于「金标走对的那张表，而错答会走另一张」。所以金标 SQL 里
+        # **不许**出现被点名的陷阱表——一旦出现，这题就变成了在考陷阱本身。
+        TRAP_TABLES = ("dwd_orders_valid", "tmp_campaign_roi_analysis")
+        for c in t_spec.get("cases", []):
+            ran += 1
+            if c.get("judge", {}).get("mode") not in JUDGES:
+                fails.append(f"{c.get('id')} 的判分 mode {c.get('judge', {}).get('mode')!r} "
+                             f"不在 JUDGES 里，跑起来会直接 KeyError")
+            ran += 1
+            if not str(c.get("value_hint", "")).strip():
+                fails.append(f"{c.get('id')} 没有 value_hint：读报告的人看不出这题的陷阱是什么")
+            for g in c.get("golden", []):
+                ran += 1
+                bad = [t for t in TRAP_TABLES if t in g.get("sql", "")]
+                if bad:
+                    fails.append(f"{c.get('id')} 的金标 {g.get('label')} 直接查了陷阱表 "
+                                 f"{bad}：这题就不再是陷阱题了")
+
     for f in fails:
         print("  ✗", f)
     print(f"判分器自测: {ran} 条断言 + 金标口径核对，"
@@ -784,6 +826,8 @@ async def main() -> int:
     ap = argparse.ArgumentParser(description="analytics agent eval harness")
     ap.add_argument("--level", type=int, nargs="*", help="只跑这些 level")
     ap.add_argument("--case", nargs="*", help="只跑这些 case id")
+    ap.add_argument("--cases", default=str(CASES_PATH),
+                    help=f"用例文件（默认 {CASES_PATH.name}；口径陷阱题用 {TRAPS_PATH.name}）")
     ap.add_argument("--dry-run", action="store_true", help="只验证金标 SQL 可执行")
     ap.add_argument("--selftest", action="store_true",
                     help="离线自测判分器（不连库不调模型）")
@@ -792,7 +836,20 @@ async def main() -> int:
     if args.selftest:
         return selftest()
 
-    spec = json.loads(CASES_PATH.read_text())
+    cases_path = Path(args.cases)
+    if not cases_path.is_absolute():
+        cases_path = (HERE / cases_path) if not cases_path.exists() else cases_path.resolve()
+    if not cases_path.is_file():
+        print(f"用例文件不存在：{cases_path}"); return 2
+    # 非默认用例集的报告单独命名。共用 report.md 的话，跑一次 3 题的陷阱集就会把
+    # 27 题的报告盖掉，而两份文件都"存在且看着正常"——同 REPORT_DRYRUN_JSON 那条教训。
+    tag = "" if cases_path.name == CASES_PATH.name else f".{cases_path.stem.replace('cases_', '')}"
+    report_md = HERE / f"report{tag}.md"
+    report_json = HERE / f"report{tag}.json"
+    report_dryrun_json = (REPORT_DRYRUN_JSON if not tag
+                          else HERE / f"report.dryrun{tag}.json")
+
+    spec = json.loads(cases_path.read_text())
     cases = spec["cases"]
     if args.level:
         cases = [c for c in cases if c["level"] in args.level]
@@ -815,17 +872,18 @@ async def main() -> int:
     meta = {
         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
         "model": os.environ.get("ANTHROPIC_MODEL", "(default)"),
+        "cases": cases_path.name,
         "avg_s": round(sum(r.get("elapsed_s", 0) for r in done) / len(done), 1) if done else "-",
         "avg_docs": round(sum(r.get("n_docs", 0) for r in done) / len(done), 1) if done else "-",
         "avg_sql": round(sum(r.get("n_sql", 0) for r in done) / len(done), 1) if done else "-",
     }
-    out_json = REPORT_DRYRUN_JSON if args.dry_run else REPORT_JSON
+    out_json = report_dryrun_json if args.dry_run else report_json
     out_json.write_text(json.dumps({"meta": meta, "records": records},
                                    ensure_ascii=False, indent=2, default=str))
     if not args.dry_run:
-        REPORT_MD.write_text(render_report(records, meta))
+        report_md.write_text(render_report(records, meta))
         print(f"\n通过 {sum(1 for r in done if r['status']=='pass')}/{len(done)}"
-              f" · 报告: {REPORT_MD.relative_to(HERE.parent)} / report.json")
+              f" · 报告: {report_md.relative_to(HERE.parent)} / {report_json.name}")
     else:
         bad = [r for r in records if r["status"] == "golden_error"]
         print(f"\n金标验证: {len(records)-len(bad)}/{len(records)} OK"

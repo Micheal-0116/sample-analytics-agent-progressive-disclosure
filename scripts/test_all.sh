@@ -6,6 +6,7 @@
 # 换的不是同一个原语：Redshift 的动态脱敏在 LF 里没有等价物，落成了列级排除 —— 见那一节。
 #
 #   bash scripts/test_all.sh           # L3 只抽查 3 张表（35 张要 ~1 分钟）
+#   bash scripts/test_all.sh --l0      # 只跑 L0（不连云、不要凭证；CI 用这一档）
 #   bash scripts/test_all.sh --full    # L3 全量 35 张表
 #   bash scripts/test_all.sh --l8      # 追加 L8 负测（会临时改文件再还原，见下）
 #   bash scripts/test_all.sh --ask     # 追加 L6 的 /ask 流式契约（**烧一次 Opus**，约 1 分钟）
@@ -22,17 +23,30 @@ cd "$(dirname "$0")/.."
 FULL=0
 L8=0
 ASK=0
+L0ONLY=0
 for arg in "$@"; do
   case "$arg" in
     --full) FULL=1 ;;
     --l8)   L8=1 ;;
     --ask)  ASK=1 ;;
+    # 只跑 L0 并**以 0 退出**。没有这一档时"只想跑离线那几十条"只有一个办法：
+    # 整套跑下去、在 AWS 身份那道闸上吃一个 exit 1 —— 结果是绿的 L0 被包在一个
+    # 非零退出码里，任何按退出码判成败的东西（CI、pre-commit）都读成失败。
+    --l0)   L0ONLY=1 ;;
     # `${arg}` 的花括号是必需的：紧跟其后的全角「（」在 bash 眼里算标识符字符，
     # 写成 `$arg（…` 会被解析成变量名 `arg（`，配上 `set -u` 就是 unbound variable ——
     # 于是"参数打错了"这件事的提示变成了一句看不懂的 shell 内部报错。
-    *) echo "未知参数 ${arg}（支持 --full / --l8 / --ask）" >&2; exit 2 ;;
+    *) echo "未知参数 ${arg}（支持 --l0 / --full / --l8 / --ask）" >&2; exit 2 ;;
   esac
 done
+
+# --l0 会在 L1 之前收工，所以它跟那三个"往后加东西"的开关放一起是自相矛盾的：
+# 静默忽略的话，`--l0 --l8` 会打印一份 L0 全绿、退出 0、而**负测一条没跑**的报告。
+if [[ $L0ONLY -eq 1 && ( $L8 -eq 1 || $ASK -eq 1 || $FULL -eq 1 ) ]]; then
+  echo "--l0 只跑 L0，与 --full / --l8 / --ask 冲突（那三个都在 L1 之后，要凭证）。" >&2
+  echo "只想跑离线负测就直接：\$PY scripts/negative_tests.py --offline（27 个用例，不连云）" >&2
+  exit 2
+fi
 
 PY=./backend/.venv/bin/python
 [[ -x "$PY" ]] || PY=python3
@@ -65,6 +79,16 @@ FAIL=0
 hdr() { printf '\n\033[1m=== %s ===\033[0m\n' "$1"; }
 note() { printf '  \033[90m·\033[0m     %s\n' "$1"; }
 
+# 在中途停下时也要把已经跑过的记账报出来，并且**说清停在哪一层**。
+# 光 `exit 1` 的话，L0 那几十条的结果就白跑了，读日志的人也分不清
+# 「离线断言红了」和「只是没登录」——这两件事的下一步动作完全不同。
+summary_and_exit() {
+  hdr "结果（提前停止）"
+  printf '  通过 %d · 失败 %d\n' "$PASS" "$FAIL"
+  echo "  L0 离线自测已跑完；L1 起需要 AWS 凭证，未继续。"
+  exit 1
+}
+
 # run <描述> <命令…>：命令 exit 0 记 PASS，否则记 FAIL 并打印输出
 run() {
   local desc="$1"; shift
@@ -90,32 +114,20 @@ grep_run() {
     PASS=$((PASS + 1))
   else
     printf '  \033[31mFAIL\033[0m  %s  (期望匹配 /%s/)\n' "$desc" "$want"
+    # 只印尾 20 行，但**必须说清截掉了多少**。2026-09-17 实测的代价：verify_constants
+    # 那条的失败清单是 38 行，尾 20 行只露出后 18 条，于是读日志的人（我）按 18 条
+    # 估了问题规模，把 13 条 RELOAD_PENDING + 1 条 DIMS_PASSTHROUGH 过期整个漏掉了。
+    # 「被截断」和「就这么多」在报告上长得一样 —— 跟这套测试反复点名的那类缺口同形。
+    local total
+    total=$(printf '%s\n' "$out" | wc -l | tr -d ' ')
     printf '%s\n' "$out" | tail -20 | sed 's/^/        /'
+    if (( total > 20 )); then
+      printf '        \033[90m…… 上面还截掉了 %d 行（失败清单可能被截了头）。看全：%s\033[0m\n' \
+        "$((total - 20))" "$*"
+    fi
     FAIL=$((FAIL + 1))
   fi
 }
-
-hdr "前置：AWS 身份"
-ACCT=$(aws sts get-caller-identity --query Account --output text 2>&1)
-if [[ ! "$ACCT" =~ ^[0-9]{12}$ ]]; then
-  printf '  \033[31mFAIL\033[0m  拿不到 AWS 身份：%s\n' "$ACCT"
-  echo "        后面全是云调用，先登录（aws sso login / AWS_PROFILE）。"
-  exit 1
-fi
-# EXPECT_ACCOUNT 是可选守卫：设了（通常在 .env.local）才强制相等，防多账号环境串号。
-if [[ -n "${EXPECT_ACCOUNT:-}" && "$ACCT" != "$EXPECT_ACCOUNT" ]]; then
-  printf '  \033[31mFAIL\033[0m  account=%s，期望 %s（.env.local 里钉的）\n' "$ACCT" "$EXPECT_ACCOUNT"
-  echo "        身份不对，后面全是云调用，先停下来。"
-  exit 1
-fi
-printf '  \033[32mPASS\033[0m  account=%s region=%s\n' "$ACCT" "$AWS_REGION"
-PASS=$((PASS + 1))
-# boto3 glue 的 CatalogId **必须带账号前缀**，且要指到叶子（表桶那一层）。
-# 给 Athena 用的那个写法不带前缀 —— 两种不能混用，混了报 EntityNotFoundException，
-# 而报错完全指不到成因。见 knowledge/connection.md。
-TABLE_BUCKET="${TABLE_BUCKET:-analytics-agent-tables}"
-CATALOG="${GLUE_CATALOG_ID:-$ACCT:s3tablescatalog/$TABLE_BUCKET}"
-export GLUE_CATALOG_ID="$CATALOG"
 
 hdr "L0 静态自测（无云依赖）"
 # 生成器（scripts/gen/main.py）依赖 numpy，而**本机两个解释器都没装**。
@@ -128,7 +140,7 @@ hdr "L0 静态自测（无云依赖）"
 if $PY -c "import numpy" >/dev/null 2>&1; then
   grep_run "生成器 fillers 自测"          "全部通过" $PY scripts/gen/selftest_fillers.py
   grep_run "生成器跨表闭环自测"           "全部通过" $PY scripts/gen/selftest_closures.py
-  # 反例一侧：上面那 105 条断言全是正向的，判据写歪了它照样绿，而它绿在最前面，
+  # 反例一侧：上面那 106 条断言（跨表闭环自测自己报的数）全是正向的，判据写歪了它照样绿，而它绿在最前面，
   # 后面每层的"通过"都会被读成"数据是对的"。这一条往深拷贝里注入 42 个缺陷，要求整套
   # 自测变红**且红在指定断言上**。跑 7 秒，留在默认档而不是 --l8：它不改任何仓库文件、
   # 不碰云，代价和 fillers 自测同级。
@@ -184,6 +196,17 @@ grep_run "只读 SQL 边界自测（管「不许写」；「不许看」在 L4�
 # 把闸门整个删掉当时也不会让任何东西变红。现在改成 PreToolUse hook，这条盯着它。
 grep_run "工具白名单边界自测（管「不许调用别的工具」；两侧选项都查）" \
   "全部通过" $PY backend/agent.py --selftest
+# 文档 SQL 里的**表名**存在性。这一层和 L2 那条 EXPLAIN 不是重复：EXPLAIN 覆盖面更全
+# （列名、类型、方言），但它连云、要钱，而且**跳过含参数占位符的语句**——
+# `relationships.md` 那两个可复制 JOIN 示例都以 `WHERE u.user_id = ?` 结尾，于是
+# EXPLAIN 从没跑过它们，而它们 JOIN 的 `user_levels` / `product_skus` 在本库不存在；
+# 同一文件的外键表里一共列了 10 张幻表。跳过占位符语句是对的，但当时「跳过」等于
+# 「没有任何检查」。这条不连云、查全集（含被跳过的），所以能站在 L0。
+# 两道各有盲区：这条只管表名，列名和方言仍然只有 EXPLAIN 能管，别用一道替另一道。
+grep_run "文档 SQL 表名提取器自测"         "全部通过" \
+    $PY scripts/lakehouse/verify_doc_sql.py --selftest
+grep_run "文档 SQL 只引用真实存在的表（离线 · 含被 EXPLAIN 跳过的语句）" "表名全部存在 ✅" \
+    $PY scripts/lakehouse/verify_doc_sql.py --offline
 grep_run "Iceberg DDL 生成器自测"         "全部通过" $PY scripts/lakehouse/gen_ddl.py --selftest
 grep_run "Iceberg DDL 未被手改（--check）" "一致 ✅"  $PY scripts/lakehouse/gen_ddl.py --check
 # knowledge/README.md 写着「表结构以 database/*.sql 为准」，而这两行挂上之前，那个
@@ -241,6 +264,50 @@ fi
 grep_run "shell 资源引用在两套挂载布局下都取得到（静态）" \
   "全部通过" $PY scripts/ui/asset_check.py
 
+# --l0 在这里就收工：**这一档的退出码才是可判的**。下面每一层都要凭证，没凭证时
+# summary_and_exit 一律 exit 1，所以"L0 全绿"和"没登录"在退出码上分不开。
+# CI（.github/workflows/offline.yml）跑的就是这一档 + negative_tests.py --offline。
+# 注意它报的是「L0 全绿」而不是「全绿」：这份报告里没有任何一条碰过云，
+# 而 L1–L6 恰恰是最容易被当成已覆盖的部分。
+if [[ $L0ONLY -eq 1 ]]; then
+  hdr "结果（只跑 L0）"
+  printf '  通过 %d · 失败 %d\n' "$PASS" "$FAIL"
+  if [[ $FAIL -gt 0 ]]; then
+    echo "  L0 未全绿，先修再往下跑。"
+    exit 1
+  fi
+  echo "  L0 全绿 ✅（离线那一档）。L1–L6 需要 AWS 凭证，**本次一条都没跑**："
+  echo "    云资源状态、元数据对账、装载完整性、治理层、查询路径、服务与前端契约"
+  echo "    都不在这个退出码的保证范围里。要连云就去掉 --l0。"
+  exit 0
+fi
+
+hdr "前置：AWS 身份"
+# **这一段刻意排在 L0 之后**：L0 那几十条一条都不连云，而这个闸门是 `exit 1`。
+# 它原来站在最前面，于是没登录的人（CI、刚 clone 的人、SSO 过期的人）一条离线自测
+# 都跑不到就被弹出去——那批断言恰好是最该在改完代码后立刻跑的。挪到这里之后，
+# 「没有 AWS 凭证」的结果从「整套测试不可用」变成「L0 全绿 + 从 L1 起停住」。
+ACCT=$(aws sts get-caller-identity --query Account --output text 2>&1)
+if [[ ! "$ACCT" =~ ^[0-9]{12}$ ]]; then
+  printf '  \033[31mFAIL\033[0m  拿不到 AWS 身份：%s\n' "$ACCT"
+  echo "        L0 已经跑完（见上），后面全是云调用，先登录（aws sso login / AWS_PROFILE）。"
+  summary_and_exit
+fi
+# EXPECT_ACCOUNT 是可选守卫：设了（通常在 .env.local）才强制相等，防多账号环境串号。
+if [[ -n "${EXPECT_ACCOUNT:-}" && "$ACCT" != "$EXPECT_ACCOUNT" ]]; then
+  printf '  \033[31mFAIL\033[0m  account=%s，期望 %s（.env.local 里钉的）\n' "$ACCT" "$EXPECT_ACCOUNT"
+  echo "        身份不对，后面全是云调用，先停下来。"
+  summary_and_exit
+fi
+printf '  \033[32mPASS\033[0m  account=%s region=%s\n' "$ACCT" "$AWS_REGION"
+PASS=$((PASS + 1))
+# boto3 glue 的 CatalogId **必须带账号前缀**，且要指到叶子（表桶那一层）。
+# 给 Athena 用的那个写法不带前缀 —— 两种不能混用，混了报 EntityNotFoundException，
+# 而报错完全指不到成因。见 knowledge/connection.md。
+TABLE_BUCKET="${TABLE_BUCKET:-analytics-agent-tables}"
+CATALOG="${GLUE_CATALOG_ID:-$ACCT:s3tablescatalog/$TABLE_BUCKET}"
+export GLUE_CATALOG_ID="$CATALOG"
+
 hdr "L1 云资源状态"
 grep_run "S3 Tables + Glue + Athena workgroup 就位（只读核查）" \
   "基建齐备 ✅" $PY scripts/lakehouse/setup.py --verify
@@ -251,6 +318,7 @@ grep_run "DDL ⟷ Glue ⟷ 知识库卡片（七类检查，含列注释）" \
   "对账通过 ✅" $PY scripts/lakehouse/reconcile.py --catalog "$CATALOG" --strict
 # 路径二：可执行性。卡片里的 SQL 是 agent 照抄的对象，抄不动就是幻觉源头。
 # EXPLAIN 做完整的语法 + 目录 + 列 + 类型解析，扫描 0 字节。
+# 表名那一层已经在 L0 离线查过（含这里会跳过的占位符语句），这条管列名/类型/方言。
 grep_run "知识库里每条 SQL 都能在 Athena 上 EXPLAIN 通过" \
   "全部通过 ✅" $PY scripts/lakehouse/verify_doc_sql.py
 # 路径三：列里的值。上面两条都管不到枚举取值——EXPLAIN 不看 WHERE 里的字面量能不能命中，

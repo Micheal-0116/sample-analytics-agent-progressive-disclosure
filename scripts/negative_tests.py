@@ -44,8 +44,8 @@ L0–L6 全绿只说明「现在没问题」，**不说明检查器还有效**�
 ## 用法
 
     python3 scripts/negative_tests.py --list        # 看用例清单
-    python3 scripts/negative_tests.py --offline     # 只跑不连云的 22 个（秒级）
-    python3 scripts/negative_tests.py               # 全部 36 个（要 AWS 凭证，约 4 分钟）
+    python3 scripts/negative_tests.py --offline     # 只跑不连云的 27 个（秒级）
+    python3 scripts/negative_tests.py               # 全部 43 个（要 AWS 凭证，约 4 分钟）
     python3 scripts/negative_tests.py -c enum-value-absent -c doc-sql-rotten
 
 退出码非 0 = 有检查器在缺陷面前保持了沉默（或负测自己的锚点失效了），两种都要处理。
@@ -124,7 +124,11 @@ CASES: list[Case] = [
                   'hooks={"PreToolUse": [HookMatcher(hooks=[_make_gate()])]},',
                   "can_use_tool=_make_gate(),")],
         cmd=[PY, "backend/agent.py", "--selftest"],
-        expect=r"can_use_tool|架空",
+        # 点名到**哪一侧**：注入只打本地那份，所以红的必须是 backend/agent.py 这一条。
+        # 原来的 `can_use_tool|架空` 里 `can_use_tool` 连自测的绿输出都能匹配上
+        # （"两侧选项都走 hooks 且无 can_use_tool"），只是被 exit 0 那道判定挡住而已。
+        expect=r"backend/agent\.py：选项里还挂着 can_use_tool",
+        forbid=r"全部通过",
     ),
     Case(
         id="tool-gate-toolsearch-locked",
@@ -136,7 +140,8 @@ CASES: list[Case] = [
                   'GATE_ALLOWED = set(ALLOWED) | {"ToolSearch"}',
                   "GATE_ALLOWED = set(ALLOWED)")],
         cmd=[PY, "backend/agent.py", "--selftest"],
-        expect=r"ToolSearch",
+        expect=r"GATE_ALLOWED 里没有 ToolSearch",
+        forbid=r"全部通过",
     ),
     Case(
         id="iceberg-ddl-handedit",
@@ -184,7 +189,11 @@ CASES: list[Case] = [
                   "WHERE status IN ('paid','shipped','delivered');",
                   "WHERE status IN ('paid','shipped');")],
         cmd=[PY, "scripts/lakehouse/verify_mart_parity.py"],
-        expect=r"谓词|不对齐|缺|❌",
+        # 认到「哪张表、丢了几条、丢的是哪一条」。原来写的是 `谓词|不对齐|缺|❌`——
+        # 那个正则几乎空匹配：这脚本任何一种红（缺文件、列数不对、表对不上）都带 ❌，
+        # 换个原因红了也算过，而这条用例要证的偏偏是**丢谓词能被抓到**。
+        expect=r"dwd_orders_valid\s+丢了 1 条谓词[\s\S]*delivered",
+        forbid=r"谓词与列数全部对齐",
     ),
     Case(
         id="manifest-artifact-handedit",
@@ -215,7 +224,10 @@ CASES: list[Case] = [
                   "**也禁止拿该表自己的 `max(时间列)` 当今天**（理由见下表，比查空更危险）",
                   "**可以拿该表自己的 `max(时间列)` 当今天**（省事）")],
         cmd=[PY, "scripts/deploy/sync_agent_code.py", "--check"],
-        expect=r"漂移",
+        # 必须认到**是 SYSTEM 这个节点漂了**。原来只认「漂移」二字，可这脚本报任何
+        # 一处不一致（哪份整拷、哪个节点）都印这两个字，等于只验了"它会红"。
+        expect=r"agent\.py::SYSTEM 漂移",
+        forbid=r"同步面一致",
     ),
     Case(
         id="csv-header-renamed",
@@ -225,7 +237,10 @@ CASES: list[Case] = [
         patches=[("data/csv/channels.csv", "channel_type,platform",
                   "channel_kind,platform")],
         cmd=[PY, "scripts/lakehouse/load.py", "--preflight"],
-        expect=r"channel|表头|列",
+        # 认到「哪张表、多了什么、缺了什么」。原来写的是 `channel|表头|列`——
+        # `channel` 在这脚本的正常输出里就有（它逐表打印），基本等于永真。
+        expect=r"channels: CSV 表头与 DDL 不一致.*channel_kind.*channel_type",
+        forbid=r"表头与列序一致",
     ),
     Case(
         id="gov-policy-loosened",
@@ -658,7 +673,10 @@ CASES: list[Case] = [
         defect="CSV 与湖里的数不一致——装载丢了行/串了值，行数对但求和不对",
         patches=[("data/csv/channels.csv", "13,直接访问", "130,直接访问")],
         cmd=[PY, "scripts/lakehouse/verify_load.py", "-t", "channels"],
-        expect=r"处差异",
+        # 认到「channels 有几项指标不符」+ 汇总行；只认「处差异」的话，连"读不到表"
+        # 之类跟装载无关的红也算过。
+        expect=r"❌ channels\s+\d+ 项指标，\d+ 项不符[\s\S]*发现 \d+ 处差异",
+        forbid=r"装载完整",
     ),
     Case(
         id="gov-probe-blind",
