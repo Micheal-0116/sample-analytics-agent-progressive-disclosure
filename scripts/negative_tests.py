@@ -506,6 +506,53 @@ CASES: list[Case] = [
         cmd=[PY, "scripts/lakehouse/verify_load.py", "--selftest"],
         expect=r"文档行数声明",
     ),
+    # 上一条守的是**种子那一侧**（文档 ⟷ data/csv）。规模判据另有三条守另一侧：湖里装的是哪一批
+    # —— 紧跟着的两条离线（声明原文、声明次数），加上离线段末尾那条连云的
+    # `scale-lake-unregistered-batch`（实测 ⟷ 已登记批次）。三条各盯一种失效，
+    # 缺哪条都会留下一种"看起来绿了"。
+    Case(
+        id="scale-prompt-hardcoded",
+        cloud=False,
+        guards="scripts/lakehouse/verify_scale.py --selftest（文档声明原文）",
+        defect="prompt 里写死了某一批的行数。同一份 prompt 会跑在种子库和全量湖上，"
+               "写死就必然有一边是错的——本库真实发生过：prompt 教 agent「35 张明细表，"
+               "约 19 万行」，而湖里装着 7994 万行，L0–L6 全绿，因为没有一条断言的对象是「有多少行」",
+        patches=[("backend/agent.py",
+                  "35 张明细表 + 4 张 mart + 8 张派生表，**行数取决于湖里装的是哪一批**"
+                  "——种子样本约 19 万行，全量重灌约 8000 万行，要精确行数就 `count(*)`，"
+                  "Iceberg 读元数据、零扫描",
+                  "35 张明细表，约 19 万行")],
+        cmd=[PY, "scripts/lakehouse/verify_scale.py", "--selftest"],
+        expect=r"backend/agent\.py：声明原文 '行数取决于湖里装的是哪一批' 命中 0 次",
+        forbid=r"规模声明自洽",
+    ),
+    Case(
+        id="scale-decl-half-edited",
+        cloud=False,
+        guards="scripts/lakehouse/verify_scale.py --selftest（声明的出现次数）",
+        defect="同一个数在一份文件里抄了两处，重灌后只改了其中一处。判据钉的是**次数**"
+               "而不是「只准出现一次」——真要求去重，判据就变成了在管别人的散文；"
+               "钉次数则一改一漏立刻红，而合法的多处引用不受干扰",
+        patches=[("backend/run.sh",
+                  '（LEGACY 路径，约 19 万行，不再维护）',
+                  '（LEGACY 路径，约 8000 万行，不再维护）')],
+        cmd=[PY, "scripts/lakehouse/verify_scale.py", "--selftest"],
+        expect=r"backend/run\.sh：声明原文 '约 19 万行' 命中 1 次（登记 2 次）",
+        forbid=r"规模声明自洽",
+    ),
+    Case(
+        id="scale-lake-unregistered-batch",
+        cloud=True,
+        guards="scripts/lakehouse/verify_scale.py（湖实测 ⟷ 已登记批次）",
+        defect="湖里换了一批数据而没人来 docs/scale.json 登记。verify_load 答不了这件事——"
+               "它比的是「湖 ⟷ data/csv」，默认两侧本来就该相等，而这个账号本来就装着"
+               "另一批。注入把已登记批次的一张表改成别的数，实测就命中不了任何一批",
+        patches=[("docs/scale.json",
+                  '"orders": 854140,', '"orders": 854141,')],
+        cmd=[PY, "scripts/lakehouse/verify_scale.py"],
+        expect=r"没有命中任何已登记批次[\s\S]*orders",
+        forbid=r"规模与声明一致",
+    ),
 
     # ---------------------------------------------------------- 连云
     Case(

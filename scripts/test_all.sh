@@ -241,6 +241,13 @@ grep_run "集市层谓词/列数对账自测"         "全部通过" $PY scripts
 grep_run "集市层谓词未在手工搬运中丢失"    "全部对齐 ✅" $PY scripts/lakehouse/verify_mart_parity.py
 grep_run "元数据对账器自测"               "全部通过" $PY scripts/lakehouse/reconcile.py --selftest
 grep_run "装载对账器自测"                 "全部通过" $PY scripts/lakehouse/verify_load.py --selftest
+# 规模声明自洽。整个对账层比表、比列、比枚举、比退化列、比装载忠实——**从不比规模**，
+# 于是曾出现「五处文档写着 19 万行、湖里装着 8000 万行、L0–L6 全绿」：数量级差 427 倍
+# 而没有一盏灯，因为没有任何一条断言的对象是「有多少行」。这条离线管两件：docs/scale.json
+# 的 seed 批次逐表等于 data/csv 现数，以及那 6 条文档声明的原文还在、次数没变、数值对得上
+# 它自称的批次。湖里到底装的是哪一批要连云，在 L3。
+grep_run "规模声明自洽（docs/scale.json ⟷ data/csv · 文档声明原文）" \
+  "规模声明自洽 ✅" $PY scripts/lakehouse/verify_scale.py --selftest
 grep_run "枚举卡片解析器自测"             "全部通过" $PY scripts/lakehouse/verify_enums.py --selftest
 grep_run "退化列分类器 + 登记清单自测"     "全部通过" $PY scripts/lakehouse/verify_constants.py --selftest
 grep_run "建站脚本自测"                   "全部通过" $PY scripts/lakehouse/setup.py --selftest
@@ -347,6 +354,15 @@ else
     "装载完整 ✅" $PY scripts/lakehouse/verify_load.py -t users -t orders -t order_items
   note "只抽查了 3 张表，加 --full 跑全部 35 张。改过数据或重灌过表必须跑 --full。"
 fi
+# 上面那条比的是「湖里的行 ⟷ data/csv 的行」，它默认这两侧**本来就该相等**——而这个
+# 账号的湖里装的是全量重灌那批（8000 万行），种子是 19 万行。所以 verify_load 的
+# 对账对象是「装载有没有丢行」，答不了「湖里现在装的是哪一批」。这条答后者：现查 35 张表
+# count(*)（Iceberg 读元数据、扫描 0 字节），必须逐表命中 docs/scale.json 里某一批已登记
+# 的规模；命中不了就印出它最像哪一批、差在哪些表——装了新一批数据得先去登记。
+# 顺带把 #14 那句「转化侧放大 427 倍而广告/券/活动维度表没有」按实测 scale 验成断言：
+# scaled 组等比、fixed 组不变、sublinear 组严格落在两者之间。
+grep_run "湖里的规模命中某一批已登记声明（+ 三组缩放不变量）" \
+  "规模与声明一致 ✅" $PY scripts/lakehouse/verify_scale.py
 
 hdr "L4 治理层（最小权限角色 + 列级排除）"
 # v2 那套 Redshift 的「最小权限角色 + 动态脱敏」在湖仓上的等价物：一个专属 IAM 角色

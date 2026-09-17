@@ -51,7 +51,7 @@ cd backend && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 ## L0 静态自测（无云依赖，秒级）
 
-33 项，全部是纯函数级断言（其中 3 项生成器自测要 numpy、1 项 boot() 契约要 node，缺了打 note、不算 FAIL）。改了 `scripts/` 下任何生成器/解析器/改写器，**先跑这一层**（`--l0` 就只跑它）。
+34 项，全部是纯函数级断言（其中 3 项生成器自测要 numpy、1 项 boot() 契约要 node，缺了打 note、不算 FAIL）。改了 `scripts/` 下任何生成器/解析器/改写器，**先跑这一层**（`--l0` 就只跑它）。
 
 注意那两个「缺了打 note」的依赖在 CI 里是**装上的**（`scripts/requirements.txt` + `setup-node`）：
 note 不算 FAIL 是给本机开的方便，如果 CI 也让它跳过，那批断言会在一片绿灯里一直不跑。
@@ -64,9 +64,10 @@ note 不算 FAIL 是给本机开的方便，如果 CI 也让它跳过，那批�
 | `verify_ddl_comments.py --selftest` / 无参 | `database/0[1-8]_*.sql` 的**行内注释**里的枚举取值与知识卡片漂开。`knowledge/README.md` 写着「表结构以 `database/*.sql` 为准」，而这道闸挂上之前，那个「为准」的源里可比对的 34 行枚举注释**有 23 行是错的**（`products.status` 四个值全错，照它写 `WHERE status='active'` 得到 0 行、不报错、结论是「一件在售商品都没有」）。这批注释还正是 `scripts/gen/tables.py` 当年抄枚举池的地方——13 个生成器缺陷的成因，且会被 `gen_ddl.py` 搬进 `01_tables.sql` 的 `COMMENT`、再进 Glue 列元数据。判据是**注释里的引号取值集合 == 卡片取值集合**；「业务上合法但本批数据没有」的值要**去掉引号**、挪进后面的散文（沿用卡片自己的体例：表格给 agent 抄，散文给人读），所以这个检查器**不需要豁免表** |
 | `manifest/render.py --check` | manifest 不合法，**或**有人手改了 15 个生成物之一（卡片 / `10_derived.sql` / 域索引片段） |
 | `deploy/sync_agent_code.py --selftest` / `--check` | 同步器自己坏了（认不出漂移），**或**云上副本 `analyticsagent/app/analytics/` 与 `backend/` 不再是同一份代码 |
-| `eval/run_eval.py --selftest` | L7 判分器坏了：`judge_funnel` 的形态闸不再拦非单调"漏斗"、`stats.funnel` 的实时闸不再报 `monotonic=False`，`L4-funnel` 的金标口径被改回"每步各数一遍"，**或 `knowledge/` 里的漏斗参考 SQL 退回独立计数 / 漏斗题不再路由到方法卡**（最后这一项是 agent 真正读的那条路，前三项全绿时它照样能答错）。另一半盯**留存**：cohort 时间列退回 `created_at`（`users` 两列都有，EXPLAIN 照样过）、分子不再限定在 cohort 内（会炸出 509%）、「这份数据算不出留存」这条**结论级**约束被摘掉，以及 `judge_retention` 的结论闸被摘掉——后两条都是「数字全对而结论仍然错」那一类，一条管卡片里那句话还在，一条管判分器真的会因此判错。见下 |
+| `eval/run_eval.py --selftest` | L7 判分器坏了：`judge_funnel` 的形态闸不再拦非单调"漏斗"、`stats.funnel` 的实时闸不再报 `monotonic=False`，`L4-funnel` 的金标口径被改回"每步各数一遍"，**或 `knowledge/` 里的漏斗参考 SQL 退回独立计数 / 漏斗题不再路由到方法卡**（最后这一项是 agent 真正读的那条路，前三项全绿时它照样能答错）。另一半盯**留存**：cohort 时间列退回 `created_at`（`users` 两列都有，EXPLAIN 照样过）、分子不再限定在 cohort 内（会炸出 509%）、「这份数据算不出留存」这条**结论级**约束被摘掉，以及 `judge_retention` 的结论闸被摘掉——后两条都是「数字全对而结论仍然错」那一类，一条管卡片里那句话还在，一条管判分器真的会因此判错。还有一条管**金标自己的时间锚点**：`(SELECT max(x) …)` 里的 x 必须是 `meta_snapshot.as_of_date`，写成逐表 max 直接判错——这条补的是「评测在奖励知识库明令禁止的写法」，9 条金标原来用的正是逐表 max，而它在多数表上恰好等于锚点、算出来和正确答案一样。见下 |
 | `verify_mart_parity.py --selftest` / 无参 | 集市层 CTAS 的谓词或列数在手工搬运中丢了 |
 | `reconcile.py` / `verify_load.py` / `verify_enums.py` / `setup.py --selftest` | 对应对账器自己的解析逻辑坏了（这些自测是**假阳性**的防线） |
+| `verify_scale.py --selftest` | `docs/scale.json` 与 `data/csv/` 对不上（seed 那一批的每表行数是抄的，CSV 是真源），**或**某处文档里声明规模的原文被改写/被抄成了另一批的数。这条补的是整个对账层的一处结构性盲区：比表、比列、比枚举、比退化列、比装载忠实，**从不比规模**——于是「五处文档写着 19 万行、湖里装着 7994 万行、L0–L6 全绿」真的发生过。湖里到底装的是哪一批要连云，在 L3 |
 | `gen/semantics.py --selftest` | `scripts/gen/semantics.yaml` 自相矛盾了。它是商品语义（品牌→类目白名单 / 价格带 / 品牌分档 / 规格词池）的**唯一真源**，生成器和 `verify_semantics.py` 都从它读——所以配置错的时候两侧会**一起**用错的那份，于是一致、全绿、而数据是错的。9 项校验在 `load()` 里，任何调用方都跑得到；`--selftest` 另外查 4 件小样本查不到的事，最要紧的一条是「不重名商品名上界 ≥ 全量目标 SKU 数」（scale=1 只造 200 行永远够用，缩了品牌白名单要到灌全量那一刻才炸）。**这一条不在 numpy 分支里**：只要 pyyaml |
 | `verify_literals.py` / `verify_semantics.py` / `verify_resolution.py` / `verify_correlation.py` / `verify_behavior.py` 的 `--selftest` | L2+ 那五个报告器的**判据失去了区分力**。挂的只有 `--selftest`（正向那一支对现行库必然红，理由在 L2+ 那一节），所以这一条是那 157 项断言（23 + 19 + 6 + 28 + 81）的**唯一**闸门：夹具喂给纯函数判据，均匀/合法那一侧必须绿、退化/违例那一侧必须红。前三个是 2026-08-27 补挂的——写前两批时还没把「自测就是唯一闸门」定成模式，那 48 项断言（23 + 19 + 6）在此之前没有任何东西在跑 |
 | `load.py --preflight` | CSV 表头/列序/换行/数组格式与 DDL 不一致——灌进去会整列错位且不报错 |
@@ -829,6 +830,9 @@ sha256 核对。第一步是关键：少了它，一个本来就红的检查器�
 | `doc-sql-rotten` | `verify_doc_sql` | 卡片示例 SQL 引用不存在的列 |
 | `csv-value-changed` | `verify_load` | 改一个 CSV 数值（行数对但求和不对） |
 | `doc-row-total-drift` | `verify_load --selftest` | 改 `knowledge/connection.md` 里的全库行数（**agent 数不出这个数**，治理角色读不到 `user_messages`，只能照抄卡片） |
+| `scale-prompt-hardcoded` | `verify_scale --selftest` | 把 prompt 里的「行数取决于湖里装的是哪一批」换回写死的「35 张明细表，约 19 万行」。**这就是本库真实发生过的那个状态**：五处文档声明 19 万行、湖里装着 7994 万行、L0–L6 全绿——数量级差 427 倍而没有一盏灯，因为整个对账层比表、比列、比枚举、比退化列、比装载忠实，**从不比规模** |
+| `scale-decl-half-edited` | `verify_scale --selftest` | 把 `backend/run.sh` 里两处「约 19 万行」中的一处改掉。判据钉的是**出现次数**而不是「只准出现一处」：真要求去重，判据就变成在管别人的散文；钉次数则一改一漏立刻红（2 → 1），而正当的多处引用不受干扰 |
+| `scale-lake-unregistered-batch` | `verify_scale`（连云） | 改 `docs/scale.json` 里已登记批次的一张表行数，模拟"湖里换了一批数据而没人来登记"。`verify_load` 答不了这件事——它比的是「湖 ⟷ `data/csv`」并默认两侧本该相等，而这个账号本来就装着另一批 |
 | `probe-warming-treated-as-dead` | `ui/boot_test.mjs`（场景⑥） | 把 `dataLayer=warming` 算进「失败」的额度——后端明说"我在，只是还在预热"，前端却当它不在。这是同一个缺陷的第二种走法：第一次是超时预算猜小了，这次是把"还在预热"读成了"后端不在" |
 | `probe-degrade-is-permanent` | `ui/boot_test.mjs`（场景⑧） | 拿掉降级后的自愈重探——失败额度只有 3 发 ≈ 3s，比 uvicorn 打开端口还短，于是「重启后端 → 立刻刷新」把页面永久锁在离线演示模式。**同一个缺陷的第三种走法，也是最难归因的一种：它看起来像「你的修改没生效」** |
 | `probe-baked-answer-while-backend-alive` | `ui/boot_test.mjs`（场景⑨） | 拿掉提问前的重探——降级过的页面在后端已经活着时照旧给烘焙答案（问退款给 DAU 走势），且不报错 |
@@ -861,7 +865,7 @@ reconcile 家族 8 个用例共用同一条基线命令，基线结果按命令�
 
 | 缺口 | 为什么没覆盖 / 怎么补 |
 |---|---|
-| **文档里写的规模 ⟷ 湖里实际的规模** | **2026-09-17 实测到的实例,不是假设**：`docs/deployment.md`、`docs/data-audit.md`、`docs/data-walkthrough.md`、`database/00_schema_overview.md`、`PROJECT_STATUS.md` 五处都写着「当前部署约 22 万行、数据源是仓库里的 `data/csv/`」——而湖早就被重灌成 **8000 万行**那一批（`orders` 854,140 而不是 2,000，差 427 倍）。这五句**写的时候都是对的，是湖在它们底下被换掉了**。没有任何一层会红：`reconcile.py` 比表和列、`verify_enums.py` 比枚举取值、`verify_load.py` 比 `data/csv/` ⟷ Athena，**没有一个比文档散文里的数字**——而 `verify_load.py` 更糟，它在一个装了 8000 万行的湖上跑仍然会因为「CSV 那 2,000 行都在」而全绿。**代价是可操作的**：照 `deployment.md` 原来那句「改完 `data/csv/` 后跑 `load.py`」执行，就是拿 2,000 单订单 `DELETE`+`INSERT` 覆盖掉 854,140 单，命令正常退出、`verify_load.py` 随后全绿。已改成把「仓库交付的那一份」和「某个账号的湖此刻装的那一份」分开写，并在两处灌数指令上加了先核查再灌的告警。**怎么补**：判据很便宜——把「湖里 `orders` 的行数」和文档里声明的规模比一次，不等就红（要么文档过期、要么湖被人换了，两种都该有人看）。没现在补是因为它要引入「文档里的数字」这种新真源形态，得先想清楚声明写在哪（候选：一份 `docs/scale.json`，文档和检查都从它读），属于下一批 |
+| **文档里写的规模 ⟷ 湖里实际的规模** | **2026-09-17 实测到的实例,不是假设**：`docs/deployment.md`、`docs/data-audit.md`、`docs/data-walkthrough.md`、`database/00_schema_overview.md`、`PROJECT_STATUS.md` 五处都写着「当前部署约 22 万行、数据源是仓库里的 `data/csv/`」——而湖早就被重灌成 **8000 万行**那一批（`orders` 854,140 而不是 2,000，差 427 倍）。这五句**写的时候都是对的，是湖在它们底下被换掉了**。没有任何一层会红：`reconcile.py` 比表和列、`verify_enums.py` 比枚举取值、`verify_load.py` 比 `data/csv/` ⟷ Athena，**没有一个比文档散文里的数字**——而 `verify_load.py` 更糟，它在一个装了 8000 万行的湖上跑仍然会因为「CSV 那 2,000 行都在」而全绿。**代价是可操作的**：照 `deployment.md` 原来那句「改完 `data/csv/` 后跑 `load.py`」执行，就是拿 2,000 单订单 `DELETE`+`INSERT` 覆盖掉 854,140 单，命令正常退出、`verify_load.py` 随后全绿。已改成把「仓库交付的那一份」和「某个账号的湖此刻装的那一份」分开写，并在两处灌数指令上加了先核查再灌的告警。**2026-09-17 补上了**：声明落在 `docs/scale.json`（每一批数据的每表行数 + 三组缩放类 + 8 条文档声明的原文与出现次数），判据是 `scripts/lakehouse/verify_scale.py`——`--selftest` 进 L0（seed 声明逐表等于 `data/csv` 现数、声明原文还在且次数没变、数值对得上它自称的批次），连云那半进 L3（现查 35 张表 `count(*)`，必须逐表命中**某一批**已登记规模；命中不了就印出最像哪一批、差在哪些表）。L8 三条证明它会红：`scale-prompt-hardcoded` / `scale-decl-half-edited` / `scale-lake-unregistered-batch`。**剩下的缺口**：① 登记的是 8 处原文，`data-audit.md` / `data-walkthrough.md` 里其余描述规模的散文（尤其 220,087 这种含派生层的合计）没进对账面；② 判据只答「湖里装的是已登记的哪一批」，不答「这一批该不该装在这个账号上」——那是部署侧的事；③ `fixed` 那 11 张维度表不随 scale 放大**是数据缺口不是判据缺口**，见下面 `budget.py` 那两栏 |
 | **治理的「值级掩码」** | LF 没这个原语，落成了列级排除（列不可见），不是"测试缺失"而是**能力下降**，写在 L4 那一节。想要真掩码得上 Glue Catalog View，那条路的代价也写在那儿 |
 | **除 agent 外的其他访问者** | L4 只约束 `analytics-agent-ro` 这一个角色。谁还有这个账号的 LF/S3 权限（包括跑 `--apply` 的那个 admin），没有任何检查断言 |
 | **CLI 是否真的执行 `PreToolUse` 的拒绝** | `backend/agent.py --selftest`（L0）验的是两件**静态**的事：两侧 options 确实把闸门装在 `hooks` 上（AST 核对），以及直接调那个 hook 函数时放行/拒绝的**返回形状**对。它证明不了 CLI 收到那个形状后真的会拦——那一层只在 2026-08-24 用活探针验过一次：可达工具从 25 个降到 6 个、直接要求执行 shell 被拒、诱导读 `.env.local` 的注入被拒。**SDK 换一次 hook 语义或拒绝形状的键名，自测照样全绿而闸门已经死了**——和 `can_use_tool` 被 `bypassPermissions` 架空是同一种失效。要补就得像 `--ask` 那样烧一次真调用，断言 init 消息里的可达工具集合 |

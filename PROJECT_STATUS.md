@@ -700,7 +700,7 @@ Athena 实际取值**双向**比,两个方向都算失败(卡片多写了不存�
   调用复用、知识树从 S3 同步、exec role 假借治理角色)下次悄悄坏掉时,本地全绿、eval 全过,
   没有一盏灯会红。浏览器入口那三个栈是同一种情况:`deploy_web.sh` 有 7 项部署后线上验证,但
   「登录 → 提问 → SSE」这条链只人工走过一次。
-- **CI 只覆盖离线那一档**。`.github/workflows/offline.yml` 跑 `scripts/test_all.sh --l0`(33 条)
+- **CI 只覆盖离线那一档**。`.github/workflows/offline.yml` 跑 `scripts/test_all.sh --l0`(34 条)
   + `negative_tests.py --offline`(27 个用例) + CDK 那 9 条策略断言,都不连云。L1–L7 仍然只靠人在
   本地跑:那几层要的是能连这个账号的凭证,而公开示例仓库里不该放长期 key——所以这块缺口是
   刻意留着的,不是忘了。绿的 offline 不代表云上那条路是通的。
