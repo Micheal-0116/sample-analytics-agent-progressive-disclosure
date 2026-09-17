@@ -69,8 +69,20 @@ grant 里压根没有 `DELETE`，照样跑通了 19 万行。本脚本把 `DELET
 里有一条断言把它和 load.py 的用法绑在一起），但真正的验证要等治理层撤掉 admin
 之后才做得到。在那之前，这份清单是**声明，不是证明**。
 
-治理层（给 agent 单独一个最小权限角色、PII 列掩码）不在本次范围内。`--principal`
-预留了给别的身份发同一批权限的入口。
+## `--principal` 只给**管理侧**身份用，不给 agent 角色
+
+治理层已经实现了，在 `scripts/lakehouse/governance.py`（最小权限角色
+`analytics-agent-ro` + LF 列级排除）。本脚本第 7 步发的是**管理侧**那一套：
+`CREATE_TABLE / ALTER / DROP` 加一条 `TableWildcard` 的 `SELECT`。
+
+**这批权限绝不能发给 agent 角色。** LF 权限是累加的（见坑 1）：一条 `TableWildcard`
+的 SELECT 和一条带 `ExcludedColumnNames` 的授权并存时，宽的那条胜——`users.email`
+就又能查了，而 governance.py 那边的列级排除看起来还在，`--verify` 的探针会红在
+"读不到 users.email"上，指不到成因是**另一个脚本**发过一条通配。
+所以 `step7_grants()` 认出 agent 角色时**直接拒绝并退出**，不是打个警告继续。
+给 agent 发权限只有一个入口：`governance.py --apply`。
+
+`--principal` 的正当用法是"给另一个管理/灌数身份发同一批权限"（比如 CI 的角色）。
 
 用法：
 
@@ -78,7 +90,8 @@ grant 里压根没有 `DELETE`，照样跑通了 19 万行。本脚本把 `DELET
     python3 scripts/lakehouse/setup.py --verify        # 只读，报告每一步的现状
     python3 scripts/lakehouse/setup.py                 # 建（幂等，可反复跑）
     python3 scripts/lakehouse/setup.py --steps 5,7     # 只跑某几步
-    python3 scripts/lakehouse/setup.py --principal arn:aws:iam::…:role/agent  # 只发权限
+    python3 scripts/lakehouse/setup.py --principal arn:aws:iam::…:role/lakehouse-ci
+                                                       # 只发权限给另一个**管理侧**身份
 
 建完之后的顺序：
 
@@ -109,10 +122,14 @@ import athena  # noqa: E402  import 时不发任何 AWS 调用，--selftest 保�
 REGION = athena.REGION
 RAW_BUCKET = athena.RAW_BUCKET
 WORKGROUP = athena.WORKGROUP
+AGENT_WORKGROUP = athena.AGENT_WORKGROUP
 TABLE_BUCKET = athena.TABLE_BUCKET
 NAMESPACE = athena.NAMESPACE
 
-STAGING_PREFIX = "athena-staging/"
+# 从 athena.py 借，不再本地写一份字面量：governance.py 把同一个前缀写进 IAM 策略的
+# Resource，两处各写一遍漂了的表现是"策略看着给了、查询报拿不到结果桶"。
+STAGING_PREFIX = athena.STAGING_PREFIX
+AGENT_STAGING_PREFIX = athena.AGENT_STAGING_PREFIX
 CSV_PREFIX = "csv/"
 RAW_GLUE_DB = os.environ.get("RAW_GLUE_DB", "analytics_agent_raw")
 CATALOG_NAME = "s3tablescatalog"          # 见坑 3
@@ -121,6 +138,8 @@ CATALOG_NAME = "s3tablescatalog"          # 见坑 3
 BYTES_CUTOFF = int(os.environ.get("ATHENA_BYTES_CUTOFF", 1024 ** 3))
 
 WG_DESC = "Analytics agent · S3 Tables (Iceberg) via Athena"
+AGENT_WG_DESC = ("Analytics agent (least-privilege role) · separate result prefix so the "
+                 "agent role cannot read admin query results. See scripts/lakehouse/governance.py")
 CATALOG_DESC = "S3 Tables federated catalog (analytics agent)"
 RAW_DB_DESC = "CSV 落地区，只用于灌数中转"
 
@@ -265,8 +284,22 @@ def step1_raw_bucket(s3, verify: bool, staging_expire_days: int) -> int:
 
 # ---------------------------------------------------------------- 2 workgroup
 
-def step2_workgroup(ath, verify: bool) -> int:
-    out = f"s3://{RAW_BUCKET}/{STAGING_PREFIX}"
+def workgroup_plan() -> list[tuple[str, str, str]]:
+    """(名字, OutputLocation, 描述) —— **两个** workgroup。
+
+    管理侧和 agent 侧的结果集必须落在不同的 S3 前缀下。共用一个前缀时，agent 角色
+    对该前缀的 GetObject 让它能读到管理侧查询的结果 CSV——那里面有 LF 已经从它眼里
+    排除掉的明文（治理探针自己就会查一次 `users.email`）。理由的完整版在
+    `athena.py` 的 `AGENT_WORKGROUP` 上方；IAM 侧的对应改动在
+    `governance.py` 的 `policy_document()`。
+    """
+    return [
+        (WORKGROUP, f"s3://{RAW_BUCKET}/{STAGING_PREFIX}", WG_DESC),
+        (AGENT_WORKGROUP, f"s3://{RAW_BUCKET}/{AGENT_STAGING_PREFIX}", AGENT_WG_DESC),
+    ]
+
+
+def _ensure_workgroup(ath, name: str, out: str, desc: str, verify: bool) -> int:
     want = {
         "ResultConfiguration": {"OutputLocation": out},
         "EnforceWorkGroupConfiguration": True,
@@ -275,49 +308,66 @@ def step2_workgroup(ath, verify: bool) -> int:
         "EngineVersion": {"SelectedEngineVersion": "AUTO"},
     }
     try:
-        wg = ath.get_work_group(WorkGroup=WORKGROUP)["WorkGroup"]
+        wg = ath.get_work_group(WorkGroup=name)["WorkGroup"]
     except ClientError as e:
         if _code(e) != "InvalidRequestException":
             raise
         if verify:
-            log(f"[2] ❌ workgroup {WORKGROUP} 不存在")
+            log(f"      ❌ workgroup {name} 不存在")
             return 1
-        ath.create_work_group(Name=WORKGROUP, Description=WG_DESC,
-                              Configuration=want)
-        log(f"[2] 建 workgroup {WORKGROUP}"
+        ath.create_work_group(Name=name, Description=desc, Configuration=want)
+        log(f"      建 workgroup {name} → {out}"
             f"（engine v3 / 扫描上限 {BYTES_CUTOFF // 1024 ** 2} MiB / 强制生效）")
         return 0
 
     cfg = wg.get("Configuration", {})
     eff = cfg.get("EngineVersion", {}).get("EffectiveEngineVersion", "?")
-    log(f"[2] workgroup {WORKGROUP} 已存在（{eff}，状态 {wg.get('State')}）")
+    log(f"      workgroup {name} 已存在（{eff}，状态 {wg.get('State')}）")
 
     bad = 0
     got_out = cfg.get("ResultConfiguration", {}).get("OutputLocation")
     if got_out != out:
-        log(f"      ⚠️  结果位置是 {got_out}，本脚本期望 {out}")
+        # **agent 那个 workgroup 的结果位置是治理边界的一部分**，不是偏好：
+        # 它指回共享前缀就等于 B3 那个洞回来了（agent 的 IAM 策略只覆盖子前缀，
+        # 所以症状还会是"agent 查询能提交、取结果时 AccessDenied"，指不到成因）。
+        # 管理侧那个只是约定，说一句就够。
+        if name == AGENT_WORKGROUP:
+            log(f"      ❌ {name} 的结果位置是 {got_out}，必须是 {out}"
+                f"（共享前缀 = agent 能读到管理侧查询结果里的明文）")
+            bad += 1
+        else:
+            log(f"      ⚠️  结果位置是 {got_out}，本脚本期望 {out}")
     # 护栏漂了要说话。这是唯一的成本上限，被人关掉而没人发现是最坏的情况。
+    guard_bad = 0
     if not cfg.get("EnforceWorkGroupConfiguration"):
         log("      ❌ EnforceWorkGroupConfiguration=false，单条查询可以绕过扫描上限")
-        bad += 1
+        guard_bad += 1
     got_cut = cfg.get("BytesScannedCutoffPerQuery")
     if got_cut != BYTES_CUTOFF:
         log(f"      ⚠️  扫描上限是 {got_cut}，本脚本期望 {BYTES_CUTOFF}")
         if got_cut is None:
             log("         （None = 没有上限，成本护栏等于没有）")
-            bad += 1
+            guard_bad += 1
     else:
         log(f"      扫描上限 {BYTES_CUTOFF // 1024 ** 2} MiB，强制生效 ✅")
 
-    if bad and not verify:
+    if guard_bad and not verify:
         # 只补护栏这一项，不整体覆盖别人可能改过的其它配置。
-        ath.update_work_group(WorkGroup=WORKGROUP, ConfigurationUpdates={
+        # **结果位置刻意不自动改**：它可能是别人有意指走的，而改它会让正在跑的查询
+        # 换落点。报出来让人决定。
+        ath.update_work_group(WorkGroup=name, ConfigurationUpdates={
             "EnforceWorkGroupConfiguration": True,
             "BytesScannedCutoffPerQuery": BYTES_CUTOFF,
         })
         log("      已补回成本护栏")
-        return 0
-    return bad
+        guard_bad = 0
+    return bad + guard_bad
+
+
+def step2_workgroup(ath, verify: bool) -> int:
+    log(f"[2] Athena workgroup ×{len(workgroup_plan())}"
+        f"（管理侧 / agent 侧结果前缀分开，见 workgroup_plan 的说明）")
+    return sum(_ensure_workgroup(ath, n, o, d, verify) for n, o, d in workgroup_plan())
 
 
 # ---------------------------------------------------------------- 3 LF admin
@@ -453,8 +503,45 @@ def step6_namespace(s3t, acct: str, verify: bool) -> int:
 
 # ---------------------------------------------------------------- 7 LF 授权
 
+# agent 那个最小权限角色的名字。默认值与 governance.py 的 `ROLE_NAME` 同源
+# （同一个环境变量、同一个默认值），所以改名不会让下面这道闸悄悄失效。
+AGENT_ROLE_NAME = os.environ.get("AGENT_ROLE_NAME", "analytics-agent-ro")
+
+
+def wildcard_grant_refusal(principal: str) -> str | None:
+    """这个 principal 能不能收第 7 步那批权限？不能就返回拒绝理由（纯函数，可离线自测）。
+
+    要挡的是「把管理侧的 `TableWildcard` SELECT 发给 agent 角色」。LF 权限累加，
+    宽的那条胜，于是列级排除被一条通配整体废掉，而 governance.py 那边的授权还在，
+    症状（探针报"读得到 users.email"）指不到成因在另一个脚本里。见模块 docstring。
+
+    判据是 ARN 尾部的**角色名**，不是子串匹配：`role/analytics-agent-ro-staging`
+    是另一个角色，不该被这道闸拦住；而 `assumed-role/analytics-agent-ro/xxx`
+    这种会话 ARN 要拦住——它指的就是同一个角色。
+    """
+    if not principal:
+        return None
+    tail = principal.rsplit(":", 1)[-1]          # role/xxx 或 assumed-role/xxx/sess
+    parts = tail.split("/")
+    name = parts[1] if len(parts) > 1 else ""
+    if name != AGENT_ROLE_NAME:
+        return None
+    return (f"{principal} 是 agent 的最小权限角色（{AGENT_ROLE_NAME}）。"
+            f"第 7 步发的是管理侧权限，含一条 TableWildcard 的 SELECT，"
+            f"而 LF 权限是累加的 —— 发下去等于把 governance.py 的列级排除整体废掉"
+            f"（users.email / phone、user_profiles.birth_date 又能查了）。"
+            f"给 agent 发权限走 scripts/lakehouse/governance.py --apply。")
+
+
 def step7_grants(lf, acct: str, principal: str, verify: bool) -> int:
-    """给 principal 发 database + table 通配两组权限，见坑 1 和「授权现状」。"""
+    """给 principal 发 database + table 通配两组权限，见坑 1 和「授权现状」。
+
+    收到 agent 角色时**拒绝**（不是警告后继续）：理由见 `wildcard_grant_refusal`。
+    """
+    refusal = wildcard_grant_refusal(principal)
+    if refusal:
+        log(f"[7] ❌ 拒绝发这批权限：{refusal}")
+        return 1
     cid = f"{acct}:{CATALOG_NAME}/{TABLE_BUCKET}"
     targets = [
         ("Database", {"Database": {"CatalogId": cid, "Name": NAMESPACE}},
@@ -547,9 +634,58 @@ def selftest() -> int:
         bad += 1
 
     # 常量必须跟 athena.py 是同一份（不是各写一遍）
-    for name in ("REGION", "RAW_BUCKET", "WORKGROUP", "TABLE_BUCKET", "NAMESPACE"):
+    for name in ("REGION", "RAW_BUCKET", "WORKGROUP", "AGENT_WORKGROUP",
+                 "TABLE_BUCKET", "NAMESPACE", "STAGING_PREFIX", "AGENT_STAGING_PREFIX"):
         if globals()[name] is not getattr(athena, name):
             print(f"  ❌ {name} 跟 athena.py 不是同一个对象，两处定义会漂")
+            bad += 1
+
+    # 两个 workgroup 的结果位置必须真的分开，而且 agent 那个要是共享前缀的子前缀。
+    # 这是 B3 那道边界的**声明侧**；IAM 侧由 governance.py 的 policy_findings 盯，
+    # 云上侧由 governance.py 的 probe_staging_isolation 盯。三处缺一条都能让洞回来。
+    plan = dict((n, o) for n, o, _ in workgroup_plan())
+    if len(plan) != 2:
+        print(f"  ❌ workgroup_plan 只给了 {len(plan)} 个 workgroup，管理侧和 agent 侧必须分开")
+        bad += 1
+    admin_out = plan.get(WORKGROUP, "")
+    agent_out = plan.get(AGENT_WORKGROUP, "")
+    if WORKGROUP == AGENT_WORKGROUP:
+        print("  ❌ 两个 workgroup 同名 —— 那就是同一个，结果集没分开")
+        bad += 1
+    if not agent_out or agent_out == admin_out:
+        print(f"  ❌ agent workgroup 的结果位置 {agent_out!r} 没跟管理侧 {admin_out!r} 分开"
+              f"（共享前缀 = agent 能读到管理侧结果里的明文 PII）")
+        bad += 1
+    if not agent_out.startswith(admin_out) or agent_out == admin_out:
+        print(f"  ❌ agent 结果前缀 {agent_out!r} 不是 {admin_out!r} 的真子前缀 ——"
+              f" 生命周期规则和授权范围都是照共享前缀算的")
+        bad += 1
+    if not AGENT_STAGING_PREFIX.endswith("/"):
+        print(f"  ❌ {AGENT_STAGING_PREFIX!r} 没以 / 结尾，"
+              f"S3 前缀条件会匹配到 athena-staging/agentXXX/ 这类兄弟前缀")
+        bad += 1
+
+    # S2：管理侧那批权限（含 TableWildcard 的 SELECT）不许发给 agent 角色。
+    # 红绿两侧都查——只查"该拒的拒了"的话，一个恒返回拒绝的实现也是绿的。
+    must_refuse = [
+        f"arn:aws:iam::123456789012:role/{AGENT_ROLE_NAME}",
+        f"arn:aws:sts::123456789012:assumed-role/{AGENT_ROLE_NAME}/some-session",
+    ]
+    for p in must_refuse:
+        if not wildcard_grant_refusal(p):
+            print(f"  ❌ wildcard_grant_refusal({p}) 放过了 agent 角色 ——"
+                  f" 一条 TableWildcard 就能废掉全部列级排除")
+            bad += 1
+    must_allow = [
+        "arn:aws:iam::123456789012:role/lake-admin",
+        "arn:aws:iam::123456789012:role/lakehouse-ci",
+        # 名字以 agent 角色名开头但**不是**它。子串匹配会在这里误伤。
+        f"arn:aws:iam::123456789012:role/{AGENT_ROLE_NAME}-staging",
+        "arn:aws:iam::123456789012:user/alice",
+    ]
+    for p in must_allow:
+        if wildcard_grant_refusal(p):
+            print(f"  ❌ wildcard_grant_refusal({p}) 误拦了管理侧身份")
             bad += 1
 
     # 护栏不能被无意调低到无效值：Athena 的下限是 10 MB
@@ -580,8 +716,10 @@ def selftest() -> int:
     if bad:
         print(f"\n{bad} 项失败 ❌")
         return 1
-    print(f"  ARN 归一 {len(cases)} 例、建桶参数 2 例、常量同源 5 项、"
+    print(f"  ARN 归一 {len(cases)} 例、建桶参数 2 例、常量同源 8 项、"
           f"护栏下限 1 项、权限与用法绑定 {len(used)} 项、目录 ID 形式 2 项")
+    print(f"  两个 workgroup 结果前缀分开 5 项、"
+          f"通配授权不发给 agent 角色 {len(must_refuse)} 拒 + {len(must_allow)} 放")
     print("全部通过 ✅")
     return 0
 

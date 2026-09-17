@@ -263,29 +263,133 @@ def fix_comments(fixes: list[tuple[str, str, str, str]], apply: bool = False) ->
     return 0
 
 
-# ---------------------------------------------- 语义层 / 指标层（复用 v2 的实现）
+# ---------------------------------------------- 语义层 / 指标层
+#
+# 这两个函数（`card_columns` / `metric_columns`）原来是用 `importlib` 从
+# `scripts/glue/reconcile.py` 里加载的，理由是"读的是 knowledge/ 和 metrics_def.py，
+# 跟查询引擎没关系，复制一份必然漂移"。第一句是对的，结论错了：Redshift 退役之后
+# `scripts/glue/` 是**死路径**（AGENTS.md 明写"不要照着走"），而 L2 每次对账都要走进去
+# 加载它。后果已经发生了——那份"v2 的"代码里现在写着 Athena 的 `COLUMN_NOT_FOUND`
+# 和 `meta_snapshot` 锚点，也就是说它其实一直在被当活代码改，只是放错了地方。一个
+# "已退役"的目录里躺着活代码，比两份会漂移的代码更难发现。
+#
+# 所以搬过来。`scripts/glue/reconcile.py` 原样留着，作为 v2 的历史记录不再被引用。
 
-_V2 = None
+CARD_FIELD_SECTION = re.compile(r"^##\s*(表结构|字段)\s*$")
+CARD_ANY_SECTION = re.compile(r"^##\s+\S")
 
 
-def _v2():
-    """加载 `scripts/glue/reconcile.py`，复用它的 `card_columns` / `metric_columns`。
+def card_columns() -> dict[str, set[str]]:
+    """语义层：从 knowledge/domains/**/<表>.md 的**「表结构」小节**里抽列名。
 
-    这两个函数读的是 knowledge/ 和 backend/metrics_def.py，跟查询引擎**一点关系没有**，
-    换 Redshift → Athena 不影响它们。而它们各自都踩过一个坑（卡片必须只扫「表结构」
-    小节、SQL 关键字要一次列全），复制一份必然漂移，所以直接 import 那份。
-
-    用 importlib 而不是把 `scripts/glue` 加进 `sys.path`：那个目录里的文件也叫
-    `reconcile.py`，加进 path 会和本文件抢同一个模块名。
+    必须限定小节。第一版扫了卡片里所有 markdown 表格，结果把「字段枚举值」小节里的
+    枚举行（`| paid | 已支付 |`、`| male | 男 |`）也当成了列名，报出 40 多处假漂移。
+    **带假阳性的检查器比没有更糟**：人看两眼就不再信它，真问题也一起被忽略。
     """
-    global _V2
-    if _V2 is None:
-        import importlib.util
-        path = ROOT / "scripts" / "glue" / "reconcile.py"
-        spec = importlib.util.spec_from_file_location("_v2_reconcile", path)
-        _V2 = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(_V2)
-    return _V2
+    out: dict[str, set[str]] = {}
+    base = ROOT / "knowledge" / "domains"
+    for p in base.rglob("*.md"):
+        name = p.stem
+        if name.startswith("_"):
+            continue
+        cols: set[str] = set()
+        in_fields = False
+        for line in p.read_text(encoding="utf-8").splitlines():
+            if CARD_FIELD_SECTION.match(line.strip()):
+                in_fields = True
+                continue
+            if in_fields and CARD_ANY_SECTION.match(line.strip()):
+                in_fields = False                      # 离开表结构小节
+                continue
+            if not in_fields or not line.strip().startswith("|"):
+                continue
+            cells = [c.strip().strip("`*") for c in line.strip().strip("|").split("|")]
+            if cells and re.fullmatch(r"[a-z_][a-z0-9_]*", cells[0] or ""):
+                cols.add(cells[0])
+        if cols:
+            out[name] = cols
+    return out
+
+
+# SQL 关键字与内建函数。D 检查要从指标 SQL 里挑出「像列名但表里没有」的标识符，
+# 靠正则分词必然把关键字一起捞进来，所以需要剔除。
+#
+# 第一版这个集合是「遇到假阳性就补一个」攒出来的，结果漏了 `IS NOT NULL` 里的 `is`，
+# 在 mart_user_summary 上报了一处假漂移。关键字是**已知有限集**，不该增量攒——
+# 一次列全，比每次踩到再补可靠。
+#
+# 搬过来时**一个词都没动**。这是个用来**剔除**的集合：加词只会让 D 检查少报，
+# 而少报的正是"口径指向了不存在的列"这类最阴险的漂移。里面留着 Redshift 方言的词
+# （`dateadd` / `datediff` / `super` / `timestamptz`）——删掉它们不会增强检查，
+# 只会在有人跑历史 SQL 时凭空多几处误报。要加 Trino 侧的词，得先有一处真实误报。
+SQL_RESERVED = {
+    # 子句与运算符
+    "select", "from", "where", "group", "by", "order", "having", "limit", "offset",
+    "join", "inner", "left", "right", "full", "outer", "on", "using", "as",
+    "and", "or", "not", "is", "in", "like", "ilike", "between", "exists", "all",
+    "any", "some", "union", "except", "intersect", "distinct", "asc", "desc",
+    "case", "when", "then", "else", "end", "over", "partition", "filter",
+    "null", "true", "false", "with", "recursive",
+    # 类型
+    "int", "integer", "bigint", "smallint", "decimal", "numeric", "real",
+    "double", "precision", "float", "varchar", "char", "text", "boolean",
+    "date", "timestamp", "timestamptz", "interval", "super",
+    # 时间单位
+    "year", "quarter", "month", "week", "day", "hour", "minute", "second",
+    # 常用函数
+    "sum", "count", "avg", "min", "max", "abs", "round", "floor", "ceil",
+    "cast", "coalesce", "nullif", "greatest", "least", "nvl",
+    "date_trunc", "dateadd", "datediff", "to_char", "to_date", "extract",
+    "current_date", "current_timestamp", "row_number", "rank", "dense_rank",
+    "lag", "lead", "first_value", "last_value", "substring", "concat", "length",
+    # 本项目约定：dt 是所有日表的日期分区列名，出现在几乎每条口径里
+    "dt",
+}
+
+
+def metric_columns() -> dict[str, set[str]]:
+    """治理指标层：每个 metric 的目标表 → 该 metric 会引用到的列。
+
+    不止 SQL 里字面出现的标识符。metric_layer 编译时还会**隐式注入**两类列，
+    它们在注册表里是配置、不在 sql 字符串里，原来这个函数扫不到：
+      · 时间锚点列（time_col，缺省 dt）—— 出现在 WHERE 和 (SELECT max(...)) 里
+      · 维度列（dimensions → DIMENSIONS[d]['sql']）—— 出现在 SELECT / GROUP BY 里
+    漏掉的代价是真实发生过的：repurchase_rate_30d 作用在 mart_user_summary（按用户
+    建行、无 dt 列），带时间窗调用时在 Athena 上抛 COLUMN_NOT_FOUND，而对账**照样通过**，
+    因为 dt 既不在它的 sql 里、又被 SQL_RESERVED 过滤掉。现在两类都算进来，
+    这类"配置指向了表里不存在的列"在 L2 就红，不用等运行时。
+    """
+    import metrics_def
+    sql_words = re.compile(r"[a-z_][a-z0-9_]*")
+    bare_col = re.compile(r"^[a-z_][a-z0-9_]*$")
+    reserved = SQL_RESERVED
+    out: dict[str, set[str]] = {}
+    for name, m in metrics_def.METRICS.items():
+        table = m.get("table")
+        if not table:
+            continue
+        parts = [m.get("sql", ""), m.get("numerator", ""), m.get("denominator", "")]
+        words = set()
+        for p in parts:
+            words |= {w for w in sql_words.findall(str(p).lower()) if w not in reserved}
+        # 被过滤的时间列：time_col 显式为 None = 该指标不支持时间窗，没有列要校验。
+        time_col = m.get("time_col", "dt")
+        if time_col:
+            words.add(str(time_col).lower())
+        # 全局锚点表（meta_snapshot.as_of_date）：它不是任何指标的 table，但每个带
+        # 时间窗的调用都会查它。少了它 = 所有相对窗口在运行时炸，所以也要对账。
+        anchor = re.search(r"max\((\w+)\)\s+from\s+(\w+)",
+                           str(getattr(metrics_def, "ANCHOR_SQL", "")).lower())
+        if anchor and time_col:
+            out.setdefault(anchor.group(2), set()).add(anchor.group(1))
+        # 维度列：只校验裸列名；表达式型维度（含函数/运算）跳过，交给 verify_doc_sql。
+        for d in m.get("dimensions", []):
+            dim_sql = str(metrics_def.DIMENSIONS.get(d, {}).get("sql", "")).lower()
+            if bare_col.match(dim_sql):
+                words.add(dim_sql)
+        out.setdefault(table, set())
+        out[table] |= words
+    return out
 
 
 def main() -> int:
@@ -312,8 +416,8 @@ def main() -> int:
 
     dec = declared()
     act = glue_state(a.catalog, a.database, a.region)
-    cards = _v2().card_columns()
-    metrics = _v2().metric_columns()
+    cards = card_columns()
+    metrics = metric_columns()
 
     print(f"声明态（DDL）      {len(dec)} 张表")
     print(f"实际态（Glue）     {len(act)} 张表   catalog={a.catalog} db={a.database}")

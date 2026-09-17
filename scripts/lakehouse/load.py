@@ -1,6 +1,21 @@
 #!/usr/bin/env python3
 r"""把 data/csv 的 35 张表灌进 S3 Tables（Iceberg）。
 
+## ⚠️ 跑之前先确认湖里现在装的是哪一批
+
+本脚本的"幂等"是**逐表 `DELETE FROM` 再 `INSERT`**——幂等的前提是两次灌的是**同一份源**。
+在一个已经装了别的批次的湖上跑它，就是覆盖，而且是静默的：命令正常退出，随后
+`verify_load.py` 还会全绿（它比的就是 `data/csv/` ⟷ Athena，两边一致正是覆盖成功的结果）。
+
+`data/csv/` 是 `scripts/gen/main.py --scale 1` 的小样（`orders` 2,000 行）。本仓库开发账号
+2026-09-17 实测湖里是 **8000 万行**那一批（`orders` 854,140，由 `feat/data-reload-80m` 的
+`load_parquet.py` 从 parquet 灌的，那个脚本不在本分支上）。在那样的湖上跑本脚本，等于拿
+2,000 单订单覆盖掉 854,140 单。判据一条命令：
+
+    SELECT count(*) FROM orders     -- 2,000 → 种子，可以跑；854,140 → 别跑
+
+背景与逐表对照见 `docs/deployment.md` 的「数据说明」。
+
 ## 路径：CSV → S3 → Glue 外部表 → INSERT INTO Iceberg
 
     data/csv/users.csv

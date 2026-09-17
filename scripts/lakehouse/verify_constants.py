@@ -124,9 +124,10 @@ RELOAD_PENDING = {
         "tables.py 里是真点击时刻 click。线上库 350 行全等于灌数那一瞬，"
         "于是任何按归因时间分桶的问题都只有一个桶",
     "user_profiles.country":
-        "生成器是 F.const(n, 'China')，卡片 user_profiles.md:13 也写 'China'，"
-        "而线上库是 '中国' —— **卡片与库此刻不一致**，WHERE country = 'China' 返回 0 行。"
-        "重灌会让三方一致；在那之前这一列的字面量以库为准",
+        "生成器是 F.const(n, 'China')，而 data/csv 与线上库都是 '中国'——"
+        "WHERE country = 'China' 返回 0 行。卡片（user_profiles.md）已按库改成 '中国' "
+        "并标了退化列，所以现在不一致的只剩生成器这一侧；重灌会让三方一致，"
+        "在那之前这一列的字面量以库为准",
     # 下面 8 列是同一件事：v1 灌数时把审计时间戳写成了装载那一瞬。生成器全部把它们
     # 挂在真实业务事件上（reg / st / vt / ev_time / first / ts_window），一个 F.const 都没有。
     "users.created_at": "生成器挂在注册时刻 reg 上；线上库是 v1 的装载瞬时值",

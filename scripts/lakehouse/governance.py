@@ -39,14 +39,36 @@ Glue Catalog View（把 agent 指到另一个 database，48 张表全部复制�
 "有人悄悄把 email 从 EXCLUDE_COLUMNS 里拿掉"会在**离线**就变红（L8
 `gov-policy-loosened` 就是注入这个），而不是等到某天有人翻查询日志才发现。
 
-## 明文旁路：CSV 中转库
+## 明文旁路一：CSV 中转库
 
 `analytics_agent_raw` 那 35 张 `*_csv` 外部表指着 `s3://<原始桶>/csv/`，里面是**明文
 CSV**。LF 的列级排除完全管不到它——那是普通 Glue 库 + 普通 S3 对象。所以角色的 IAM
-策略里，S3 读权限**只到 `athena-staging/` 前缀**，`csv/` 一个字节都不给；
-`--selftest` 有一条断言专门盯这个（连"给它加一条 csv/* 的 GetObject"这种改法都会红），
-`--verify` 里也有一条真探针去查 `users_csv.email` 并要求它失败。
-把这条漏了，前面所有列级授权都是装饰。
+策略里，S3 读权限**一个字节都不给 `csv/`**；`--selftest` 有一条断言专门盯这个
+（连"给它加一条 csv/* 的 GetObject"这种改法都会红），`--verify` 里也有一条真探针
+去查 `users_csv.email` 并要求它失败。把这条漏了，前面所有列级授权都是装饰。
+
+## 明文旁路二：Athena 自己的查询结果
+
+同类、更隐蔽，而且**它一度是真的**：Athena 把每条查询的结果写成 CSV 落到 workgroup
+的 `OutputLocation`，那份 CSV 是**明文行数据**。原来两侧共用一个 workgroup、共用
+`athena-staging/` 前缀，而 agent 角色对该前缀有 `GetObject`/`PutObject`——于是
+
+- LF 在目录层从它眼里拿掉的 `users.email`，它可以从**管理侧查询的结果文件**里读回来。
+  而管理侧真的会跑那条查询：这个脚本的 `--verify --as-caller` 每次都执行一遍
+  `SELECT email FROM users LIMIT 1`，那一行明文就落在共享前缀下。
+- 反方向也通：它能**覆盖**管理侧的结果对象，而对账脚本会把结果读回去比数字。
+
+修法是拆成两个 workgroup、两个前缀（`athena-staging/` 与 `athena-staging/agent/`），
+agent 的 S3 授权面只到后者。三处各盯一段，缺一段这个洞就能悄悄回来：
+
+- **声明侧**：`setup.py` 的 `workgroup_plan()` + 它的自测（两个 workgroup 的结果位置
+  必须真的分开，且 agent 那个是真子前缀）。
+- **策略侧（离线）**：`policy_findings()`——把前缀退回 `athena-staging/`、把
+  `s3:prefix` 条件退回共享前缀、或者授权到管理侧 workgroup，三种改法都会红。
+- **云上侧**：`probe_staging_isolation()`——以角色凭证真去列 / 读 / 写管理侧前缀，
+  三样都必须被拒。它盯的是"角色上实际挂着的策略"，而离线那道只盯本脚本声明的文本。
+
+一句话：LF 的列级排除管的是「查得到吗」，管不了「结果放哪儿」。
 
 ## 踩出来的点
 
@@ -100,11 +122,18 @@ import athena  # noqa: E402  import 时不发任何 AWS 调用，--selftest 保�
 
 REGION = athena.REGION
 RAW_BUCKET = athena.RAW_BUCKET
-WORKGROUP = athena.WORKGROUP
 TABLE_BUCKET = athena.TABLE_BUCKET
 NAMESPACE = athena.NAMESPACE
 
-STAGING_PREFIX = "athena-staging/"
+# **agent 走自己的 workgroup 和自己的结果前缀**，管理侧那一对只在这里作为"不许碰
+# 的那一半"出现。理由见 `athena.py` 的 `AGENT_WORKGROUP` 上方；一句话版本：
+# workgroup 的 OutputLocation 决定结果 CSV 落在哪个 S3 前缀，而结果 CSV 是明文行
+# 数据 —— 共用前缀时 agent 能从管理侧的结果文件里把 LF 已经排除掉的 email 读回来，
+# 还能覆盖管理侧的结果对象。列级排除管"查得到吗"，管不了"结果放哪儿"。
+ADMIN_WORKGROUP = athena.WORKGROUP
+WORKGROUP = athena.AGENT_WORKGROUP
+STAGING_PREFIX = athena.STAGING_PREFIX
+AGENT_STAGING_PREFIX = athena.AGENT_STAGING_PREFIX
 CATALOG_NAME = "s3tablescatalog"
 RAW_GLUE_DB = os.environ.get("RAW_GLUE_DB", "analytics_agent_raw")
 
@@ -141,6 +170,20 @@ MUST_NOT_READ_COLUMNS = (("users", "email"), ("users", "phone"),
 # 明文旁路：CSV 中转库里的同一份数据（普通 Glue 表 + 明文 S3 对象，LF 管不到）
 MUST_NOT_READ_RAW = (("users_csv", "email"),)
 
+# Iceberg 的**元数据表**（`<表>$files` / `$snapshots` / `$manifests`）。单独钉一条的
+# 理由和 MUST_NOT_READ_RAW 完全同类——它是一条**从 SQL 里读出旁路入口**的路：
+# `users$files` 的 `file_path` 列直接给出数据文件的 S3 路径，拿到路径再配上
+# `s3tables:GetTableData`（那个权限**必须**给，理由见上面那段长注释）就能绕过
+# 查询引擎的列级排除去读明文。`backend/db.py` 的 validate() 不会挡它（只读闸门管的是
+# 写操作，`users$files` 是个合法的 SELECT）。
+#
+# 实测（2026-09-16，两个身份对跑）：agent 角色查 `users$files` / `users$snapshots`
+# 报 `TABLE_NOT_FOUND: … or requester is not authorized`；**管理员身份查得到**
+# （返回 content / file_path / file_format / record_count / file_size_in_bytes）。
+# 两边不一样才说明这道边界是权限给的，不是"S3 Tables 压根不支持元数据表"——
+# 后者的话这条探针绿了也什么都不证明，而 `--as-caller` 负测模式正好会把这件事戳破。
+MUST_NOT_READ_META = ("users$files", "users$snapshots")
+
 MUST_READ_TABLES = ("users", "user_profiles", "orders", "channels",
                     "mart_daily_kpi", "meta_snapshot", "tmp_campaign_roi_analysis")
 MUST_READ_COLUMNS = (("users", "user_id"), ("users", "username"),
@@ -169,7 +212,12 @@ _NOT_A_DENIAL = re.compile(
     r"Unable to verify/create output bucket|"        # 结果桶权限，跟数据授权无关
     r"WORKGROUP_NOT_FOUND|workgroup .* not found|"   # 环境配错
     r"ExpiredToken|security token included in the request is expired|"
-    r"ThrottlingException|TooManyRequests|SlowDown",  # 被限流不是被拒绝
+    r"ThrottlingException|TooManyRequests|SlowDown|"  # 被限流不是被拒绝
+    # AssumeRole 本身被拒 —— 这一轮**没能变成 agent 角色**，所以每条探针用的都是
+    # 别的身份。它长得最像"权限挡住了"（就是一条 AccessDenied），而它意味着的恰恰
+    # 是"什么都没测到"。[7] 那里 assume 完会立刻 get_caller_identity() 把这种情况
+    # 挡在探针之前；这一条是第二层，防的是别处新写的调用绕过那道检查。
+    r"sts:AssumeRole|not authorized to perform: sts:",
     re.IGNORECASE)
 
 
@@ -261,19 +309,138 @@ def catalog_id(acct: str) -> str:
 
 # ---------------------------------------------------------------- IAM 策略文本
 
+TRUST_SID = "AllowAgentRuntimeAndDeveloper"
+
+
 def trust_policy(principals: list[str]) -> dict:
-    """谁能 assume 这个角色。
+    """谁能 assume 这个角色。**只在角色不存在、要新建时用这个。**
 
     只放调用方自己的 role ARN（本地开发就是你当前的开发者角色）。上云时把
-    AgentCore Runtime 的执行角色也加进来——**追加，不是替换**，所以这里收的是
-    一个列表。
+    AgentCore Runtime 的执行角色也加进来——追加不是替换，所以这里收的是一个列表。
+    角色已经存在的情况走 `merge_trust_policy()`，别拿这个函数的返回值去
+    `update_assume_role_policy`：那会把现有文档整个换掉。
     """
     return {"Version": "2012-10-17", "Statement": [{
-        "Sid": "AllowAgentRuntimeAndDeveloper",
+        "Sid": TRUST_SID,
         "Effect": "Allow",
         "Principal": {"AWS": sorted(set(principals))},
         "Action": "sts:AssumeRole",
     }]}
+
+
+class TrustPrincipalError(ValueError):
+    """`--trust` 或当前身份给出的 principal 不能进信任策略。"""
+
+
+def validate_principals(principals: list[str]) -> list[str]:
+    """信任策略的入口校验。**只放具体的 IAM role/user ARN。**
+
+    三类要拦（都不是假想的）：
+
+    1. `*` —— 任何账号的任何身份都能 assume 这个角色。`--trust '*'` 原来直接就写进去了，
+       而写进去之后这个角色不再是「最小权限」，是「任何人都能拿的最小权限」。
+    2. `arn:aws:iam::<账号>:root` —— 那不是一个身份，是整个账号：账号里任何有
+       `sts:AssumeRole` 的 principal 都能扮演它。`me` 是从 `get_caller_identity()` 来的,
+       用 root 凭证跑一次 `--apply`，root 就这么进了信任策略，而且没有一行日志说这事。
+    3. 不是 `arn:aws:iam::` 开头的 —— 服务 principal（`lambda.amazonaws.com`）、
+       联合身份、拼错的 ARN。服务 principal 要进的话得显式写一条带 Condition 的语句，
+       不该从这个列表悄悄溜进来。注意 `arn:aws:sts::…:assumed-role/…` 也在这里被拦：
+       它是一个**会话**而不是一个身份，写进信任策略不会生效（要写它背后那个 role），
+       `setup.caller_role_arn()` 就是为了把它换算回 role ARN 的。
+
+    去重并排序返回，让 `--apply` 幂等。
+    """
+    out: set[str] = set()
+    for p in principals:
+        p = (p or "").strip()
+        if not p:
+            continue
+        if p == "*" or p.endswith(":root"):
+            raise TrustPrincipalError(
+                f"拒绝把 {p!r} 放进 {ROLE_NAME} 的信任策略："
+                + ("`*` 等于任何账号的任何身份都能 assume 它。"
+                   if p == "*" else
+                   "`:root` 是整个账号而不是一个身份，账号里任何能 AssumeRole 的"
+                   "principal 都能扮演这个角色。用 root 凭证跑的话，改用具体的"
+                   "开发者角色：--trust arn:aws:iam::<账号>:role/<角色名>。")
+            )
+        if not p.startswith("arn:aws:iam::"):
+            raise TrustPrincipalError(
+                f"拒绝把 {p!r} 放进 {ROLE_NAME} 的信任策略：只接受具体的 "
+                f"arn:aws:iam::<账号>:role/… 或 :user/…。"
+                + ("`assumed-role` 是会话不是身份，写进去不生效——要写它背后那个 role。"
+                   if ":assumed-role/" in p else
+                   "服务 principal / 联合身份要单独写一条带 Condition 的语句。")
+            )
+        out.add(p)
+    if not out:
+        raise TrustPrincipalError("信任策略的 principal 列表为空——角色会没人能 assume")
+    return sorted(out)
+
+
+def _as_list(v) -> list:
+    """IAM 文档里「单值可以不写成数组」，读的时候要两种都接。"""
+    if v is None:
+        return []
+    return [v] if isinstance(v, str) else list(v)
+
+
+def unconditional_principals(doc: dict) -> set[str]:
+    """文档里**无条件**就能 `sts:AssumeRole` 的 AWS principal 集合。
+
+    两处刻意从严，都是为了别把"其实 assume 不到"读成"已经齐了"：
+
+    - 带 `Condition` 的语句不算。信任策略里的条件通常正是门槛（要求 MFA、要求
+      `sts:ExternalId`），Runtime 的 exec role 满足不了；把它当成"已授权"会让
+      `--verify` 绿着而云上 assume 失败。
+    - 只认 `Effect: Allow`。`Deny` 语句里出现的 principal 当然不算授权。
+
+    代价是：如果有人手工给我们这条加了 Condition，`--apply` 会另外补一条无条件的
+    语句进去（而不是改他那条）。那是**该发生**的——脚本不改别人写的语句。
+    """
+    out: set[str] = set()
+    for st in _as_list(doc.get("Statement")):
+        if not isinstance(st, dict) or st.get("Effect") != "Allow" or st.get("Condition"):
+            continue
+        acts = _as_list(st.get("Action"))
+        if not any(a in ("sts:AssumeRole", "sts:*", "*") for a in acts):
+            continue
+        principal = st.get("Principal")
+        if not isinstance(principal, dict):
+            continue                      # `"Principal": "*"` —— 不当成具体 ARN
+        out |= set(_as_list(principal.get("AWS")))
+    return out
+
+
+def merge_trust_policy(current: dict, principals: list[str]) -> dict:
+    """把 principals 并进**现有**信任策略，保留其余一切。
+
+    原来这里是 `trust_policy(sorted(cur_p | set(principals)))`：读出现有文档里所有
+    `Principal.AWS`，然后拿声明模板重新拼一份盖回去。少的东西不显眼但都致命——
+    `Condition`（MFA / ExternalId 门槛）、`Service` 与 `Federated` principal
+    （比如让某个服务扮演它、或 SSO 联合身份）、以及第二条之后的所有语句。盖回去的
+    那一刻它们就没了，而 `update_assume_role_policy` 不会有任何抗议：下一次
+    `--apply` 会安静地拆掉一条别人加的授权路径。
+
+    所以改成真的合并：现有语句一律原样保留，缺的 principal 优先并进我们自己那条
+    （按 `Sid` 认领），认不到就**追加**一条新语句。任何情况下都不改写别人写的语句。
+    """
+    if not current or not _as_list(current.get("Statement")):
+        return trust_policy(principals)
+    # 深拷贝：调用方（和 --verify 的对比）拿到的 `current` 不该被改。json 往返
+    # 够用——IAM 文档只有 JSON 标量。
+    out = json.loads(json.dumps(current))
+    out["Statement"] = _as_list(out.get("Statement"))
+    want = set(principals) - unconditional_principals(out)
+    if not want:
+        return out
+    for st in out["Statement"]:
+        if isinstance(st, dict) and st.get("Sid") == TRUST_SID:
+            aws = set(_as_list(st.get("Principal", {}).get("AWS")))
+            st.setdefault("Principal", {})["AWS"] = sorted(aws | want)
+            return out
+    out["Statement"].append(trust_policy(sorted(want))["Statement"][0])
+    return out
 
 
 def policy_document(acct: str, region: str = REGION) -> dict:
@@ -365,17 +532,25 @@ def policy_document(acct: str, region: str = REGION) -> dict:
         {
             # 枚举对象键才是要挡的：不限前缀就能列出 csv/ 下的明文文件。
             # 见 docstring「明文旁路」。
+            #
+            # 前缀是 **agent 那个子前缀**，不是共享的 `athena-staging/`：后者下面还有
+            # 管理侧查询的结果 CSV。少了这层收窄，`csv/` 那条旁路挡住了，
+            # 管理侧结果集这条没挡住 —— 而 `SELECT email FROM users LIMIT 1` 的结果
+            # 就落在那里（治理探针自己每次 --verify 都会跑一遍）。
             "Sid": "AthenaStagingList",
             "Effect": "Allow",
             "Action": ["s3:ListBucket"],
             "Resource": f"arn:aws:s3:::{RAW_BUCKET}",
-            "Condition": {"StringLike": {"s3:prefix": [f"{STAGING_PREFIX}*"]}},
+            "Condition": {"StringLike": {"s3:prefix": [f"{AGENT_STAGING_PREFIX}*"]}},
         },
         {
+            # 同上：读写都只到 agent 自己那一格。`PutObject` 收窄这一半同样要紧——
+            # 共享前缀下它意味着 agent 能**覆盖**管理侧的查询结果对象，
+            # 而那些结果是对账脚本读回去比数的。
             "Sid": "AthenaStagingObjects",
             "Effect": "Allow",
             "Action": ["s3:GetObject", "s3:PutObject", "s3:AbortMultipartUpload"],
-            "Resource": f"arn:aws:s3:::{RAW_BUCKET}/{STAGING_PREFIX}*",
+            "Resource": f"arn:aws:s3:::{RAW_BUCKET}/{AGENT_STAGING_PREFIX}*",
         },
     ]}
 
@@ -406,17 +581,57 @@ def policy_findings(doc: dict) -> list[str]:
                 continue
             if _WRITEISH.search(a) and a not in _WRITEISH_OK:
                 bad.append(f"{sid}: 疑似写权限 {a}（不在白名单里）")
-        # S3 读只允许落在 staging 前缀
-        s3_read = [a for a in actions
-                   if a.startswith("s3:") and ("Get" in a or "List" in a)]
-        if s3_read:
+        # S3 读写只允许落在 **agent 自己那个子前缀**。
+        #
+        # 判据从 `athena-staging/` 收到 `athena-staging/agent/` 是 B3 的离线那一半：
+        # 共享前缀下面有管理侧查询的结果 CSV（明文行数据，含 LF 已经排除掉的 email），
+        # 所以"没越出 athena-staging/"这个旧判据对那个洞是绿的。
+        # 写操作一起查：`PutObject` 落在共享前缀就是"能覆盖管理侧结果对象"。
+        s3_obj = [a for a in actions
+                  if a.startswith("s3:") and any(
+                      k in a for k in ("Get", "List", "Put", "Delete", "Abort"))]
+        if s3_obj:
             ok_exact = f"arn:aws:s3:::{RAW_BUCKET}"
-            ok_prefix = f"arn:aws:s3:::{RAW_BUCKET}/{STAGING_PREFIX}"
+            ok_prefix = f"arn:aws:s3:::{RAW_BUCKET}/{AGENT_STAGING_PREFIX}"
+            shared = f"arn:aws:s3:::{RAW_BUCKET}/{STAGING_PREFIX}"
             for r in res:
                 if r == ok_exact or r.startswith(ok_prefix):
                     continue
-                bad.append(f"{sid}: S3 读越出 {STAGING_PREFIX} → {r}"
+                if r.startswith(shared):
+                    bad.append(
+                        f"{sid}: S3 授权到共享前缀 {STAGING_PREFIX} → {r}"
+                        f"（那里面有管理侧查询的结果 CSV，是明文行数据；"
+                        f"必须收到 {AGENT_STAGING_PREFIX}）")
+                    continue
+                bad.append(f"{sid}: S3 越出 {AGENT_STAGING_PREFIX} → {r}"
                            f"（csv/ 下是明文 PII）")
+        # `s3:prefix` 条件同样要收到子前缀：Resource 收窄了但条件还写共享前缀时，
+        # ListBucket 仍然能枚举出管理侧的结果对象键（键名里带 QueryExecutionId，
+        # 拿到就能直接 GetObject 试）。
+        for a in actions:
+            if a != "s3:ListBucket":
+                continue
+            pref = st.get("Condition", {}).get(
+                "StringLike", {}).get("s3:prefix", [])
+            pref = [pref] if isinstance(pref, str) else pref
+            if not pref:
+                bad.append(f"{sid}: s3:ListBucket 没挂 s3:prefix 条件 ——"
+                           f" 能枚举整个桶，包括 csv/ 下的明文文件名")
+            for p in pref:
+                if not p.startswith(AGENT_STAGING_PREFIX):
+                    bad.append(f"{sid}: s3:prefix 条件 {p!r} 没收到 "
+                               f"{AGENT_STAGING_PREFIX}（能列出管理侧的结果对象键）")
+        # Athena workgroup 也是边界的一部分：agent 只能用自己那个。给了管理侧那个，
+        # 结果就又落回共享前缀了（OutputLocation 挂在 workgroup 上，
+        # 且 `EnforceWorkGroupConfiguration=true` 意味着提交方无法另指位置——
+        # 也就是说这条给宽了，S3 那两条收窄反而让 agent 取不到自己的结果，
+        # 报错还是指向"结果桶有问题"）。
+        if any(a.startswith("athena:") for a in actions):
+            admin_wg = f":workgroup/{ADMIN_WORKGROUP}"
+            for r in res:
+                if r.endswith(admin_wg) and ADMIN_WORKGROUP != WORKGROUP:
+                    bad.append(f"{sid}: 授权到管理侧 workgroup {ADMIN_WORKGROUP} → {r}"
+                               f"（它的结果落在共享前缀，agent 只能用 {WORKGROUP}）")
         # 资源通配一律不允许。曾经这里对 `lakeformation:*` 开了个豁免，理由是
         # "GetDataAccess 不支持资源级授权"——那条豁免现在没有用户了：实测
         # GetDataAccess 根本不需要（见 policy_document 里的说明）。豁免留着不要紧，
@@ -570,7 +785,13 @@ def glue_columns(glue, cid: str, table: str) -> list[str]:
 # ---------------------------------------------------------------- 建角色
 
 def ensure_role(iam, acct: str, principals: list[str], apply: bool) -> tuple[int, bool]:
-    """幂等地建/校验角色与内联策略。返回 (不符项数, 角色是否存在)。"""
+    """幂等地建/校验角色与内联策略。返回 (不符项数, 角色是否存在)。
+
+    `principals` 先过 `validate_principals()`：`*` / `:root` / 非 IAM ARN 直接抛
+    `TrustPrincipalError`，**--verify 也拦**（不是只在 --apply 时拦）。理由是
+    `--verify` 的输出会被当成"这个角色的信任面是对的"来读，而它拿的是同一份列表。
+    """
+    principals = validate_principals(principals)
     want_trust = trust_policy(principals)
     want_doc = policy_document(acct)
     bad = 0
@@ -602,13 +823,11 @@ def ensure_role(iam, acct: str, principals: list[str], apply: bool) -> tuple[int
                 f"（现有标签 {tags or '无'}）")
             return 1, True
         cur = got.get("AssumeRolePolicyDocument") or {}
-        cur_p = set()
-        for st in cur.get("Statement", []):
-            aws = st.get("Principal", {}).get("AWS", [])
-            cur_p |= set([aws] if isinstance(aws, str) else aws)
+        cur_p = unconditional_principals(cur)
         missing = sorted(set(principals) - cur_p)
         if missing and apply:
-            merged = trust_policy(sorted(cur_p | set(principals)))
+            # 合并而非重建，见 merge_trust_policy 的说明。
+            merged = merge_trust_policy(cur, principals)
             iam.update_assume_role_policy(
                 RoleName=ROLE_NAME, PolicyDocument=json.dumps(merged))
             log(f"[1] 角色 {ROLE_NAME} 已存在，信任列表补入 {missing}")
@@ -804,6 +1023,9 @@ def build_probes() -> list[Probe]:
         ps.append(Probe(f"读不到 {t}", f"SELECT count(*) FROM {t}", False))
     for t, c in MUST_NOT_READ_COLUMNS:
         ps.append(Probe(f"读不到 {t}.{c}", f"SELECT {c} FROM {t} LIMIT 1", False))
+    for t in MUST_NOT_READ_META:
+        # 表名带 `$`，必须双引号；不带的话 Trino 报语法错，那种红不算过
+        ps.append(Probe(f"读不到元数据表 {t}", f'SELECT * FROM "{t}" LIMIT 1', False))
     for t, c in MUST_NOT_READ_RAW:
         ps.append(Probe(f"读不到明文副本 {RAW_GLUE_DB}.{t}.{c}",
                         f"SELECT {c} FROM {t} LIMIT 1", False,
@@ -1008,6 +1230,97 @@ def probe_direct_read(sess, acct: str) -> int:
     return 0
 
 
+def probe_staging_isolation(sess) -> int:
+    """结果集这道边界的**云上**那一半：agent 角色读不到管理侧查询的结果对象。
+
+    为什么需要它，而不是只有 `policy_findings` 那道离线判据：离线那道审的是**本脚本
+    声明的策略文本**。角色上真正挂着的那份可能不是它——有人在控制台点过、`--apply`
+    没跑、或者另一条 attached policy 补了一条更宽的 GetObject。策略文本对了而实际
+    没对，症状是零：查询照样跑、探针照样绿。
+
+    三件事各查一遍，因为它们坏的方式不同：
+
+    1. **列不出**管理侧前缀（ListBucket 的 s3:prefix 条件）。少了这条，对象键名
+       （里面带 QueryExecutionId）就能被枚举出来，接下来直接 GetObject 试。
+    2. **读不到**管理侧前缀下的对象（GetObject 的 Resource）。这是明文那一跳：
+       管理侧跑过的 `SELECT email FROM users LIMIT 1` 的结果 CSV 就在那儿。
+    3. **写不进**管理侧前缀（PutObject 的 Resource）。方向反过来，但同样要挡：
+       能覆盖管理侧的结果对象，就能让读结果回来比数的对账脚本拿到伪造的数字。
+       这一条**刻意不真写**——真写成功就污染了共享前缀。用一个不存在的键发
+       PutObject 并要求它被拒；被拒说明没权限，那也就写不进任何键。
+
+    注意 `csv/` 那条旁路由 build_probes() 里的 MUST_NOT_READ_RAW 探针盯着（走 Athena
+    查 `*_csv` 外部表），和这里不重叠：那条查的是"能不能用 SQL 读明文副本"，
+    这条查的是"能不能绕过 SQL 直接取 S3 对象"。
+    """
+    s3 = sess.client("s3", region_name=REGION)
+    bad = 0
+
+    def want_denied(label: str, fn) -> None:
+        nonlocal bad
+        try:
+            fn()
+        except ClientError as e:
+            code = _code(e)
+            if code in ("AccessDenied", "AccessDeniedException", "403"):
+                log(f"      {label} ✅（{code}）")
+            elif code in ("NoSuchKey", "NoSuchBucket"):
+                # **不算过**：键不存在时 S3 对有权限的调用方就是报 NoSuchKey，
+                # 所以这个结果分不出"没权限"和"有权限但键恰好不在"。
+                log(f"      ❌ {label} —— 报的是 {code}，不是 AccessDenied。"
+                    f"这条分不出「没权限」和「有权限但键不在」，不算过。")
+                bad += 1
+            else:
+                log(f"      ❌ {label} —— 失败了，但原因不像权限：{code} {_msg(e)[:120]}")
+                bad += 1
+        else:
+            log(f"      ❌ {label} —— 成功了，说明这道边界没生效")
+            bad += 1
+
+    # 1) 列管理侧前缀。ListBucket 有权限时返回 200（哪怕前缀下一个对象都没有），
+    #    所以这条不会出现上面那种"分不出"的情况。
+    want_denied(
+        f"列不出管理侧结果前缀 {STAGING_PREFIX}",
+        lambda: s3.list_objects_v2(Bucket=RAW_BUCKET, Prefix=STAGING_PREFIX,
+                                   MaxKeys=1))
+
+    # 2) 读管理侧前缀下的对象。先用当前身份（管理侧）**找一个真实存在的键**，
+    #    否则拿不到能区分 AccessDenied / NoSuchKey 的证据。找不到就说明测不了，
+    #    如实报 note 而不是记成通过。
+    admin_key = None
+    try:
+        me = boto3.client("s3", region_name=REGION)
+        for page in me.get_paginator("list_objects_v2").paginate(
+                Bucket=RAW_BUCKET, Prefix=STAGING_PREFIX,
+                PaginationConfig={"MaxItems": 200}):
+            for o in page.get("Contents", []):
+                # 只挑**不在** agent 子前缀下的键：agent 自己那些是它该读的。
+                if not o["Key"].startswith(AGENT_STAGING_PREFIX):
+                    admin_key = o["Key"]
+                    break
+            if admin_key:
+                break
+    except ClientError as e:
+        log(f"      note: 当前身份也列不了 {STAGING_PREFIX}（{_code(e)}），"
+            f"这条测不了")
+
+    if admin_key:
+        want_denied(
+            f"读不到管理侧的结果对象 {admin_key.rsplit('/', 1)[-1][:40]}",
+            lambda: s3.get_object(Bucket=RAW_BUCKET, Key=admin_key))
+    else:
+        log(f"      note: {STAGING_PREFIX} 下没有 agent 子前缀之外的对象，"
+            f"「读不到管理侧结果」这条**没测到**（跑一条管理侧查询再来）")
+
+    # 3) 写不进管理侧前缀。用一个明显不存在、也不打算存在的键。
+    want_denied(
+        f"写不进管理侧结果前缀 {STAGING_PREFIX}",
+        lambda: s3.put_object(Bucket=RAW_BUCKET,
+                              Key=f"{STAGING_PREFIX}.governance-probe-should-fail",
+                              Body=b""))
+    return bad
+
+
 # ---------------------------------------------------------------- 后端接线
 
 def verify_backend(acct: str) -> int:
@@ -1171,6 +1484,51 @@ def selftest() -> int:
     check(any("恒为假" in x for x in policy_findings({"Statement": [too_narrow]})),
           "策略审查抓不到「桶级动作挂了 s3:prefix 条件」——那它对静默没授权是瞎的")
 
+    # 3b) 结果集这道边界（B3）。列级排除挡的是"查得到吗"，挡不了"结果放哪儿"：
+    # workgroup 的 OutputLocation 决定结果 CSV 落到哪个 S3 前缀，而结果 CSV 是明文
+    # 行数据。共用一个前缀时 agent 能从管理侧的结果文件里把 email 读回来
+    # ——`--verify` 自己每次都会跑一遍 `SELECT email FROM users LIMIT 1`，
+    # 那一行明文就落在那儿。这一组断言是这道边界的**离线**闸。
+    check(WORKGROUP != ADMIN_WORKGROUP,
+          f"agent 和管理侧共用 workgroup {WORKGROUP} —— 结果集落在同一个前缀下")
+    check(AGENT_STAGING_PREFIX.startswith(STAGING_PREFIX)
+          and AGENT_STAGING_PREFIX != STAGING_PREFIX,
+          f"{AGENT_STAGING_PREFIX!r} 不是 {STAGING_PREFIX!r} 的真子前缀")
+    check(AGENT_STAGING_PREFIX.endswith("/"),
+          f"{AGENT_STAGING_PREFIX!r} 没以 / 结尾，前缀条件会匹配到兄弟前缀"
+          f"（athena-staging/agentXXX/）")
+    check(f"{STAGING_PREFIX}*" not in json.dumps(doc),
+          f"策略里还出现了共享前缀 {STAGING_PREFIX}* —— 那是 B3 那个洞")
+    check(ADMIN_WORKGROUP not in json.dumps(doc),
+          f"策略里出现了管理侧 workgroup {ADMIN_WORKGROUP}")
+    # 三个正对照，一条一个退化方向。**都是"改回原来的写法"**，也就是这道边界
+    # 真正会被怎么弄坏：有人为了让某条查询跑通，把前缀从 agent/ 退回 athena-staging/。
+    widened_obj = json.loads(json.dumps(doc))
+    for st in widened_obj["Statement"]:
+        if st.get("Sid") == "AthenaStagingObjects":
+            st["Resource"] = f"arn:aws:s3:::{RAW_BUCKET}/{STAGING_PREFIX}*"
+    check(any("共享前缀" in x for x in policy_findings(widened_obj)),
+          "策略审查抓不到「S3 对象授权退回共享 staging 前缀」"
+          "——那管理侧查询结果里的明文 agent 就能读")
+
+    widened_list = json.loads(json.dumps(doc))
+    for st in widened_list["Statement"]:
+        if st.get("Sid") == "AthenaStagingList":
+            st["Condition"] = {"StringLike": {"s3:prefix": [f"{STAGING_PREFIX}*"]}}
+    check(any("s3:prefix" in x for x in policy_findings(widened_list)),
+          "策略审查抓不到「ListBucket 的前缀条件退回共享前缀」"
+          "——Resource 收窄了也没用，键名里带 QueryExecutionId，列到就能试着取")
+
+    wrong_wg = json.loads(json.dumps(doc))
+    for st in wrong_wg["Statement"]:
+        if st.get("Sid") == "AthenaQuery":
+            st["Resource"] = [r.replace(f"workgroup/{WORKGROUP}",
+                                        f"workgroup/{ADMIN_WORKGROUP}")
+                              for r in st["Resource"]]
+    check(any("管理侧 workgroup" in x for x in policy_findings(wrong_wg)),
+          "策略审查抓不到「授权到管理侧 workgroup」——OutputLocation 挂在 workgroup 上，"
+          "给了它结果就又落回共享前缀")
+
     # 4) LF 资源形状：列级排除不能退化成表通配
     r = table_resource("acct:cat/bucket", "users", ("email", "phone"))
     check("TableWithColumns" in r, "列级授权的资源形状写错了")
@@ -1197,8 +1555,13 @@ def selftest() -> int:
     ps = build_probes()
     check(sum(1 for p in ps if not p.want_ok)
           == len(MUST_NOT_READ_TABLES) + len(MUST_NOT_READ_COLUMNS)
-          + len(MUST_NOT_READ_RAW), "负向探针数量与契约不符")
+          + len(MUST_NOT_READ_META) + len(MUST_NOT_READ_RAW),
+          "负向探针数量与契约不符")
     check(any(p.database == RAW_GLUE_DB for p in ps), "少了 CSV 中转库那条探针")
+    # 元数据表那几条：表名带 `$`，忘了双引号会红在语法错上——那种红不算过
+    for p in ps:
+        if any(t in p.label for t in MUST_NOT_READ_META):
+            check('"' in p.sql, f"元数据表探针的表名没加双引号，会红在语法错上：{p.sql}")
     for real in ("COLUMN_NOT_FOUND: line 1:8: Column 'email' cannot be resolved",
                  "Insufficient Lake Formation permission(s) on user_messages",
                  "User: arn:… is not authorized to perform: athena:StartQueryExecution",
@@ -1219,6 +1582,11 @@ def selftest() -> int:
         "SCHEMA_NOT_FOUND: line 1:15: Schema 'app_analytics' does not exist",
         "ExpiredToken: The security token included in the request is expired",
         "ThrottlingException: Rate exceeded",
+        # AssumeRole 被拒：这一轮根本没变成 agent 角色，探针用的是别的身份。
+        # 它长得就是一条 AccessDenied，是这一类里最像"正确拒绝"的一个。
+        "AccessDenied: User: arn:aws:iam::1234:user/dev is not authorized to "
+        "perform: sts:AssumeRole on resource: arn:aws:iam::1234:role/"
+        "analytics-agent-ro",
     ):
         check(not is_denial(infra),
               f"把基础设施级失败当成了「权限挡住了」——治理层没生效也会报绿：{infra[:70]}")
@@ -1268,6 +1636,64 @@ def selftest() -> int:
     check(tp["Statement"][0]["Principal"]["AWS"] == ["arn:aws:iam::1:role/a"],
           "信任策略没去重")
 
+    # 8b) 信任策略是**合并**不是重建。这一组是回归测试：原来 --apply 会把现有文档
+    #     拿模板重拼一份盖回去，Condition / Service principal / 第二条语句全丢。
+    _dev, _exec = "arn:aws:iam::1:role/dev", "arn:aws:iam::1:role/exec"
+    _live = {"Version": "2012-10-17", "Statement": [
+        {"Sid": TRUST_SID, "Effect": "Allow", "Action": "sts:AssumeRole",
+         "Principal": {"AWS": _dev}},
+        {"Sid": "SomebodyElse", "Effect": "Allow", "Action": "sts:AssumeRole",
+         "Principal": {"Service": "lambda.amazonaws.com"},
+         "Condition": {"StringEquals": {"sts:ExternalId": "x"}}},
+    ]}
+    _m = merge_trust_policy(_live, [_dev, _exec])
+    check(len(_m["Statement"]) == 2, "合并信任策略时语句数变了——别人的语句被吃掉了")
+    check(_m["Statement"][0]["Principal"]["AWS"] == sorted([_dev, _exec]),
+          "exec role 没并进我们自己那条（按 Sid 认领）")
+    check(_m["Statement"][1] == _live["Statement"][1],
+          "别人写的那条语句被改了：Condition / Service principal 必须原样留着")
+    check(_live["Statement"][0]["Principal"]["AWS"] == _dev,
+          "merge_trust_policy 改了入参——调用方手里的文档不该被就地修改")
+    # 只有别人那条（带 Condition）的时候，要**追加**一条，而不是改他那条
+    _m2 = merge_trust_policy({"Version": "2012-10-17",
+                              "Statement": [_live["Statement"][1]]}, [_exec])
+    check(len(_m2["Statement"]) == 2 and _m2["Statement"][1]["Sid"] == TRUST_SID,
+          "认不到自己那条时应当追加一条无条件语句")
+    # 带 Condition 的语句不算「已授权」：assume 不到却报绿是最坏的一种绿
+    check(unconditional_principals(
+        {"Statement": [{"Effect": "Allow", "Action": "sts:AssumeRole",
+                        "Principal": {"AWS": _exec},
+                        "Condition": {"Bool": {"aws:MultiFactorAuthPresent": "true"}}}]}
+    ) == set(), "带 Condition 的信任语句被当成了无条件授权")
+    check(unconditional_principals(
+        {"Statement": [{"Effect": "Deny", "Action": "sts:AssumeRole",
+                        "Principal": {"AWS": _exec}}]}
+    ) == set(), "Deny 语句里的 principal 被当成了授权")
+    check(unconditional_principals(_live) == {_dev},
+          "无条件 principal 集合算错")
+
+    # 8c) 信任策略的 principal 入口校验：`*` / `:root` / 非 IAM ARN 一律拒
+    def _rejects(p, why):
+        try:
+            validate_principals([_dev, p])
+        except TrustPrincipalError:
+            return
+        check(False, why)
+
+    _rejects("*", "`--trust '*'` 被放进了信任策略——那等于任何身份都能 assume 这个角色")
+    _rejects("arn:aws:iam::123456789012:root",
+             "`:root` 被放进了信任策略——那是整个账号，不是一个身份")
+    _rejects("lambda.amazonaws.com", "服务 principal 溜进了 AWS principal 列表")
+    _rejects("arn:aws:sts::123456789012:assumed-role/r/session",
+             "assumed-role 会话 ARN 被当成身份——写进信任策略不生效")
+    check(validate_principals([_dev, "", _dev]) == [_dev],
+          "principal 列表没去重/没滤掉空串")
+    try:
+        validate_principals([])
+        check(False, "空 principal 列表应当被拒（角色会没人能 assume）")
+    except TrustPrincipalError:
+        pass
+
     if bad:
         log(f"\n{bad} 项自测不过 ❌")
         return 1
@@ -1295,7 +1721,9 @@ def main() -> int:
                     help="后端是否真的在用这个角色查（导入 backend/db.py）")
     ap.add_argument("--no-probes", action="store_true", help="跳过实测探针（只看授权面）")
     ap.add_argument("--trust", action="append", default=[],
-                    help="额外可 assume 这个角色的 principal（可重复，例如上云的执行角色）")
+                    help="额外可 assume 这个角色的 principal（可重复，例如上云的执行角色）。"
+                         "只接受具体的 arn:aws:iam::<账号>:role/… 或 :user/…；"
+                         "'*' 与 ':root' 会被拒（见 validate_principals）")
     a = ap.parse_args()
 
     if a.selftest:
@@ -1321,7 +1749,13 @@ def main() -> int:
         f"目标角色 {arn}\n模式：{mode}"
         f"{'（探针用当前身份跑 —— 负测模式）' if a.as_caller else ''}\n")
 
-    bad, exists = ensure_role(iam, acct, [me] + a.trust, apply)
+    try:
+        bad, exists = ensure_role(iam, acct, [me] + a.trust, apply)
+    except TrustPrincipalError as e:
+        # 拒绝的理由要读得懂，不该是一段 traceback：这条路径最常见的触发方式是
+        # 有人用 root 凭证跑 --apply，而那时他要的是"换个身份重跑"，不是栈帧。
+        log(f"[1] ❌ {e}")
+        return 1
     if not exists and not apply:
         log("\n治理层还没建：python3 scripts/lakehouse/governance.py --apply")
         return 1
@@ -1338,21 +1772,41 @@ def main() -> int:
 
     log("\n[7] 实测探针"
         + ("（当前身份，负测模式）" if a.as_caller else f"（assume {ROLE_NAME}）"))
-    try:
-        sess = None if a.as_caller else athena.assume_role_session(
-            arn, REGION, SESSION_NAME)
-    except ClientError as e:
-        log(f"      ❌ assume 不了 {arn}：{_code(e)} {_msg(e)}"
-            f"\n      （角色的信任策略里有 {me} 吗？--apply 会补）")
-        return 1
-    cl = athena.Client(session=sess)
+    # 这个 try/except 光包 assume_role_session() 是**不够**的：它返回的 Session 里
+    # 凭证是**延迟获取**的，AssumeRole 那次调用要等到第一次用凭证才真的发出去。所以
+    # 「信任策略里没有我」不会炸在这里，会炸成一条 Athena 查询失败——而 4 条负向探针
+    # 恰好期待失败，`is_denial()` 又认得 `AccessDeniedException`，于是它们**假绿**：
+    # 报告写着"读不到 user_messages ✅"，真相是这一轮根本没能变成 agent 角色。
+    # 所以 assume 完立刻 get_caller_identity() 把凭证取一次，并核对拿到的确实是
+    # 这个角色的会话。
+    sess = None
+    if not a.as_caller:
+        try:
+            sess = athena.assume_role_session(arn, REGION, SESSION_NAME)
+            who = sess.client("sts", region_name=REGION).get_caller_identity()["Arn"]
+        except ClientError as e:
+            log(f"      ❌ assume 不了 {arn}：{_code(e)} {_msg(e)}"
+                f"\n      （角色的信任策略里有 {me} 吗？--apply 会补）")
+            return 1
+        if ROLE_NAME not in who:
+            log(f"      ❌ assume 之后的身份是 {who}，认不出 {ROLE_NAME}"
+                f"——下面每一条探针都在用别的身份，绿了也不算数")
+            return 1
+        log(f"      身份已确认：{who} ✅")
+    # 探针必须走 **agent 那个 workgroup**：它的 OutputLocation 是 agent 唯一有
+    # GetObject 权限的前缀。用管理侧那个的话查询能提交、取结果时 AccessDenied，
+    # 而报错指向结果桶，看不出是 workgroup 选错了。
+    # `--as-caller` 下也用它：负测比的是同一批探针换个身份，workgroup 要一样。
+    cl = athena.Client(session=sess, workgroup=WORKGROUP)
     bad += run_probes(cl, build_probes())
     bad += probe_shape(cl)
     if sess is None:
-        log("      note: --as-caller 下跳过直读探针（admin 当然读得到，"
+        log("      note: --as-caller 下跳过直读与结果集隔离探针（admin 当然读得到，"
             "证明不了任何关于 agent 角色的事）")
     else:
         bad += probe_direct_read(sess, acct)
+        log("\n[8] 结果集隔离（agent 读不到管理侧查询的结果对象）")
+        bad += probe_staging_isolation(sess)
 
     if bad:
         log(f"\n{bad} 项不符 ❌"
