@@ -201,11 +201,18 @@ def text_cols(t: dict) -> list[tuple[str, list[str]]]:
 # 所以这一条不是"放过"，是**记账**：卡片描述的是**当前湖里的 500 行样本**，生成器描述的是
 # 重灌之后的样子。两边此刻本就该不一致，而这个不一致的消除条件是**全量重灌 + 重生卡片**，
 # 不是把生成器改回去。豁免带一条护栏（见下），免得它变成"以后什么都能塞进来"的口子。
-ENUM_SUPERSET_OK = {
-    "sessions.utm_campaign":
-        "D-04：生成器产真实活动名，卡片写的是当前 500 行样本里的 6 个 v1 遗留值。"
-        "消除条件是全量重灌后重生卡片，不是缩回生成器。",
-}
+#
+# **这个清单现在是空的**：`sessions.utm_campaign` 那条的消除条件在这条分支上兑现了——湖
+# 重灌成全量、`knowledge/domains/behavior/sessions.md` 按实际取值重生成，`VE.cards()`
+# 现在声明的就是那 39 个活动名。条目留着不是"无害的历史记录"，它有实际代价：留着的话
+# 生成器以后多产一个第 40 个值，会被印成"刻意超集 ⊋ 声明"然后照样绿——豁免恰好会吞掉
+# 它本该抓的那种漂移。同一份道理已经写在下面 cancel_reason 那段里（永远不命中的条目
+# 不许加），所以这里按同一条规矩删掉，而不是等它哪天吞掉一个真缺陷。
+#
+# 机制留着、清单空着。再加条目的门槛是三样：写清消除条件、产出必须真的**更宽**
+# （护栏那条断言现算 `len(vals) > len(declared)`，不成立就当豁免失效判红）、
+# 并且在 NEG_CASES 里配一个反例证明它失效时会红。
+ENUM_SUPERSET_OK: dict[str, str] = {}
 # 刻意**没有** orders.cancel_reason / refund_reason 的豁免条目，尽管它们此刻正是这个形态
 # （线上各只有一个值、生成器已改成八个）：`verify_enums.parse_card` 要求表格 **≥ 2 行**
 # 才算一次枚举声明，所以只剩一个值的列**声明不出来**，这条检查压根看不见它们，
@@ -275,7 +282,8 @@ def check_enums_vs_cards(t: dict) -> None:
        f"每个声明列的归属都有交代（比对/未产出/空列三类，共 {n_declared} 列）")
     ok(not extra_hits,
        f"生成器枚举产出全部在卡片声明内（比对 {n_cmp} 组列，"
-       f"刻意超集豁免 {len(ENUM_SUPERSET_OK)} 列：{wider or '未命中'}）"
+       f"刻意超集豁免 {len(ENUM_SUPERSET_OK)} 列："
+       f"{wider or ('清单为空' if not ENUM_SUPERSET_OK else '未命中')}）"
        + (f"；越界 {len(extra_hits)} 组：{extra_hits}" if extra_hits else ""))
 
 
@@ -1681,10 +1689,14 @@ NEG_CASES: list[tuple[str, str, object]] = [
     # 标签（正是卡片以前误写的那批值之一），要求它红在同一条断言上。
     ("enum-not-declared-array", "生成器枚举产出全部在卡片声明内",
      lambda t, c: t["user_profiles"]["interests"].__setitem__(0, ["electronics"])),
-    # 豁免口的护栏：ENUM_SUPERSET_OK 的理由是"产得更宽"，那就必须真的更宽。把
-    # utm_campaign 缩成 3 个卡片没声明的值——比声明的 6 个还少，豁免必须失效。
-    # 没有这一条，那个字典就是"写进去即永久免检"。
-    ("enum-superset-exemption-void", "豁免失效",
+    # 高基数列被整列换掉：utm_campaign 缩成 3 个卡片没声明的值。
+    # 这一条原来叫 `enum-superset-exemption-void`，盯的是 ENUM_SUPERSET_OK 那条豁免的
+    # 护栏（"产得更宽"必须真的更宽）。豁免连同它的消除条件一起删了（见 ENUM_SUPERSET_OK
+    # 上方），所以现在它红在无条件那条断言上——而这正是删豁免换来的东西：同样的注入，
+    # 从"豁免失效"变成"产出越界"，中间那层可能吞掉真缺陷的转发没了。
+    # 与 `enum-not-declared` 不重复：那条改一格，这条换整列，走的是 39 个真实活动名
+    # 那种高基数列被批量替换的形态。
+    ("enum-values-wholesale-swapped", "生成器枚举产出全部在卡片声明内",
      lambda t, c: t["sessions"].__setitem__(
          "utm_campaign",
          np.array(["x_a", "x_b", "x_c"] * len(t["sessions"]["utm_campaign"]),
