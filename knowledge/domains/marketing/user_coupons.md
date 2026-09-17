@@ -82,7 +82,7 @@ SELECT
     ROUND(COUNT(CASE WHEN status = 'used' THEN 1 END) * 100.0 /
           NULLIF(COUNT(*), 0), 2) AS usage_rate
 FROM user_coupons
-WHERE received_at >= CURRENT_DATE - interval '30' day
+WHERE received_at >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '30' day
 GROUP BY source
 ORDER BY coupon_count DESC;
 ```

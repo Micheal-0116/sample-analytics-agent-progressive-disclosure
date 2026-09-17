@@ -11,7 +11,7 @@ SELECT
     DATE(last_active_at) AS date,
     COUNT(DISTINCT user_id) AS dau
 FROM users
-WHERE last_active_at >= CURRENT_DATE - interval '30' day
+WHERE last_active_at >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '30' day
 GROUP BY DATE(last_active_at)
 ORDER BY date;
 ```
@@ -22,7 +22,7 @@ SELECT
     DATE(event_time) AS date,
     COUNT(DISTINCT user_id) AS dau
 FROM events
-WHERE event_time >= CURRENT_DATE - interval '30' day
+WHERE event_time >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '30' day
 GROUP BY DATE(event_time)
 ORDER BY date;
 ```
@@ -33,7 +33,7 @@ SELECT
     DATE_TRUNC('week', event_time) AS week,
     COUNT(DISTINCT user_id) AS wau
 FROM events
-WHERE event_time >= CURRENT_DATE - interval '84' day
+WHERE event_time >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '84' day
 GROUP BY DATE_TRUNC('week', event_time)
 ORDER BY week;
 ```
@@ -44,7 +44,7 @@ SELECT
     DATE_TRUNC('month', event_time) AS month,
     COUNT(DISTINCT user_id) AS mau
 FROM events
-WHERE event_time >= CURRENT_DATE - interval '12' month
+WHERE event_time >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '12' month
 GROUP BY DATE_TRUNC('month', event_time)
 ORDER BY month;
 ```
@@ -56,13 +56,13 @@ WITH daily AS (
         DATE(event_time) AS date,
         COUNT(DISTINCT user_id) AS dau
     FROM events
-    WHERE event_time >= CURRENT_DATE - interval '30' day
+    WHERE event_time >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '30' day
     GROUP BY DATE(event_time)
 ),
 monthly AS (
     SELECT COUNT(DISTINCT user_id) AS mau
     FROM events
-    WHERE event_time >= CURRENT_DATE - interval '30' day
+    WHERE event_time >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '30' day
 )
 SELECT
     d.date,
@@ -259,7 +259,7 @@ SELECT
     ROUND(CAST(COUNT(*) AS decimal(38,6)) / COUNT(DISTINCT user_id), 2) AS posts_per_creator
 FROM posts
 WHERE status = 'published'
-  AND created_at >= CURRENT_DATE - interval '84' day
+  AND created_at >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '84' day
 GROUP BY DATE_TRUNC('week', created_at)
 ORDER BY week;
 ```
@@ -267,8 +267,9 @@ ORDER BY week;
 ## 使用说明
 
 1. **时间范围**: 所有查询的时间范围可根据需求调整。注意本库是**静态样本**，业务日历截止
-   2026-01-24，剩下那些还写着 `CURRENT_DATE` 的例子直接跑会查空——问"最近 N 天"时统一用
-   `(SELECT max(as_of_date) FROM meta_snapshot)` 作锚点。
+   2026-01-24，所以问"最近 N 天"时统一用 `(SELECT max(as_of_date) FROM meta_snapshot)`
+   作锚点——本文件里的例子已经全部这么写了，`CURRENT_DATE` / `NOW()` 在 Trino 里语法合法，
+   写了不报错，只会安静地返回 0 行。
    **别用各表自己的 `max(dt)`**：`fin_daily_revenue` 到 2026-02-02、
    `channel_daily_costs`（时间列叫 `date` 不叫 `dt`）和 `mart_channel_daily` 到 2026-09-01，
    按各自的 max 取"最近 30 天"会得到互相错位的窗口，跨表一对账就是对不上。见 connection.md

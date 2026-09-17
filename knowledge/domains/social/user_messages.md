@@ -2,7 +2,10 @@
 
 > **这张表 agent 查不到，整表。** 私信正文是用户之间的通信内容，不在 agent 角色的
 > 授权面里（Lake Formation 表级不授权，见 `scripts/lakehouse/governance.py` 的
-> `DENY_TABLES`）：任何引用它的查询会报 `Insufficient Lake Formation permission(s)`。
+> `DENY_TABLES`）：任何引用它的查询都会失败。**实测报的是 `TABLE_NOT_FOUND`**
+> （"表不存在"，读起来像表名写错了），也可能是
+> `Insufficient Lake Formation permission(s) on user_messages`——两种都是同一件事：
+> 这张表不在授权面里。**不要重试、不要以为是表名拼错**。
 > 遇到「私信/聊天/消息」类的问题，正确做法是**说清这张表按治理策略不开放**，
 > 而不是写一条注定失败的 SQL、也不是拿 `posts` / `post_comments` 之类的公开内容
 > 冒充私信去算。下面这份表结构留着是为了让「不开放」这件事可解释——
@@ -50,6 +53,9 @@
 
 ## 常用查询
 
+> ⚠️ 下面这几条**在 agent 角色下一条都跑不了**（整表未授权，见页首）。它们记的是
+> 这张表本来该怎么查，用管理员凭证才有意义。别把它们当"可以试一下"的模板。
+
 ### 私信活跃度分析
 ```sql
 SELECT
@@ -59,8 +65,7 @@ SELECT
     COUNT(DISTINCT receiver_id) AS unique_receivers,
     ROUND(AVG(CASE WHEN is_read THEN 1 ELSE 0 END) * 100, 2) AS read_rate
 FROM user_messages
-WHERE sent_at >= CURRENT_DATE - interval '30' day
-    AND message_type != 'system'
+WHERE sent_at >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '30' day
 GROUP BY DATE(sent_at)
 ORDER BY msg_date;
 ```
@@ -73,7 +78,7 @@ SELECT
     ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(), 2) AS pct,
     ROUND(AVG(CASE WHEN is_read THEN 1 ELSE 0 END) * 100, 2) AS read_rate
 FROM user_messages
-WHERE sent_at >= CURRENT_DATE - interval '30' day
+WHERE sent_at >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '30' day
 GROUP BY message_type
 ORDER BY message_count DESC;
 ```
@@ -91,7 +96,7 @@ SELECT
     COUNT(*) AS message_count
 FROM user_messages
 WHERE is_read = TRUE
-    AND sent_at >= CURRENT_DATE - interval '7' day
+    AND sent_at >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '7' day
 GROUP BY 1
 ORDER BY
     CASE response_time_bucket

@@ -7,7 +7,7 @@
 | user_id | BIGINT | 主键，用户唯一标识 |
 | username | VARCHAR(50) | 用户名 |
 | email | VARCHAR(100) | 邮箱地址 |
-| phone | VARCHAR(20) | 手机号（脱敏存储） |
+| phone | VARCHAR(20) | 手机号，**明文 11 位**（500/500 行都是）；不在授权面里，见下 |
 | registered_at | TIMESTAMP | 注册时间 |
 | registration_source | VARCHAR(50) | 注册来源 |
 | status | VARCHAR(20) | 账号状态 |
@@ -22,6 +22,10 @@
 > 的结果里没有它们，点名 `SELECT email` 直接报 `COLUMN_NOT_FOUND`。要按人群
 > 分组就用 `user_level` / `is_vip` / `registration_source`，要联系方式没有替代——
 > **这是治理上的硬约束，不是提示词里的建议，绕不过去。**
+>
+> 注意这**不是脱敏**：库里存的是明文邮箱和明文 11 位手机号，Lake Formation 也没有
+> 值级掩码这个原语（见 `governance.py` 的「一处能力下降」）。边界全在"这两列不在
+> 授权面里"这一件事上，所以别把 `phone` 当成"反正是脱敏过的"而写进任何输出。
 
 ## 字段枚举值
 
@@ -83,7 +87,7 @@ SELECT
     registration_source,
     COUNT(*) AS new_users
 FROM users
-WHERE registered_at >= CURRENT_DATE - interval '30' day
+WHERE registered_at >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '30' day
 GROUP BY DATE(registered_at), registration_source
 ORDER BY reg_date DESC;
 ```
@@ -104,6 +108,6 @@ ORDER BY user_level;
 ```sql
 SELECT COUNT(*) AS active_users
 FROM users
-WHERE last_active_at >= CURRENT_DATE - interval '7' day
+WHERE last_active_at >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '7' day
   AND status = 'active';
 ```

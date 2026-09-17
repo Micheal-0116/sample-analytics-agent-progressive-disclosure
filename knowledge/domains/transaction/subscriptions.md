@@ -73,7 +73,7 @@ SELECT
     COUNT(CASE WHEN status = 'expired' THEN 1 END) AS expired,
     ROUND(COUNT(CASE WHEN status = 'active' THEN 1 END) * 100.0 / COUNT(*), 2) AS retention_rate
 FROM subscriptions
-WHERE start_date >= CURRENT_DATE - interval '12' month
+WHERE start_date >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '12' month
 GROUP BY DATE_TRUNC('month', start_date)
 ORDER BY start_month DESC;
 ```
@@ -89,7 +89,7 @@ SELECT
     ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(PARTITION BY plan_name), 2) AS pct
 FROM subscriptions
 WHERE status = 'cancelled'
-  AND cancelled_at >= CURRENT_DATE - interval '90' day
+  AND cancelled_at >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '90' day
 GROUP BY plan_name, cancel_reason
 ORDER BY plan_name, cancel_count DESC;
 ```

@@ -7,7 +7,7 @@
 | event_name | VARCHAR(50) | 主键，事件名称 |
 | event_category | VARCHAR(30) | 事件分类 |
 | description | TEXT | 事件描述 |
-| properties_schema | JSONB | 事件属性schema定义 |
+| properties_schema | `string` | 事件属性 schema 定义。**Iceberg 里是 JSON 文本（string），不是 Postgres 的 JSONB**：取值用 `json_extract_scalar(...)`，`->` / `->>` 是语法错 |
 | owner | VARCHAR(50) | 负责人 |
 | is_core_event | BOOLEAN | 是否核心事件 |
 | created_at | TIMESTAMP | 记录创建时间 |

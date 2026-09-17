@@ -52,7 +52,7 @@ WITH channel_costs AS (
         SUM(cost) AS total_cost,
         SUM(installs) AS total_installs
     FROM channel_daily_costs
-    WHERE date >= CURRENT_DATE - interval '30' day
+    WHERE date >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '30' day
     GROUP BY channel_id
 ),
 channel_revenue AS (
@@ -62,7 +62,7 @@ channel_revenue AS (
         SUM(o.actual_amount) AS total_revenue
     FROM user_attributions ua
     JOIN orders o ON ua.user_id = o.user_id
-    WHERE ua.attributed_at >= CURRENT_DATE - interval '30' day
+    WHERE ua.attributed_at >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '30' day
       AND o.status = 'delivered'
     GROUP BY ua.channel_id
 )
@@ -94,7 +94,7 @@ SELECT
     ROUND(SUM(cdc.cost) / NULLIF(SUM(cdc.installs), 0), 2) AS cpi
 FROM ad_creatives ac
 JOIN channel_daily_costs cdc ON ac.creative_id = cdc.creative_id
-WHERE cdc.date >= CURRENT_DATE - interval '7' day
+WHERE cdc.date >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '7' day
 GROUP BY ac.creative_id, ac.creative_name, ac.creative_type, ac.creative_format
 HAVING SUM(cdc.impressions) > 1000
 ORDER BY cvr_percent DESC;
@@ -110,7 +110,7 @@ SELECT
     SUM(cost) AS daily_cost,
     ROUND(SUM(cost) / NULLIF(SUM(installs), 0), 2) AS daily_cpi
 FROM channel_daily_costs
-WHERE date >= CURRENT_DATE - interval '30' day
+WHERE date >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '30' day
 GROUP BY date
 ORDER BY date DESC;
 ```

@@ -8,7 +8,7 @@
 | segment_name | VARCHAR(100) | 分群名称 |
 | segment_type | VARCHAR(50) | 分群类型 |
 | description | TEXT | 分群描述 |
-| rules_json | JSONB | 分群规则定义 |
+| rules_json | `string` | 分群规则定义（JSON 文本；**不是 Postgres 的 JSONB**，取值用 `json_extract_scalar`） |
 | owner | VARCHAR(50) | 创建人 |
 | status | VARCHAR(20) | 状态 |
 | created_at | TIMESTAMP | 创建时间 |

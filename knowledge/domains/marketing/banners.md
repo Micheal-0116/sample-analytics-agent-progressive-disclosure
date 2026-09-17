@@ -95,7 +95,7 @@ SELECT
     SUM(click_count) AS total_clicks,
     ROUND(SUM(click_count) * 100.0 / NULLIF(SUM(impression_count), 0), 2) AS avg_ctr
 FROM banners
-WHERE start_date >= CURRENT_DATE - interval '30' day
+WHERE start_date >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '30' day
 GROUP BY position
 ORDER BY total_impressions DESC;
 ```

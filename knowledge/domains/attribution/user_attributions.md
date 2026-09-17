@@ -14,7 +14,7 @@
 | install_time | TIMESTAMP | APP 安装时间 |
 | attributed_at | TIMESTAMP | 归因确定时间 |
 | days_to_install | INT | 点击到安装天数 |
-| tracking_params | JSONB | 追踪参数 |
+| tracking_params | `string` | 追踪参数（JSON 文本；**不是 Postgres 的 JSONB**，取值用 `json_extract_scalar`）。**整列为 NULL**，见下 |
 
 ## 字段枚举值
 
@@ -57,7 +57,7 @@ SELECT
     COUNT(DISTINCT ua.user_id) AS attributed_users
 FROM user_attributions ua
 JOIN channels ch ON ua.channel_id = ch.channel_id
-WHERE ua.attributed_at >= CURRENT_DATE - interval '30' day
+WHERE ua.attributed_at >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '30' day
 GROUP BY ch.channel_id, ch.channel_name, ch.channel_type
 ORDER BY attributed_users DESC;
 ```
@@ -74,7 +74,7 @@ SELECT
     ROUND(COUNT(CASE WHEN ua.days_to_install = 0 THEN 1 END) * 100.0 / COUNT(*), 2) AS same_day_rate
 FROM user_attributions ua
 JOIN channels ch ON ua.channel_id = ch.channel_id
-WHERE ua.attributed_at >= CURRENT_DATE - interval '30' day
+WHERE ua.attributed_at >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '30' day
 GROUP BY ch.channel_id, ch.channel_name
 ORDER BY total_attributions DESC;
 ```
@@ -86,7 +86,7 @@ SELECT
     COUNT(*) AS attribution_count,
     COUNT(DISTINCT user_id) AS unique_users
 FROM user_attributions
-WHERE attributed_at >= CURRENT_DATE - interval '30' day
+WHERE attributed_at >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '30' day
 GROUP BY attribution_type
 ORDER BY attribution_count DESC;
 ```

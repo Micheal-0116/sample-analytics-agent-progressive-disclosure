@@ -13,7 +13,8 @@
 |---|---|
 | S3 Table bucket | `analytics-agent-tables` |
 | Namespace（= Glue database） | `app_analytics` |
-| Athena workgroup | `analytics-agent-wg`（engine v3，单查询扫描上限 1 GiB 且强制生效） |
+| Athena workgroup（管理侧） | `analytics-agent-wg`（engine v3，单查询扫描上限 1 GiB 且强制生效），结果落 `s3://analytics-agent-raw/athena-staging/` |
+| Athena workgroup（agent） | `analytics-agent-ro-wg`，结果落 `s3://analytics-agent-raw/athena-staging/agent/`。**两个是分开的**：结果集是明文行数据的 CSV，共用一个前缀时 agent 能从管理侧的结果文件里读回 LF 已排除的列 |
 | Athena 的 Catalog 参数 | `s3tablescatalog/analytics-agent-tables`（**不带**账号前缀） |
 | Glue API 的 CatalogId | `<账号>:s3tablescatalog/analytics-agent-tables`（**带**账号前缀） |
 | 区域 | `us-west-2`（与 AgentCore Runtime 同区，不再跨区） |

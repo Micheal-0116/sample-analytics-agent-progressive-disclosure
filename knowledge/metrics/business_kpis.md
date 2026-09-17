@@ -12,7 +12,7 @@ SELECT
     AVG(total_amount) AS aov
 FROM orders
 WHERE status IN ('paid', 'shipped', 'delivered')
-  AND created_at >= CURRENT_DATE - interval '30' day
+  AND created_at >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '30' day
 GROUP BY DATE(created_at)
 ORDER BY date;
 ```
@@ -37,12 +37,12 @@ WITH period_revenue AS (
     SELECT SUM(total_amount) AS total_revenue
     FROM orders
     WHERE status IN ('paid', 'shipped', 'delivered')
-      AND created_at >= CURRENT_DATE - interval '30' day
+      AND created_at >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '30' day
 ),
 period_users AS (
     SELECT COUNT(DISTINCT user_id) AS active_users
     FROM events
-    WHERE event_time >= CURRENT_DATE - interval '30' day
+    WHERE event_time >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '30' day
 )
 SELECT
     pr.total_revenue,
@@ -68,17 +68,22 @@ ORDER BY month;
 
 ### LTV (用户生命周期价值) - 简化计算
 ```sql
-WITH user_value AS (
+-- 注册时间列是 registered_at，**不是 created_at**：后者是灌数时的记录创建时刻，
+-- 当前库里 500 行同一个值，用它算「注册至今多少天」会让四档 cohort 全部塌进同一档
+-- （不报错、数看着合理、分层是假的）。同理时间锚用 meta_snapshot，不用 NOW()。
+WITH a AS (SELECT max(as_of_date) AS d FROM meta_snapshot),
+user_value AS (
     SELECT
         u.user_id,
-        u.created_at AS register_date,
+        u.registered_at AS register_date,
         COALESCE(SUM(o.total_amount), 0) AS total_spend,
         COUNT(DISTINCT o.order_id) AS order_count,
-        EXTRACT(DAY FROM NOW() - u.created_at) AS days_since_register
+        date_diff('day', CAST(u.registered_at AS date), a.d) AS days_since_register
     FROM users u
     LEFT JOIN orders o ON u.user_id = o.user_id
         AND o.status IN ('paid', 'shipped', 'delivered')
-    GROUP BY u.user_id, u.created_at
+    CROSS JOIN a
+    GROUP BY u.user_id, u.registered_at, a.d
 )
 SELECT
     CASE
@@ -255,7 +260,7 @@ JOIN products p ON oi.product_id = p.product_id
 JOIN categories pc ON p.category_id = pc.category_id
 JOIN orders o ON oi.order_id = o.order_id
 WHERE o.status IN ('paid', 'shipped', 'delivered')
-  AND o.created_at >= CURRENT_DATE - interval '30' day
+  AND o.created_at >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '30' day
 GROUP BY p.product_id, p.product_name, pc.category_name
 ORDER BY total_revenue DESC
 LIMIT 20;

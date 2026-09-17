@@ -13,7 +13,7 @@
 | budget_daily | DECIMAL(10,2) | 日预算（元） |
 | start_date | TIMESTAMP | 开始日期 |
 | end_date | TIMESTAMP | 结束日期 |
-| target_audience | JSONB | 目标受众配置 |
+| target_audience | `string` | 目标受众配置（JSON 文本；**不是 Postgres 的 JSONB**，取值用 `json_extract_scalar`）。**种子数据里整列为 NULL** |
 | status | VARCHAR(20) | 活动状态 |
 | created_at | TIMESTAMP | 记录创建时间 |
 | updated_at | TIMESTAMP | 记录更新时间 |

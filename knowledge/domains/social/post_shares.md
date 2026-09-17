@@ -44,7 +44,7 @@ SELECT
     COUNT(*) AS share_count,
     ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(), 2) AS pct
 FROM post_shares
-WHERE created_at >= CURRENT_DATE - interval '30' day
+WHERE created_at >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '30' day
 GROUP BY share_channel
 ORDER BY share_count DESC;
 ```
@@ -62,7 +62,7 @@ FROM posts p
 JOIN users u ON p.user_id = u.user_id
 JOIN post_shares ps ON p.post_id = ps.post_id
 WHERE p.status = 'published'
-    AND ps.created_at >= CURRENT_DATE - interval '7' day
+    AND ps.created_at >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '7' day
 GROUP BY p.post_id, p.title, p.content_type, u.username
 ORDER BY share_count DESC
 LIMIT 50;
@@ -78,7 +78,7 @@ SELECT
     COUNT(DISTINCT post_id) AS unique_posts
 FROM post_shares
 WHERE share_channel IN ('wechat_friend', 'wechat_moments')
-    AND created_at >= CURRENT_DATE - interval '30' day
+    AND created_at >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '30' day
 GROUP BY DATE(created_at), share_channel
 ORDER BY share_date DESC, share_count DESC;
 ```

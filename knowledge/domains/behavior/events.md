@@ -10,7 +10,7 @@
 | session_id | BIGINT | 关联 sessions.session_id |
 | event_name | VARCHAR(50) | 事件名称 |
 | event_time | TIMESTAMP | 事件发生时间 |
-| properties | JSONB | 事件属性（JSON格式） |
+| properties | `string` | 事件属性（JSON 文本）。**Iceberg 里是 string，不是 Postgres 的 JSONB**：取值用 `json_extract_scalar(properties, '$.k')`，`->` / `->>` 是语法错 |
 | page_name | VARCHAR(100) | 事件发生页面 |
 | referrer | VARCHAR(500) | 来源 |
 | ip_address | VARCHAR(45) | IP地址 |
@@ -105,7 +105,9 @@
 - PRIMARY KEY: `event_id`
 - INDEX: `user_id`, `session_id`, `event_time`
 - INDEX: `event_name`
-- GIN INDEX: `properties` (支持JSONB查询)
+- ~~GIN INDEX: `properties`~~ —— Postgres 时代的索引。**Iceberg 表没有二级索引**，对
+  `properties` 的过滤一律是全扫；上面几条同理，它们记的是 v1 的建表意图，不是 Athena
+  上真实存在的结构（Iceberg 靠分区和文件级统计裁剪）
 
 ## 常用查询
 

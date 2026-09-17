@@ -10,7 +10,7 @@
 | variant_key | VARCHAR(50) | 变体标识符（如 control, treatment_a） |
 | description | TEXT | 变体描述 |
 | traffic_percentage | DECIMAL(5,2) | 该变体分配的流量百分比 |
-| config_json | JSONB | 变体配置参数 |
+| config_json | `string` | 变体配置参数（JSON 文本；**不是 Postgres 的 JSONB**，取值用 `json_extract_scalar`）。**种子数据里整列为 NULL** |
 | is_control | BOOLEAN | 是否为对照组 |
 | created_at | TIMESTAMP | 记录创建时间 |
 
@@ -81,6 +81,12 @@ ORDER BY t.test_name;
 ```
 
 ### 查看特定配置项的变体
+> ⚠️ **这段查询在当前种子数据上返回 0 行**：`config_json` 整列为 NULL（登记在
+> `scripts/lakehouse/verify_constants.py` 的清单里）。留着是给"以后填上了怎么查"当模板，
+> **别拿它去回答实际问题**——真实分流效果看 `ab_test_assignments`。
+> 另外 Postgres 的 `json ? 'k'`（判断键存在）在 Trino 里**是语法错**，
+> 要写成 `json_extract_scalar(...) IS NOT NULL`。
+
 ```sql
 SELECT
     t.test_name,
@@ -89,6 +95,6 @@ SELECT
     json_extract_scalar(v.config_json, '$.discount_percentage') AS discount
 FROM ab_test_variants v
 JOIN ab_tests t ON v.test_id = t.test_id
-WHERE v.config_json ? 'button_color'
+WHERE json_extract_scalar(v.config_json, '$.button_color') IS NOT NULL
 ORDER BY t.test_id, v.variant_id;
 ```

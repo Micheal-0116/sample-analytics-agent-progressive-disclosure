@@ -92,7 +92,7 @@ SELECT
     ROUND(COUNT(CASE WHEN is_opened THEN 1 END) * 100.0 /
           NULLIF(COUNT(CASE WHEN is_delivered THEN 1 END), 0), 2) AS open_rate
 FROM push_notifications
-WHERE sent_at >= CURRENT_DATE - interval '30' day
+WHERE sent_at >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '30' day
 GROUP BY push_type
 ORDER BY total_sent DESC;
 ```
@@ -105,7 +105,7 @@ SELECT
     ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(), 2) AS pct
 FROM push_notifications
 WHERE failure_reason IS NOT NULL
-  AND sent_at >= CURRENT_DATE - interval '7' day
+  AND sent_at >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '7' day
 GROUP BY failure_reason
 ORDER BY failure_count DESC;
 ```

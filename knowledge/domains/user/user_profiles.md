@@ -10,8 +10,8 @@
 | birth_date | DATE | 出生日期 |
 | city | VARCHAR(50) | 城市 |
 | province | VARCHAR(50) | 省份 |
-| country | VARCHAR(50) | 国家，默认 'China' |
-| interests | TEXT[] | 兴趣标签数组 |
+| country | VARCHAR(50) | 国家。**实测 500/500 行都是 `'中国'`**（中文，不是 `'China'`）——退化列，别用来分组，按它 `GROUP BY` 只会得到一行 |
+| interests | `array<string>` | 兴趣标签数组（不是 Postgres 的 `TEXT[]`；Trino 里下标从 1 起，取元素用 `element_at(interests, 1)`） |
 | occupation | VARCHAR(50) | 职业 |
 | income_level | VARCHAR(20) | 收入水平 |
 | created_at | TIMESTAMP | 记录创建时间 |

@@ -76,7 +76,8 @@ SELECT
     status
 FROM campaigns
 WHERE status IN ('active', 'completed')
-  AND start_date >= DATE_TRUNC('month', CURRENT_DATE)
+  -- 「本月」= 锚点所在的月（2026-01），不是真实当月
+  AND start_date >= DATE_TRUNC('month', (SELECT max(as_of_date) FROM meta_snapshot))
 ORDER BY budget DESC;
 ```
 
@@ -88,7 +89,7 @@ SELECT
     COUNT(CASE WHEN status = 'active' THEN 1 END) AS active_count,
     SUM(budget) AS total_budget_managed
 FROM campaigns
-WHERE start_date >= CURRENT_DATE - interval '90' day
+WHERE start_date >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '90' day
 GROUP BY owner
 ORDER BY total_campaigns DESC;
 ```

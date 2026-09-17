@@ -105,7 +105,7 @@ SELECT
     AVG(duration_seconds) AS avg_session_duration,
     AVG(page_view_count) AS avg_pages_per_session
 FROM sessions
-WHERE start_time >= CURRENT_DATE - interval '7' day
+WHERE start_time >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '7' day
     AND user_id IS NOT NULL
 GROUP BY DATE(start_time)
 ORDER BY date DESC;
@@ -122,7 +122,7 @@ SELECT
     AVG(duration_seconds) AS avg_duration,
     SUM(CASE WHEN is_bounce THEN 1 ELSE 0 END) * 100.0 / COUNT(*) AS bounce_rate
 FROM sessions
-WHERE start_time >= CURRENT_DATE - interval '7' day
+WHERE start_time >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '7' day
 GROUP BY utm_source, traffic_source, utm_medium, utm_campaign
 ORDER BY sessions DESC
 LIMIT 20;
@@ -136,7 +136,7 @@ SELECT
     SUM(CASE WHEN is_bounce THEN 1 ELSE 0 END) AS bounce_sessions,
     ROUND(SUM(CASE WHEN is_bounce THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS bounce_rate
 FROM sessions
-WHERE start_time >= CURRENT_DATE - interval '30' day
+WHERE start_time >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '30' day
 GROUP BY DATE(start_time)
 ORDER BY date DESC;
 ```
