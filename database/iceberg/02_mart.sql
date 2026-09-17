@@ -50,9 +50,10 @@
  *   v1  database/09_mart.sql:67           WHERE status = 'refunded' AND refunded_at IS NOT NULL
  *   v2  database/redshift/02_mart.sql:67  WHERE refunded_at IS NOT NULL
  *
- * 这批数据里 refunded_at 非空的行只有 status='refunded'（145 行），两边都算出
- * 963560.92 —— **数值恰好相同，bug 是潜伏的**。哪天部分退款也写 refunded_at
- * （业务上完全正常），v2 就会静默把它算进退款，而没有任何测试会红。
+ * 生成器保证 refunded_at 非空的行只有 status='refunded'（v1 那批 145 行都算出
+ * 963560.92；2026-09-17 重灌后 41995 行，两侧同为 9897495.82）—— **数值恰好相同，
+ * bug 是潜伏的**，换一批数据也照旧潜伏，因为这个不变式是生成器给的。哪天部分退款
+ * 也写 refunded_at（业务上完全正常），v2 就会静默把它算进退款，而没有任何测试会红。
  *
  * 对照组：v2 的 03_derived.sql 是 pg_to_redshift.py 生成的，同一份真源，没有漂移。
  * 一个仓库里，手写的那半边漂了，生成的那半边没漂 —— 这就是 gen_ddl.py 那段
@@ -68,10 +69,13 @@
  * 重算过，两个数**都被精确命中**，所以是 v1 SQL 的性质，不是移植错误。
  * 记在这里，免得下一个人以为是灌数失败。
  *
+ * 下面的绝对数字都标了实测日期，**它们会随灌进湖里的那批数据变**（见文末）。
+ * 要判断缺陷还在不在，看机制，别背数字。
+ *
  * 1. **mart_daily_kpi.refund_amt 会丢掉日期轴以外的退款。**
  *    日期轴（spine）取的是 events / orders.placed_at / users.registered_at 的最早最晚日，
  *    **没算 refunded_at**。而退款天然发生在下单之后，于是轴末之后的退款被
- *    `LEFT JOIN rf ON rf.dt = s.dt` 静默丢弃：
+ *    `LEFT JOIN rf ON rf.dt = s.dt` 静默丢弃。v1 那批数据上是这样：
  *
  *        日期轴          = [2025-10-26 .. 2026-01-24]，91 天
  *        退款总额        = 963560.92
@@ -81,20 +85,30 @@
  *    所以**同一个仓库里两张表的退款额本来就不一致**。要对齐口径就得把
  *    min/max(refunded_at) 也纳入 spine —— 那是改口径，得走评审，不在移植范围内。
  *
+ *    ⚠️ 2026-09-17 在全量重灌（scale 427）后实测：这一条**当前批次上不显现**。
+ *    日期轴还是 [2025-10-26 .. 2026-01-24]，但 max(refunded_at) 也正好是 2026-01-24，
+ *    轴外退款 0 笔，于是三个数全等（9897495.82）。缺陷代码一字未改，只是这批数据
+ *    没有轴外退款去触发它。别把"三个数相等"读成"口径已经对齐了"。
+ *
  * 2. **dws_channel_weekly.cost 被 join 扇出重复计数。**
  *    `LEFT JOIN user_attributions` 发生在聚合**之前**，一条成本行匹配到 N 条归因
  *    就被复制 N 份，`sum(d.cost)` 于是把同一笔钱数了 N 遍：
  *
- *        channel_daily_costs.cost 合计 = 1449872.13
- *        dws_channel_weekly.cost 合计  = 1758934.34   ← 虚高 309062.21
+ *        v1 那批：channel_daily_costs 合计 1449872.13 → 本表 1758934.34（1.21 倍）
+ *        2026-09-17：             合计 4351988.47 → 本表 524993074.37（120.6 倍）
  *
+ *    虚高的倍数 = 每条成本行平均匹配到几条归因，所以它跟着归因表的规模走：归因行数
+ *    涨 100 倍，虚高就涨 100 倍。这一条在任何非空归因表上都显现。
  *    连带 weekly_cac（= cost / new_users）分子也是虚高的。正确写法是把归因新客数
  *    先在子查询里聚合好再 join，同样属于改口径。
  *
  * 这两条不是本次迁移引入的 —— v2 的 Redshift 版逐字继承了同样的结构（03_derived.sql
  * 由 pg_to_redshift.py 从同一份真源生成，扇出照旧）。写在这里是为了让它们
- * **有名字**：verify_mart_parity.py 把这两个值钉成期望值，将来谁修了口径，
- * 对账会红，而不是悄悄换了个数。
+ * **有名字**：verify_mart_parity.py 的 QUIRKS 把它们钉成恒等式，将来谁修了口径，
+ * 对账会红，而不是悄悄换了个数。钉的是**机制不是数值** —— 等号右边用 SQL 现场复刻
+ * "只算轴内退款" / "聚合前扇出"，两边一起随数据走，所以重灌不会让它假红；
+ * 代价是缺陷一旦像上面第 1 条那样在某批数据上不显现，这条钉子也就暂时没有鉴别力
+ * （L5 的 refund clamp 断言踩过这个坑，那边改成钉编译出的 SQL 里有没有 clamp 谓词）。
  */
 
 /* ============================================================
@@ -529,10 +543,10 @@ CREATE TABLE dws_channel_weekly (
     channel_id  int           COMMENT '渠道 ID',
     channel_name string       COMMENT '渠道名',
     week_start  date          COMMENT '周起始日 = date_trunc(week, channel_daily_costs.date)，周一为一周之始',
-    cost        decimal(14,2) COMMENT '本周花费。⚠️ 虚高：归因表在聚合前 LEFT JOIN，一条成本行匹配 N 条归因就被数 N 遍（全表合计 1758934.34，真实花费 1449872.13）。要准确花费请查 channel_daily_costs 或 mart_channel_daily',
+    cost        decimal(14,2) COMMENT '本周花费。⚠️ 虚高：归因表在聚合前 LEFT JOIN，一条成本行匹配 N 条归因就被数 N 遍。虚高的倍数 = 每条成本行平均匹配到几条归因，所以它随数据规模变（2026-09-17 实测 120.6 倍，v1 那批 1.21 倍）——记机制不要记数字。要准确花费请查 channel_daily_costs 或 mart_channel_daily',
     installs    bigint        COMMENT '本周激活。⚠️ 同 cost，被 join 扇出重复计数',
     new_users   bigint        COMMENT '本周 last_touch 归因新客（按 attributed_at 落在 [week_start, week_start+7) 判定）。这一列用了 count(DISTINCT)，不受扇出影响',
-    weekly_cac  decimal(12,2) COMMENT '周 CAC = cost / nullif(new_users, 0)；无归因新客时为 NULL 而不是 0。⚠️ 分子 cost 虚高，此列同样偏高'
+    weekly_cac  decimal(12,2) COMMENT '周 CAC = cost / nullif(new_users, 0)；无归因新客时为 NULL 而不是 0。⚠️ 两件事：① 分子 cost 虚高，此列同样偏高；② NULL 集中在业务日历之外——成本轴铺到 2026-09-01 而归因止于 2026-01-24，那些周有花费零新客，NULL 是正确答案（2026-09-17 实测 414 行里 288 行 NULL，全部 week_start 大于 2026-01-24；日历内 126 行全部有值）。要干净的序列加 week_start <= (SELECT max(as_of_date) FROM meta_snapshot)'
 );
 
 INSERT INTO dws_channel_weekly (
