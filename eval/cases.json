@@ -84,15 +84,15 @@
       "golden": [
         {
           "label": "events last day distinct users",
-          "sql": "SELECT count(DISTINCT user_id) FROM events WHERE event_time::date=(SELECT max(event_time)::date FROM events) AND user_id IS NOT NULL"
+          "sql": "SELECT count(DISTINCT user_id) FROM events WHERE event_time::date=(SELECT max(as_of_date) FROM meta_snapshot) AND user_id IS NOT NULL"
         },
         {
           "label": "mart_daily_kpi last day",
-          "sql": "SELECT dau FROM mart_daily_kpi ORDER BY dt DESC LIMIT 1"
+          "sql": "SELECT dau FROM mart_daily_kpi WHERE dt=(SELECT max(as_of_date) FROM meta_snapshot)"
         }
       ],
-      "value_hint": 27,
-      "trap": "必须以数据 max(event_time) 为锚, 用 current_date 会得 0"
+      "value_hint": "30159（2026-09-17 全量批次实测；重灌会变，判分以金标现算为准）",
+      "trap": "锚点必须是 (SELECT max(as_of_date) FROM meta_snapshot): 用 current_date 得 0（不报错、静默空集）；用 max(event_time) 这类逐表 max 是另一种错——它在 events 上恰好等于锚点，换一张表就不等了（sessions.start_time 越到 2026-01-25，channel_daily_costs 铺到 2026-09-01），而且不查空、只给一个错的数。金标本身曾经写的就是逐表 max，等于在奖励这个反模式"
     },
     {
       "id": "L1-ab-running",
@@ -193,10 +193,10 @@
       "golden": [
         {
           "label": "page_views 7d anchored",
-          "sql": "SELECT page_name FROM page_views WHERE view_time >= (SELECT max(view_time)::date FROM page_views) - interval '6 days' GROUP BY page_name ORDER BY count(*) DESC LIMIT 10"
+          "sql": "SELECT page_name FROM page_views WHERE view_time >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '6 days' GROUP BY page_name ORDER BY count(*) DESC LIMIT 10"
         }
       ],
-      "trap": "时间锚点用 max(view_time); 用 current_date 得空结果"
+      "trap": "时间锚点用 (SELECT max(as_of_date) FROM meta_snapshot); 用 current_date 得空结果, 用 max(view_time) 这类逐表 max 得错数"
     },
     {
       "id": "L2-top-liked-posts",
@@ -247,19 +247,19 @@
       "golden": [
         {
           "label": "actual_amount valid status",
-          "sql": "SELECT sum(actual_amount) FROM orders WHERE status IN ('paid','shipped','delivered') AND placed_at >= (SELECT max(placed_at)::date FROM orders) - interval '29 days'"
+          "sql": "SELECT sum(actual_amount) FROM orders WHERE status IN ('paid','shipped','delivered') AND placed_at >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '29 days'"
         },
         {
           "label": "total_amount valid status",
-          "sql": "SELECT sum(total_amount) FROM orders WHERE status IN ('paid','shipped','delivered') AND placed_at >= (SELECT max(placed_at)::date FROM orders) - interval '29 days'"
+          "sql": "SELECT sum(total_amount) FROM orders WHERE status IN ('paid','shipped','delivered') AND placed_at >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '29 days'"
         },
         {
           "label": "mart_daily_revenue 30d",
-          "sql": "SELECT sum(gmv) FROM mart_daily_revenue WHERE dt >= (SELECT max(dt) FROM mart_daily_revenue) - interval '29 days'"
+          "sql": "SELECT sum(gmv) FROM mart_daily_revenue WHERE dt >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '29 days'"
         }
       ],
-      "trap": "有效订单状态 + max(placed_at) 时间锚点, 双重口径陷阱",
-      "value_hint": "~284 万"
+      "trap": "有效订单状态 + meta_snapshot 锚点, 双重口径陷阱（锚点不许写 current_date, 也不许写 max(placed_at) 这类逐表 max）",
+      "value_hint": "5767 万（2026-09-17 全量批次实测 57673919.78；种子那一批是约 284 万）"
     },
     {
       "id": "L3-top-products-gmv",
@@ -289,14 +289,15 @@
       "golden": [
         {
           "label": "no session in 30d",
-          "sql": "SELECT count(*) FROM users u WHERE NOT EXISTS (SELECT 1 FROM sessions s WHERE s.user_id=u.user_id AND s.start_time >= (SELECT max(start_time) FROM sessions) - interval '30 days')"
+          "sql": "SELECT count(*) FROM users u WHERE NOT EXISTS (SELECT 1 FROM sessions s WHERE s.user_id=u.user_id AND s.start_time >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '30 days')"
         },
         {
           "label": "last_active_at variant",
-          "sql": "SELECT count(*) FROM users WHERE last_active_at IS NULL OR last_active_at < (SELECT max(last_active_at) FROM users) - interval '30 days'"
+          "sql": "SELECT count(*) FROM users WHERE last_active_at IS NULL OR last_active_at < (SELECT max(as_of_date) FROM meta_snapshot) - interval '30 days'"
         }
       ],
-      "value_hint": "18 (sessions) / 174 (last_active_at) 两种口径差异大, 判分按命中任一"
+      "value_hint": "91291 (sessions) / 38591 (last_active_at) 两种口径差异大, 判分按命中任一（2026-09-17 全量批次实测；种子那一批是 18 / 174）",
+      "trap": "sessions.start_time 的 max 是 2026-01-25T00:00:42（跨过零点、伸出业务日历），所以这题用逐表 max 当锚点会把窗口整体推后一天；锚点一律用 meta_snapshot"
     },
     {
       "id": "L3-coupon-aov-compare",
@@ -407,14 +408,14 @@
       "golden": [
         {
           "label": "mart_daily_kpi wow",
-          "sql": "WITH a AS (SELECT max(dt) m FROM mart_daily_kpi) SELECT (SELECT sum(gmv) FROM mart_daily_kpi, a WHERE dt > m - interval '7 days'), (SELECT sum(gmv) FROM mart_daily_kpi, a WHERE dt <= m - interval '7 days' AND dt > m - interval '14 days')"
+          "sql": "WITH a AS (SELECT max(as_of_date) m FROM meta_snapshot) SELECT (SELECT sum(gmv) FROM mart_daily_kpi, a WHERE dt > m - interval '7 days'), (SELECT sum(gmv) FROM mart_daily_kpi, a WHERE dt <= m - interval '7 days' AND dt > m - interval '14 days')"
         },
         {
           "label": "raw orders wow",
-          "sql": "WITH a AS (SELECT max(placed_at)::date m FROM orders) SELECT (SELECT sum(actual_amount) FROM orders, a WHERE status IN ('paid','shipped','delivered') AND placed_at::date > m - interval '7 days'), (SELECT sum(actual_amount) FROM orders, a WHERE status IN ('paid','shipped','delivered') AND placed_at::date <= m - interval '7 days' AND placed_at::date > m - interval '14 days')"
+          "sql": "WITH a AS (SELECT max(as_of_date) m FROM meta_snapshot) SELECT (SELECT sum(actual_amount) FROM orders, a WHERE status IN ('paid','shipped','delivered') AND placed_at::date > m - interval '7 days'), (SELECT sum(actual_amount) FROM orders, a WHERE status IN ('paid','shipped','delivered') AND placed_at::date <= m - interval '7 days' AND placed_at::date > m - interval '14 days')"
         }
       ],
-      "value_hint": "675179 vs 708728, 跌约 4.7%; 方向判断也计入 insight 检查"
+      "value_hint": "13926391.12 vs 14280957.12, 跌约 2.5%; 方向判断也计入 insight 检查（2026-09-17 全量批次实测；种子那一批是 675179 vs 708728, 跌 4.7%）"
     },
     {
       "id": "L3-refund-total",
@@ -433,8 +434,8 @@
           "sql": "SELECT sum(actual_amount) FROM orders WHERE status = 'refunded' AND refunded_at IS NOT NULL"
         }
       ],
-      "trap": "查 mart_daily_kpi.refund_amt 会得 925471.33 —— 那张表的日期轴由 placed_at 决定、不含 refunded_at, 轴末之后的退款被 LEFT JOIN 丢掉, 偏低 3.95% 且不报错。全量退款必须用 fin_daily_revenue。这是 v1 照搬的既有缺陷, verify_mart_parity.py 的 QUIRKS 钉住了它的数值, 但在 agent 侧要靠表卡片的路由警告才不会踩",
-      "value_hint": 963560.92
+      "trap": "mart_daily_kpi.refund_amt 的日期轴由 placed_at 决定、不含 refunded_at, 轴末之后的退款被 LEFT JOIN 丢掉且不报错——全量退款一律走 fin_daily_revenue。**这个缺陷在当前这批数据上不显现**: 2026-09-17 实测三个数全等 9897495.82（种子那一批是 963560.92 ⟷ 925471.33, 偏低 3.95%）, 因为重灌后没有一笔退款落在轴末之后。缺陷代码一字未改, 只是这批数据碰不到它, 所以别把「数相等」读成「口径对齐了」。verify_mart_parity.py 的 QUIRKS 钉的是机制（等号两边现场用 SQL 复刻）而不是数值, agent 侧靠表卡片的路由警告",
+      "value_hint": "9897495.82（2026-09-17 全量批次实测；种子那一批是 963560.92）"
     },
     {
       "id": "L3-channel-cost-total",
@@ -453,8 +454,8 @@
           "sql": "SELECT sum(cost) FROM mart_channel_daily"
         }
       ],
-      "trap": "查 dws_channel_weekly.cost 会得 1758934.34 —— 归因表在聚合前 LEFT JOIN, 一条成本行匹配 N 条归因就被数 N 遍, 虚高 21%。同表的 installs / weekly_cac 同样受扇出影响, 但 new_users 用了 count(DISTINCT) 不受影响",
-      "value_hint": 1449872.13
+      "trap": "查 dws_channel_weekly.cost 会得 524993074.37 —— 归因表在聚合前 LEFT JOIN, 一条成本行匹配 N 条归因就被数 N 遍。**虚高的倍数跟着归因表的规模走, 不是个固定值**: 2026-09-17 实测 120.6 倍（4351988.47 → 524993074.37）, 种子那一批只有 1.21 倍（1449872.13 → 1758934.34）。同表的 installs / weekly_cac 同样受扇出影响, 但 new_users 用了 count(DISTINCT) 不受影响",
+      "value_hint": "4351988.47（2026-09-17 全量批次实测；种子那一批是 1449872.13）"
     },
     {
       "id": "L4-cac-lowest-channel",

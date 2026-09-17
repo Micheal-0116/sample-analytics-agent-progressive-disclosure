@@ -541,6 +541,21 @@ CASES: list[Case] = [
         forbid=r"规模声明自洽",
     ),
     Case(
+        id="kb-golden-pertable-max",
+        cloud=False,
+        guards="eval/run_eval.py --selftest（金标的时间锚点）",
+        defect="金标把「今天」写成该表自己的 max(时间列)——**评测于是在奖励知识库明令禁止的写法**。"
+               "这比 current_date 那种错难发现得多：多数表的轴末恰好等于锚点，逐表 max 算出来"
+               "和正确答案一样，只有踩到那十几根伸出业务日历的轴时才分叉"
+               "（`sessions.start_time` 越到 2026-01-25，于是 L3-churn-30d 的窗口整体推后一天）",
+        patches=[("eval/cases.json",
+                  "WHERE event_time::date=(SELECT max(as_of_date) FROM meta_snapshot)",
+                  "WHERE event_time::date=(SELECT max(event_time)::date FROM events)")],
+        cmd=[PY, "eval/run_eval.py", "--selftest"],
+        expect=r"L1-dau-latest 金标.*时间锚点写成了逐表 max\(event_time\)",
+        forbid=r"全部通过",
+    ),
+    Case(
         id="scale-lake-unregistered-batch",
         cloud=True,
         guards="scripts/lakehouse/verify_scale.py（湖实测 ⟷ 已登记批次）",

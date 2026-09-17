@@ -832,6 +832,7 @@ sha256 核对。第一步是关键：少了它，一个本来就红的检查器�
 | `doc-row-total-drift` | `verify_load --selftest` | 改 `knowledge/connection.md` 里的全库行数（**agent 数不出这个数**，治理角色读不到 `user_messages`，只能照抄卡片） |
 | `scale-prompt-hardcoded` | `verify_scale --selftest` | 把 prompt 里的「行数取决于湖里装的是哪一批」换回写死的「35 张明细表，约 19 万行」。**这就是本库真实发生过的那个状态**：五处文档声明 19 万行、湖里装着 7994 万行、L0–L6 全绿——数量级差 427 倍而没有一盏灯，因为整个对账层比表、比列、比枚举、比退化列、比装载忠实，**从不比规模** |
 | `scale-decl-half-edited` | `verify_scale --selftest` | 把 `backend/run.sh` 里两处「约 19 万行」中的一处改掉。判据钉的是**出现次数**而不是「只准出现一处」：真要求去重，判据就变成在管别人的散文；钉次数则一改一漏立刻红（2 → 1），而正当的多处引用不受干扰 |
+| `kb-golden-pertable-max` | `eval/run_eval.py --selftest` | 把 `L1-dau-latest` 的金标锚点从 `meta_snapshot` 换回 `max(event_time) FROM events`。**这是修之前 9 条金标的真实样子**：评测在奖励一个知识库明令禁止的写法。它比 `current_date` 那种错难发现得多——多数表的轴末恰好等于锚点，逐表 max 算出来和正确答案一样，只有踩到伸出业务日历的轴才分叉（`sessions.start_time` 越到 2026-01-25，`L3-churn-30d` 的窗口整体推后一天） |
 | `scale-lake-unregistered-batch` | `verify_scale`（连云） | 改 `docs/scale.json` 里已登记批次的一张表行数，模拟"湖里换了一批数据而没人来登记"。`verify_load` 答不了这件事——它比的是「湖 ⟷ `data/csv`」并默认两侧本该相等，而这个账号本来就装着另一批 |
 | `probe-warming-treated-as-dead` | `ui/boot_test.mjs`（场景⑥） | 把 `dataLayer=warming` 算进「失败」的额度——后端明说"我在，只是还在预热"，前端却当它不在。这是同一个缺陷的第二种走法：第一次是超时预算猜小了，这次是把"还在预热"读成了"后端不在" |
 | `probe-degrade-is-permanent` | `ui/boot_test.mjs`（场景⑧） | 拿掉降级后的自愈重探——失败额度只有 3 发 ≈ 3s，比 uvicorn 打开端口还短，于是「重启后端 → 立刻刷新」把页面永久锁在离线演示模式。**同一个缺陷的第三种走法，也是最难归因的一种：它看起来像「你的修改没生效」** |

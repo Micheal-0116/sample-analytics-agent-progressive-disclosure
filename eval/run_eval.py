@@ -554,6 +554,34 @@ def selftest() -> int:
         if len(seq) >= 3 and any(seq[i] > seq[i - 1] for i in range(1, len(seq))):
             fails.append(f"金标 value_hint 非单调: {hint}")
 
+    # 6b) 金标的**时间锚点**：不许用逐表 max() 当"今天"。
+    #
+    # 这一条和上面那条是同一类问题的两个实例：金标本身写着错口径，于是评测在
+    # **奖励**一个知识库里明令禁止的写法。`knowledge/README.md` 的静态样本铁律写的是
+    # 「禁用 current_date/now()（会查空），也禁用该表自己的 max(时间列)（不查空，
+    # 查出错数）」，而 9 条金标（L1-dau-latest / L2-top-pages-7d / L3-gmv-30d ×3 /
+    # L3-churn-30d ×2 / L5-wow-gmv ×2）用的正是后者。
+    #
+    # 它比 current_date 那种错难发现得多：多数表的时间轴末恰好等于锚点，于是逐表 max
+    # 算出来**和正确答案一样**。真正会分叉的是那十几根伸出业务日历的轴——
+    # `sessions.start_time` 越到 2026-01-25（跨零点）、`channel_daily_costs` 铺到
+    # 2026-09-01。L3-churn-30d 就踩在第一根上：窗口整体推后一天。
+    #
+    # 判据只拦**当锚点用**的那一种：`(SELECT max(x) …)` 这种子查询形态。分组聚合里的
+    # `max(placed_at)`（"每个用户最后一次下单"）是正当用法，不在拦截面里。
+    ANCHOR_COL = "as_of_date"
+    for c in spec["cases"]:
+        for g in c.get("golden", []):
+            for col in re.findall(r"\(\s*SELECT\s+max\(\s*([A-Za-z_][\w.]*)\s*\)",
+                                  g["sql"], re.I):
+                if col.split(".")[-1].lower() != ANCHOR_COL:
+                    fails.append(
+                        f"{c['id']} 金标 {g['label']}：时间锚点写成了逐表 "
+                        f"max({col})。锚点一律用 "
+                        f"(SELECT max({ANCHOR_COL}) FROM meta_snapshot)——"
+                        f"逐表 max 不查空、只给一个错的数，而且在多数表上恰好"
+                        f"等于锚点，所以它是那种「测试通过了、口径是错的」")
+
     # 7) knowledge/ 里的参考 SQL 自己得是对的口径。
     #
     # 这一组是补一个真实事故的窟窿：前六组全绿、判分器和 stats 都装了闸，
