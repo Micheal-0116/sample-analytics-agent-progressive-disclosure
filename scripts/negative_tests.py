@@ -44,8 +44,8 @@ L0–L6 全绿只说明「现在没问题」，**不说明检查器还有效**�
 ## 用法
 
     python3 scripts/negative_tests.py --list        # 看用例清单
-    python3 scripts/negative_tests.py --offline     # 只跑不连云的 27 个（秒级）
-    python3 scripts/negative_tests.py               # 全部 43 个（要 AWS 凭证，约 4 分钟）
+    python3 scripts/negative_tests.py --offline     # 只跑不连云的 32 个（秒级）
+    python3 scripts/negative_tests.py               # 全部 49 个（要 AWS 凭证，约 4 分钟）
     python3 scripts/negative_tests.py -c enum-value-absent -c doc-sql-rotten
 
 退出码非 0 = 有检查器在缺陷面前保持了沉默（或负测自己的锚点失效了），两种都要处理。
@@ -466,15 +466,24 @@ CASES: list[Case] = [
         id="kb-retention-verdict-gone",
         cloud=False,
         guards="eval/run_eval.py --selftest（「这份数据算不出留存」这条结论约束）",
-        defect="数字全对、右删失说明也完全正确，结论仍然是错的：这份数据的留存曲线平坦"
+        defect="数字全对、右删失说明也完全正确，结论仍然是错的：v1 种子样本的留存曲线平坦"
                "（45.0/43.0/42.1/41.1/43.0），agent 把它答成「曲线平稳、留得住」——"
                "**把项目自己的 P0 数据缺陷报成了正面业务发现**，而那句右删失说明让整段话"
                "听起来很严谨。根因是这条事实此前只写在 `docs/data-audit.md`，"
                "`knowledge/` 里一个字都没有，而 agent 只读 `knowledge/`。"
-               "这条钉的是**结论层**，不是数值层",
+               "这条钉的是**结论层**，不是数值层。文档现在写的是判据（W4/W1 ≥ 0.8 算不衰减）"
+               "而不是结论——全量批次的曲线已经衰减了——所以注入打在判据那句话上",
+        # 三处一起改：那句话在这份文档里出现三次（判据的前提、对照表的落笔栏、
+        # risk finding 的写法），只改一处不算"这条约束消失了"，剩下两处照样把它教会。
         patches=[("knowledge/analysis/retention_curve.md",
-                  "## ⚠️ 这份数据算不出留存",
-                  "## ⚠️ 关于这份数据的留存")],
+                  "因为「这份数据算不出留存」这句话",
+                  "因为「这份数据的留存怎么写」这件事"),
+                 ("knowledge/analysis/retention_curve.md",
+                  "**数字照给 + 明说这份数据算不出留存**",
+                  "**数字照给 + 说明观测窗**"),
+                 ("knowledge/analysis/retention_curve.md",
+                  '"这一批数据算不出留存"写进',
+                  '"观测窗不完整"写进')],
         cmd=[PY, "eval/run_eval.py", "--selftest"],
         expect=r"找不到 `算不出留存`",
     ),
@@ -490,7 +499,7 @@ CASES: list[Case] = [
                "拦的写法都会打到正确答案身上。第一版白名单还放了「别当」，结果被那份缺陷"
                "答案的右删失句「别当真实下跌」满足了——本该不算数的 caveat 成了放行凭证",
         patches=[("eval/run_eval.py",
-                  "    if not any(k in prose for k in _RETENTION_CREDIBILITY):",
+                  "    if not decaying and not any(k in prose for k in _RETENTION_CREDIBILITY):",
                   "    if False:")],
         cmd=[PY, "eval/run_eval.py", "--selftest"],
         expect=r"结论报成「留得住」应判错",
@@ -553,6 +562,35 @@ CASES: list[Case] = [
                   "WHERE event_time::date=(SELECT max(event_time)::date FROM events)")],
         cmd=[PY, "eval/run_eval.py", "--selftest"],
         expect=r"L1-dau-latest 金标.*时间锚点写成了逐表 max\(event_time\)",
+        forbid=r"全部通过",
+    ),
+    Case(
+        id="lite-mode-analysis-banned",
+        cloud=False,
+        guards="eval/run_eval.py --selftest（常规模式的文档路由）",
+        defect="`LITE_SUFFIX` 里那句「不要读 analysis/」被写回一刀切，而域索引写着"
+               "「两个都要读，**哪怕只是取数**」——两句话对冲、系统提示赢，于是常规模式下"
+               "留存题的分子约束（写错出 509%）和曲线可信度判据一起读不到。"
+               "deep 模式只有 4 个预设按钮能进，用户手打的问题一律走 lite，所以这不是"
+               "评测保真度问题而是产品缺陷。注入只把例外那句话换个说法，两边就不再对上",
+        patches=[("backend/agent.py", "哪怕只是取数", "就算只是取数")],
+        cmd=[PY, "eval/run_eval.py", "--selftest"],
+        expect=r"LITE_SUFFIX 里没有「哪怕只是取数」这个例外",
+        forbid=r"全部通过",
+    ),
+    Case(
+        id="retention-gate-hardcoded",
+        cloud=False,
+        guards="eval/run_eval.py --selftest（留存结论闸按曲线形状开合）",
+        defect="留存的结论闸写死成「必须声明这份数据算不出留存」。它在 v1 种子样本上是对的"
+               "（曲线平坦，W4/W1≈0.99），数据换成全量批次之后（71.6→37.2，W4/W1≈0.52）"
+               "就开始**要求 agent 说一句假话**——这一批是算得出留存的。判据钉在数据的性质上"
+               "而数据会换，就必然有这种反转；正确做法是现从金标的 pct 那一份量曲线形状",
+        patches=[("eval/run_eval.py",
+                  "        decaying = ratio < RETENTION_DECAY_MAX",
+                  "        decaying = False")],
+        cmd=[PY, "eval/run_eval.py", "--selftest"],
+        expect=r"曲线在衰减时不该再要求声明「算不出留存」: 得到 False，期望 True",
         forbid=r"全部通过",
     ),
     Case(

@@ -14,14 +14,14 @@ L2 后面另挂一组**不编号、不是闸门**的数据真实性报告器（�
 bash scripts/test_all.sh              # L0–L6，约 3 分钟（L3 抽查 3 张表）
 bash scripts/test_all.sh --l0         # 只跑 L0，不连云、不要凭证，exit 0 可判（CI 跑的是这一档）
 bash scripts/test_all.sh --full       # L3 换成全量 35 张表（多约 1 分钟）
-bash scripts/test_all.sh --l8         # 追加 L8 负测（43 个用例，约 4 分钟，会临时改文件再还原）
+bash scripts/test_all.sh --l8         # 追加 L8 负测（49 个用例，约 4 分钟，会临时改文件再还原）
 ```
 
 L7（端到端 agent）不在里面：它烧 Bedrock token 并覆盖 `eval/report.md`，该有人看着跑。
 
 ### CI 覆盖到哪一层（`.github/workflows/offline.yml`）
 
-CI **只跑离线那一档**：`test_all.sh --l0`（33 条）+ `negative_tests.py --offline`（27 个用例）
+CI **只跑离线那一档**：`test_all.sh --l0`（34 条）+ `negative_tests.py --offline`（32 个用例）
 + CDK 那 9 条执行角色策略断言（`Template.fromStack`，纯合成）。三步都不连云。
 
 L1–L7 不在 CI 里，而这是个**刻意的缺口**：那几层要能连这个账号的凭证（S3 Tables / Glue /
@@ -769,7 +769,7 @@ HTTP、不解析 SSE。于是夹在中间的东西——SSE 分帧、事件键�
 ```bash
 python3 scripts/negative_tests.py --list        # 用例清单
 python3 scripts/negative_tests.py --offline     # 只跑不连云的 27 个（秒级）
-python3 scripts/negative_tests.py               # 全部 43 个
+python3 scripts/negative_tests.py               # 全部 49 个
 bash scripts/test_all.sh --l8                   # 挂在套件末尾跑
 ```
 
@@ -798,7 +798,7 @@ sha256 核对。第一步是关键：少了它，一个本来就红的检查器�
 注入用唯一子串替换，锚点必须恰好出现一次，否则用例直接 ERROR（锚点漂移显式失败，
 而不是静默改了别的地方）。还原一旦失败就停跑剩下的用例：脏工作树上的"绿"不可信。
 
-### 43 个用例
+### 49 个用例
 
 | id | 守的检查器 | 注入的缺陷 |
 |---|---|---|
@@ -845,8 +845,10 @@ sha256 核对。第一步是关键：少了它，一个本来就红的检查器�
 | `kb-funnel-absolute-gone` | `eval/run_eval.py --selftest` | 摘掉 `analysis/funnel_analysis.md` 里「绝对值不可比」那条口径声明。守的是口径修对之后剩下的那一半：**数值全对、形态也全对**（394/314/258/199，逐层流失 20%/18%/23%，单调递减），结论仍然可以错——端到端转化 50.5%（近 30 天 16.2%）被答成「转化表现优异」，也就是把生成器的抽样方式报成了业务表现。根因在分母：漏斗顶端「看过就走」这一侧没按真实比例生成，浏览过商品的 394 人里一次都没加购的只有 80 人（20.3%），而 25 种事件各自的行数被抽得近似均匀（736–866，极差比 1.18）。跟 `kb-retention-verdict-gone` 同一个病、不同的器官：钉**结论层**，数值闸对这种错一律判 PASS |
 | `kb-retention-cohort-column` | `eval/run_eval.py --selftest` | 把留存 cohort 的时间列从 `registered_at` 换成 `created_at`。**`users` 上两列都存在**，所以 EXPLAIN 通过、SQL 出结果、行数也正常，只是分出来的是另一批人（实测 500/500 行两列不相等）。这是「检查器验的是另一个维度」的第三种形态：`verify_doc_sql.py` 查语法，语法完全对，错的是语义。旧版本这段写的就是 `created_at`。断言必须**同时**禁掉错列、要求对列——只要求 `registered_at` 出现过太松：把 SELECT 的键换掉、`WHERE` 里留着，那条照样绿（写的时候真踩了） |
 | `kb-retention-numerator-unbounded` | `eval/run_eval.py --selftest` | 把留存分子从 cohort 成员（`c.user_id`）换成全站活跃（`act.user_id`）。Rₜ 的分子是「**这个 cohort 里**第 t 期还活跃的人数」，换掉之后实测第 1 周 219 人 / cohort 43 人 = **509%**。这个缺陷至少会自己炸出来（>100% 一眼可见），比漏斗那次"悄悄给一个像样的数"友好，但只有装了闸才会在提交前炸 |
-| `kb-retention-verdict-gone` | `eval/run_eval.py --selftest` | 摘掉 `analysis/retention_curve.md` 顶部「这份数据算不出留存」那条结论约束。**这条钉的是结论层，不是数值层**：数字全对、右删失说明也完全正确，结论仍然是错的——曲线在这份数据上平坦（45.0/43.0/42.1/41.1/43.0），agent 答成「曲线平稳、留得住」，把项目自己的 P0 数据缺陷报成了正面业务发现，而那句右删失说明让整段话听起来很严谨。根因是这条事实此前只写在 `docs/data-audit.md`，`knowledge/` 里一个字都没有，而 agent 只读 `knowledge/` |
+| `kb-retention-verdict-gone` | `eval/run_eval.py --selftest` | 摘掉 `analysis/retention_curve.md` 顶部那条结论判据（三处一起摘——那句话在这份文档里出现三次，只改一处剩下两处照样把它教会）。**这条钉的是结论层，不是数值层**：数字全对、右删失说明也完全正确，结论仍然是错的——曲线在 v1 种子样本上平坦（45.0/43.0/42.1/41.1/43.0），agent 答成「曲线平稳、留得住」，把项目自己的 P0 数据缺陷报成了正面业务发现，而那句右删失说明让整段话听起来很严谨。根因是这条事实此前只写在 `docs/data-audit.md`，`knowledge/` 里一个字都没有，而 agent 只读 `knowledge/`。文档现在写的是**判据**（W4/W1 ≥ 0.8 算不衰减）而不是结论，因为全量批次的曲线已经衰减了 |
 | `retention-verdict-gate-gone` | `eval/run_eval.py --selftest` | 摘掉 `judge_retention` 里的结论闸（那句必须出现「算不出/不可信/独立抽样/假象」的白名单校验）。上一条钉的是知识卡片里那句话还在，**这条钉的是判分器会不会因此判错**——少了它，留存金标退回「数值对就 PASS」，而那份把 P0 数据缺陷答成「留得住」的答案数值恰恰全对，会安安静静进归档基线。闸必须是白名单而不是黑名单：**正确答案里就带着「别当成"留存好"的正面结论」**，任何按「留存好」拦的写法都会打到正确答案身上。第一版白名单里放了「别当」，结果被那份缺陷答案的右删失句「别当真实下跌」满足了——本该不算数的 caveat 成了放行凭证 |
+| `retention-gate-hardcoded` | `eval/run_eval.py --selftest` | 把 `judge_retention` 的结论闸从「按曲线形状开合」改回**写死**（`decaying = False`）。上一条守的是"闸不许被摘掉"，这一条守的是相反的方向：**闸也不许硬编码一句关于数据的结论**。写死那一版在 v1 种子样本上是对的（曲线平坦，W4/W1≈0.99），数据换成全量重灌批次之后（2026-09-17 实测 71.6→37.2，W4/W1≈0.52）就开始**要求 agent 说一句假话**——这一批是算得出留存的。判据钉在数据的性质上而数据会换，就必然有这种反转；正确做法是现从金标 `pct` 那一份量比值，`≥ 0.8` 才开闸。`--selftest` 里两个分支各有固定夹具，所以不靠"湖里正好装着哪一批"来体检 |
+| `lite-mode-analysis-banned` | `eval/run_eval.py --selftest` | 把 `LITE_SUFFIX`（常规题的系统提示后缀）里那句例外换个说法，让它不再与知识库对上。这是 `L5-retention-cohort` 那道红的另一半：域索引写的是「两个都要读，**哪怕只是取数**」，而提示后缀原文写着「**不要**读 analysis/ 方法库」——两句话直接对冲，**系统提示赢**，于是常规模式下那份文档从来没被打开过，留存题的分子约束（写错出 509%）和曲线可信度判据一起消失，而 eval 又按"该说的话没说"判它红。deep 模式只有 4 个预设按钮进得去，用户手打的问题一律走 lite，所以这不是评测保真度问题、是产品缺陷。判据拿同一句话当锚：知识库标了「哪怕只是取数」，提示词里就必须出现同一句、并且围绕 `analysis/` 说 |
 | `shell-config-js-route-gone` | `ui/asset_check.py` | 摘掉 `server.py` 里 `/config.js` 那条兜底路由——唯一被允许的绝对路径例外变成没人管的 404，行为不变（照旧回退 `/api/config`），只剩会误导排查的日志噪音 |
 | `probe-budget-too-tight` | `ui/boot_test.mjs`（boot() 行为契约） | 把前端存活探针的超时预算改回本地 Postgres 时代的 2500ms——湖仓冷启动第一发 `/health` 实测 5.0s，于是「起完后端第一次打开页面」**必然**落进离线演示模式（问退款答 DAU 走势，底部还提示"请启动后端"）。要 node，没装则**明说跳过** |
 
@@ -867,6 +869,7 @@ reconcile 家族 8 个用例共用同一条基线命令，基线结果按命令�
 | 缺口 | 为什么没覆盖 / 怎么补 |
 |---|---|
 | **文档里写的规模 ⟷ 湖里实际的规模** | **2026-09-17 实测到的实例,不是假设**：`docs/deployment.md`、`docs/data-audit.md`、`docs/data-walkthrough.md`、`database/00_schema_overview.md`、`PROJECT_STATUS.md` 五处都写着「当前部署约 22 万行、数据源是仓库里的 `data/csv/`」——而湖早就被重灌成 **8000 万行**那一批（`orders` 854,140 而不是 2,000，差 427 倍）。这五句**写的时候都是对的，是湖在它们底下被换掉了**。没有任何一层会红：`reconcile.py` 比表和列、`verify_enums.py` 比枚举取值、`verify_load.py` 比 `data/csv/` ⟷ Athena，**没有一个比文档散文里的数字**——而 `verify_load.py` 更糟，它在一个装了 8000 万行的湖上跑仍然会因为「CSV 那 2,000 行都在」而全绿。**代价是可操作的**：照 `deployment.md` 原来那句「改完 `data/csv/` 后跑 `load.py`」执行，就是拿 2,000 单订单 `DELETE`+`INSERT` 覆盖掉 854,140 单，命令正常退出、`verify_load.py` 随后全绿。已改成把「仓库交付的那一份」和「某个账号的湖此刻装的那一份」分开写，并在两处灌数指令上加了先核查再灌的告警。**2026-09-17 补上了**：声明落在 `docs/scale.json`（每一批数据的每表行数 + 三组缩放类 + 8 条文档声明的原文与出现次数），判据是 `scripts/lakehouse/verify_scale.py`——`--selftest` 进 L0（seed 声明逐表等于 `data/csv` 现数、声明原文还在且次数没变、数值对得上它自称的批次），连云那半进 L3（现查 35 张表 `count(*)`，必须逐表命中**某一批**已登记规模；命中不了就印出最像哪一批、差在哪些表）。L8 三条证明它会红：`scale-prompt-hardcoded` / `scale-decl-half-edited` / `scale-lake-unregistered-batch`。**剩下的缺口**：① 登记的是 8 处原文，`data-audit.md` / `data-walkthrough.md` 里其余描述规模的散文（尤其 220,087 这种含派生层的合计）没进对账面；② 判据只答「湖里装的是已登记的哪一批」，不答「这一批该不该装在这个账号上」——那是部署侧的事；③ `fixed` 那 11 张维度表不随 scale 放大**是数据缺口不是判据缺口**，见下面 `budget.py` 那两栏 |
+| **深度分析模式（`DEEP_SUFFIX`）在评测里零覆盖** | `eval/run_eval.py` 调的是 `run_agent(question)`，`deep` 用默认值 `False`，所以 **27 题全部走 `LITE_SUFFIX`**——提示词里那半篇「必须读 `analysis/` 选方法、必须用 `compute_stats` 算统计量、必须填 `method` 面板、必须给 2–4 条 findings」从来没被执行过一次。它只走浏览器上那 4 个「深度分析 · 资深分析师」预设按钮（`web/index.html` 的 `deep:true`），而那条路唯一的验收是人眼。2026-09-17 这一轮**没有**顺手给用例加 `deep` 字段：那会改掉 27 题里若干题实际收到的提示词，等于把归档基线的可比性一次性作废，而且要多烧一轮 19 分钟的 Bedrock 才知道新基线长什么样——该单独做，不该夹在一次修红里做。**当前的真实状态是：`LITE_SUFFIX` 有 27 题覆盖，`DEEP_SUFFIX` 有 0 题覆盖，`compute_stats` 的调用契约在端到端一侧完全没验过**（它自己的 `stats.py --selftest` 在 L0，但"模型会不会照规矩调它"没人查） |
 | **治理的「值级掩码」** | LF 没这个原语，落成了列级排除（列不可见），不是"测试缺失"而是**能力下降**，写在 L4 那一节。想要真掩码得上 Glue Catalog View，那条路的代价也写在那儿 |
 | **除 agent 外的其他访问者** | L4 只约束 `analytics-agent-ro` 这一个角色。谁还有这个账号的 LF/S3 权限（包括跑 `--apply` 的那个 admin），没有任何检查断言 |
 | **CLI 是否真的执行 `PreToolUse` 的拒绝** | `backend/agent.py --selftest`（L0）验的是两件**静态**的事：两侧 options 确实把闸门装在 `hooks` 上（AST 核对），以及直接调那个 hook 函数时放行/拒绝的**返回形状**对。它证明不了 CLI 收到那个形状后真的会拦——那一层只在 2026-08-24 用活探针验过一次：可达工具从 25 个降到 6 个、直接要求执行 shell 被拒、诱导读 `.env.local` 的注入被拒。**SDK 换一次 hook 语义或拒绝形状的键名，自测照样全绿而闸门已经死了**——和 `can_use_tool` 被 `bypassPermissions` 架空是同一种失效。要补就得像 `--ask` 那样烧一次真调用，断言 init 消息里的可达工具集合 |
@@ -894,7 +897,7 @@ reconcile 家族 8 个用例共用同一条基线命令，基线结果按命令�
 | **`web/index.html` 里展示用的 SQL 字符串** | 那是给观众看的文本，不进数据库，方言错了没有任何东西会红。人工核对 |
 | **v1 本地 Postgres 分支** | `db.py` 的 postgres 路径、`docker-compose.cloud.yml`、顶层 `database/*.sql` **刻意不覆盖**，边界见 [legacy.md](legacy.md) |
 | **`scripts/gen/` 生成器** | 缺 numpy 时 L0 自动跳过；且 8000 万行 → Parquet → COPY 那条路没接到 Iceberg，装载的是仓库里的 CSV 种子数据 |
-| **L8 自己的覆盖面** | 43 个用例覆盖 **17 个检查器脚本 / 20 个可执行入口**（同一脚本的不同 flag 各算一个入口，例如 `governance.py` 的 `--selftest` / `--verify` / `--verify-backend`；这两个数是从 `guards=` 现数的，此前这一栏写的「27 个检查器」对不上任何一种数法），绝大多数是**一种**缺陷形态（`asset_check.py` 有两个，`backend/agent.py --selftest` 有两个（闸门退回 `can_use_tool`、白名单里丢掉 `ToolSearch`），`verify_constants.py` 有两个（清单外新增退化列、清单条目已过期——**必须成对**，只守前者的话那份清单会退化成只增不减的白名单），`boot_test.mjs` 有四个：超时预算被改小、`warming` 被当成"后端不在"、降级不可逆、后端活着却给烘焙答案——同一处代码栽过三次；`run_eval.py --selftest` 有**九个**，是全场最密的：判分器的形态闸、金标的口径、`knowledge/` 参考 SQL 的口径、漏斗题到方法卡的路由、漏斗「绝对值不可比」这条结论约束，加上留存的四条——cohort 时间列、分子的 cohort 限定、「这份数据算不出留存」这条**结论级**约束写在卡片里，以及判分器真的会因为它判错。它密不是因为它重要，是因为同一个错误在这里住过七个地方，而前两个闸全绿时 agent 在浏览器上照旧答错：它读的是知识卡片，不是金标）。它证明"该报时会报"，不证明检查器想得全。想得不全的部分就在这张表里 |
+| **L8 自己的覆盖面** | 49 个用例覆盖 **18 个检查器脚本 / 22 个可执行入口**（同一脚本的不同 flag 各算一个入口，例如 `governance.py` 的 `--selftest` / `--verify` / `--verify-backend`；这两个数是从 `guards=` 现数的，此前这一栏写的「27 个检查器」对不上任何一种数法），绝大多数是**一种**缺陷形态（`asset_check.py` 有两个，`backend/agent.py --selftest` 有两个（闸门退回 `can_use_tool`、白名单里丢掉 `ToolSearch`），`verify_constants.py` 有两个（清单外新增退化列、清单条目已过期——**必须成对**，只守前者的话那份清单会退化成只增不减的白名单），`verify_scale.py --selftest` 有两个（prompt 写死某一批的行数、同一个数抄两处只改了一处），`boot_test.mjs` 有四个：超时预算被改小、`warming` 被当成"后端不在"、降级不可逆、后端活着却给烘焙答案——同一处代码栽过三次；`run_eval.py --selftest` 有**十二个**，是全场最密的：判分器的形态闸、金标的口径、`knowledge/` 参考 SQL 的口径、漏斗题到方法卡的路由、漏斗「绝对值不可比」这条结论约束、金标的时间锚点不许写成逐表 `max()`，加上留存的五条——cohort 时间列、分子的 cohort 限定、「曲线不衰减时算不出留存」这条**结论级**判据写在卡片里、判分器真的会因为它判错、以及**结论闸得跟着曲线形状开合**（写死那一版在数据换成会衰减的批次之后开始要求 agent 说假话），再加**常规模式的文档路由**（`LITE_SUFFIX` 一刀切禁读 `analysis/` ⟷ 域索引写着"哪怕只是取数也要读"，两句话对冲、系统提示赢，那份口径硬约束就永远读不到）。它密不是因为它重要，是因为同一个错误在这里住过七个地方，而前两个闸全绿时 agent 在浏览器上照旧答错：它读的是知识卡片，不是金标）。它证明"该报时会报"，不证明检查器想得全。想得不全的部分就在这张表里 |
 
 ## 改动 → 测试步覆盖矩阵
 
@@ -945,7 +948,7 @@ reconcile 家族 8 个用例共用同一条基线命令，基线结果按命令�
 | `eval/run_eval.py`（`_adapt_sql`、金标 SQL） | L5 dry-run |
 | `eval/run_eval.py`（`judge_funnel` 的形态闸）+ `eval/cases.json` 的 `L4-funnel` 金标口径 | L0 `--selftest` + L8 `funnel-shape-gate-gone` / `funnel-golden-subset-gone` |
 | `knowledge/**` 里漏斗参考 SQL 的**口径**（不只是语法）+ 漏斗题到 `analysis/funnel_analysis.md` 的路由 + 「转化率绝对值不具参考性」这条结论约束 | L0 `--selftest` 第 7 组 + L8 `kb-funnel-subset-gone` / `kb-funnel-route-gone` / `kb-funnel-absolute-gone`。**这一面此前零覆盖**，是那次事故真正的漏点：`verify_doc_sql.py` 逐条 EXPLAIN 知识文档里的 SQL，但 EXPLAIN 只管语法——一条口径全错的漏斗 SQL 照样 EXPLAIN 通过 |
-| `eval/run_eval.py`（`judge_retention` 的结论闸）+ `eval/cases.json` 的 `L5-retention-cohort` 金标口径 + `knowledge/**` 里留存参考 SQL 的口径与结论 | L0 `--selftest` 第 8/9 组 + L8 `kb-retention-cohort-column` / `kb-retention-numerator-unbounded` / `kb-retention-verdict-gone` / `retention-verdict-gate-gone`。这一面盯的是**数值全对而结论仍然错**的那一类：闸要求答案里出现「算不出/不可信/独立抽样/假象」这类声明，而**右删失说明不算**——那正是那次答错时唯一给出的 caveat |
+| `eval/run_eval.py`（`judge_retention` 的结论闸）+ `eval/cases.json` 的 `L5-retention-cohort` 金标口径 + `knowledge/**` 里留存参考 SQL 的口径与结论 + `backend/agent.py` 的 `LITE_SUFFIX` 文档路由 | L0 `--selftest` 第 8/9 组（含 8e 的路由对冲检查）+ L8 `kb-retention-cohort-column` / `kb-retention-numerator-unbounded` / `kb-retention-verdict-gone` / `retention-verdict-gate-gone` / `retention-gate-hardcoded` / `lite-mode-analysis-banned`。这一面盯的是**数值全对而结论仍然错**的那一类：曲线不衰减时，闸要求答案里出现「算不出/不可信/独立抽样/假象」这类声明，而**右删失说明不算**——那正是那次答错时唯一给出的 caveat；曲线衰减时闸让路，否则就是要求 agent 说假话（形状现从金标量，两个分支各有固定夹具） |
 | `eval/run_eval.py` 的其余判分模式（`numbers` / `contains` / `judge_llm`） | **无覆盖**：形态闸那次事故说明判分器和被判的对象一样会错，而这几个模式至今没有断言碰过 |
 | `analyticsagent/app/analytics/` 的六份整拷 + `agent.py` 的 17 个节点 | L0 `sync_agent_code.py --selftest` + `--check`（逐字比对）+ L8 `cloud-copy-drift`；**改这些要改 `backend/` 那份再跑 `--apply`** |
 | `analyticsagent/` 的其余部分（`main.py` 暖客户端 / `knowledge_store.py` / `runtime_config.py` 的硬失败 / `Dockerfile` / `agentcore.json`） | **无自动化覆盖**。2026-08-20 已部署并人工复验过 `README.md` 里那三条，但每次改动都得重新手跑一遍 |
@@ -1000,7 +1003,8 @@ L0 复跑 **33 / 0 ✅**。
 | 层 | 结果 |
 |---|---|
 | L0–L6 + L8 | **通过 53 · 失败 0 ✅**（`bash scripts/test_all.sh --l8`，exit 0）。其中 L0–L6 是 **52**，L8 整体那一项是第 53 条。相对上一批 51 → 53 的两条都是本轮新挂的：L0 的「退化列分类器 + 登记清单自测」和 L2 的「线上库退化列全部登记在册」 |
-| L8 负测 | **43 / 43 全过 ✅**（**27 个离线 + 16 个连云**）。41 → 43 是本轮新增的 `degenerate-col-unlisted` / `degenerate-col-stale-entry`，成对守新清单的两个方向。还原按 sha256 核对通过 |
+| L8 负测 | 上一轮整套连跑 **43 / 43 全过 ✅**（**27 个离线 + 16 个连云**）；41 → 43 是那一轮新增的 `degenerate-col-unlisted` / `degenerate-col-stale-entry`，成对守新清单的两个方向。还原按 sha256 核对通过。**2026-09-17 本轮 43 → 49**：新增三个规模用例、一个金标锚点用例、一个留存结论闸的**反方向**用例（`retention-gate-hardcoded`：闸不许硬编码一句关于数据的结论）、一个常规模式的文档路由用例（`lite-mode-analysis-banned`），**离线 32 个整档连跑全过 ✅**，连云那个 `scale-lake-unregistered-batch` 单跑 PASS；其余 16 个连云用例本轮**没有重跑**（沿用上一轮结果）。顺带修了两个**锚点漂移**：`retention-verdict-gate-gone` 和 `kb-retention-verdict-gone` 的注入锚点被这一轮的改动挪走了，负测按设计显式 ERROR（"锚点出现 0 次"）而不是静默改别处——这正是那条"唯一子串替换"规则要的效果 |
+| L7 端到端（2026-09-17 重跑） | **27 / 27 ✅**（20:29 起，24.5 分钟，27 次 Bedrock 调用，模型 `global.anthropic.claude-opus-4-8`，均 55.0s/题、均读文档 2.4 次、均 SQL 0.7 条）。这一轮**必须跑**：改了 prompt（规模措辞、轴末表、`LITE_SUFFIX` 的例外）、两张语义卡片和判分器，而 L7 是唯一覆盖 `backend/agent.py` 的一层。上一轮那道红 `L5-retention-cohort` 本轮 **88.2s / 读文档 3 次 / 1 条 SQL**，理由「曲线在衰减，结论闸不适用（金标实测 5 个 cohort 的末周/首周 ≈ 0.50，阈值 0.8）」——读文档 3 次说明 lite 模式的例外确实生效了（修之前那份 `analysis/` 文档在常规模式下打不开）。报告覆盖在 `eval/report.md` / `.json` |
 | L0 跨表闭环 | 正例 **106 / 106**、反例 **44 / 44 按预期变红**（约 8s） |
 | L2 `verify_constants.py` 连云普查（新增） | **退化列全部登记在册 ✅**：48 张表 / **468 个标量列**，389 列基数正常 + **14 待重灌 + 17 透传遗留 + 46 整列 NULL** 已登记 + 2 单行表，另有 **8 个数组列跳过并逐个打印**。耗时 **75s**。账算得平：389 + 33 + 46 = 468 |
 | 两个方向都**在真库上注入验过** | 不只是离线 `--selftest`：从清单里摘掉 `posts.share_count` → 真库跑出「不在任何清单里」；往清单里塞一条 `posts.title` → 跑出「已经不是常量了」。验完按 sha256 还原，字节相同。然后把这两次注入固化成上面那两个 L8 用例——**否则这盏新灯本身是没验过的** |
@@ -1048,6 +1052,7 @@ L0 复跑 **33 / 0 ✅**。
 | 补掉的缺口 | `verify_literals.py` 是五个里最后一个只有 Athena 一条路的，于是生成器的字面值修复**没有任何一条路验得到**（云上是 v1 数据、已决定不重灌）。补 `--from-csv` 时抽出三个共用判据（`merge_col_verdicts` / `judge_posts` / `judge_device`），**PASS/FAIL 合成规则零复制**；类型真源用 DDL 而非 `information_schema`，顺带把数组/JSONB 那个**不可见**的覆盖缺口变成了报告上印出来的一行 |
 | L7 端到端 | **27 / 27 全过**（2026-08-28 15:47，`eval/run_eval.py` 全量 27 例，模型 `global.anthropic.claude-opus-4-8`）。均 **49.6s/题**、均读文档 2.6 次、均 SQL 0.9 条，27 题合计 1340.3s（≈22 分钟）；`agent_errors` 全空，最慢三题 `L3-churn-30d` 71.8s · `L5-repurchase-rate` 71.2s · `L5-retention-cohort` 70.9s。**跑之前先跑了一次 `--dry-run`**（只验金标、不调模型，27/27 金标 SQL 可执行），避免把金标语法错烧成 20 分钟的 token。触发这一轮的是 D-05 改过的两张语义卡片（`knowledge/analysis/funnel_analysis.md`、`knowledge/metrics/core_metrics.md`），`AGENTS.md` 的触发条件成立。逐题与基线的对比见下一栏 |
 | L7 与基线逐题对比 | 基线 `eval/baseline/eval.lakehouse-athena.post-funnel-retention-fix.json`（2026-08-23）。**题集相同、状态零变化（27 全 pass → 27 全 pass）**；`avg_s` 48.3 → 49.6、`avg_sql` 0.8 → 0.9。判定理由（`detail`）**只有 1 题变了**：`L5-retention-cohort` 从「命中 golden[weekly matrix **pct**] 16/16」变成「命中 golden[weekly matrix **counts**] 20/20」，结论闸「结论已声明数据限制」两轮都过。**这不是判分放松，是答案更全了**，而且可验证：`judge_retention` 按声明顺序先试 counts 再试 pct，我拿两组金标值实测过交叉命中——纯百分比答案在 5% 容差下只能蹭到 counts 的 4/20（`41≈41.5`、`37≈37.8`、`49`），**低于 `min_hit=6`**，所以「命中 counts 20/20」只能来自答案里真的印出了那张整数矩阵；反向则会蹭（纯计数答案能命中 pct 9/16），所以**pct 那条 label 才是不可靠的那个**。单跑该题复现了一次，两次都是 counts。两轮金标行本身逐字相同（数据没动）。另有 7 题 `n_sql`/`n_docs` 有运行间抖动（`L1-dau-latest` 0→1 条 SQL、`L5-wow-gmv` 1→2、`L3-top-products-gmv` 读文档 4→6 等），**不是判定依据**；真正该守的那条不变量守住了：指标层五题（`L3-gmv-30d`/`L3-refund-total`/`L3-cac-overall`/`L4-cac-lowest-channel`/`L4-roi-cac-by-channel`）仍然 `n_sql=0`，没有绕过 `metric_layer` 去手写 SQL |
+| L7 在全量批次上的那一道红（2026-09-17） | 湖里换成 8000 万行那一批之后，`eval/report.md` 记的是 **26 / 27**，红的是 `L5-retention-cohort`，理由「结论里没有声明「这份数据算不出留存」」。查下来是**两个**独立成因，都不在判分器的数值一侧：①**路由**——`LITE_SUFFIX` 写着「不要读 analysis/ 方法库」，而 `knowledge/domains/behavior/_index.md` 写着「两个都要读，哪怕只是取数」，系统提示赢，于是那份文档在常规模式下从来没被打开过（deep 模式只有 4 个预设按钮进得去，手打的问题一律走 lite，所以这是产品缺陷不是评测保真度问题）；②**判据自己过期了**——新生成器给用户配了活跃半衰期（`scripts/gen/tables.py` 的 `ENGAGEMENT_HALFLIFE`），这一批的曲线实测 71.6→51.9→42.3→37.2（W4/W1≈0.52）是**正常衰减**的，写死的结论闸于是在要求 agent 说一句假话。两条都已修：提示后缀加了一条点名 `analysis/` 的例外、两份卡片从"下结论"改成"给判据（W4/W1 ≥ 0.8 算不衰减）"、`judge_retention` 改成现从金标 `pct` 那一份量形状再决定开不开闸，新增 L8 `lite-mode-analysis-banned` / `retention-gate-hardcoded` 两条反向用例。**修完当天重跑了整套 L7：27/27 ✅**（2026-09-17 20:29，24.5 分钟，均 55.0s/题），该题耗时 88.2s、读文档 **3** 次（路由那一半确实通了），判定理由是「曲线在衰减，结论闸不适用（金标实测 5 个 cohort 的末周/首周 ≈ 0.50，阈值 0.8）」。离线一侧同时全绿：`run_eval.py --selftest` 122 条断言（含两个分支的固定夹具）、离线负测 32/32、L0 34/0 |
 | 全量重灌 | **未做，刻意的**。任务书硬约束 #1「全量重灌放在最后一步」；重灌的危害面已单独盘过，最尖的一条是**成本/维度表冻在 ×1 而转化类表 ×427，CAC 会塌 427 倍、ROI 涨 427 倍**，而 CAC/ROI 是 `governed_metrics.md` 的招牌指标、卡片里钉着具体数字、没有任何闸门盯着。等口径决定 |
 
 上表几行都是**文档与 docstring 也改完之后重跑的**，不是只覆盖代码改动的那一次：改完注释

@@ -352,43 +352,100 @@ def _delivered_prose(evidence: dict) -> str:
     return "\n".join(parts)
 
 
+# 「曲线在衰减」的判据：满窗 cohort 的 W_last/W_first 平均比值，低于这个数算衰减。
+# 两批实测把阈值夹得很松：v1 种子样本 W1→W4 一直在 40–48% 之间徘徊，比值 ≈ 0.99
+# （就是那条 P0）；2026-09-17 的全量批次 71.6 → 37.2，比值 ≈ 0.52。0.8 落在中间，
+# 不是拿某一批的数字调出来的。这个数与 knowledge/analysis/retention_curve.md 和
+# knowledge/metrics/core_metrics.md 里写给 agent 的判据是同一个，改这里要一起改。
+RETENTION_DECAY_MAX = 0.8
+
+
+def _retention_shape(goldens) -> tuple[float | None, int]:
+    """从**百分比**那份金标里量出曲线形状：各 cohort 末周/首周比值的平均。
+
+    只认 label 里带 `pct` 的那份——人数那份的第一列是 cohort_size，混进来比值全错。
+    量不出来时返回 None，判分那边**从严**处理（见 judge_retention）。
+    """
+    g = next((g for g in goldens if "pct" in str(g.get("label", "")).lower()), None)
+    if g is None:
+        return None, 0
+    ratios = []
+    for row in g["rows"]:
+        v = [float(x) for x in row if isinstance(x, (int, float))]
+        if len(v) >= 2 and v[0]:
+            ratios.append(v[-1] / v[0])
+    if not ratios:
+        return None, 0
+    return sum(ratios) / len(ratios), len(ratios)
+
+
 def judge_retention(case, goldens, evidence, defaults) -> tuple[bool, str]:
-    """留存题判分：**先验结论、再比数值**。
+    """留存题判分：**先验结论、再比数值**，而"结论该怎么写"由金标现算的曲线形状决定。
 
     这个 mode 的存在理由和 `funnel` 相反，值得写清楚。漏斗那次是**数值**错了
-    （394/385/396/373，结算 > 浏览），所以形态闸盯的是数值。留存这次数值**全对**
+    （394/385/396/373，结算 > 浏览），所以形态闸盯的是数值。留存那次数值**全对**
     ——44.7 / 41.7 / 42.1 与独立实测分毫不差，分子也正确地限定在了 cohort 内——
-    错的只有结论那五个字：「曲线平稳、留得住」。这份数据的活跃度与注册生命周期是
+    错的只有结论那五个字：「曲线平稳、留得住」。v1 种子样本的活跃度与注册生命周期是
     独立抽样的，曲线不衰减是项目自己审计出来的 P0，而 agent 把它报成了正面业务发现。
     纯数值判分会给这种答案判 PASS。
 
-    所以这里的闸是**结论级**的：交付的散文里必须出现"这份数据算不出留存"这个意思。
-    右删失说明**不算**——那次答错时右删失那句是完全正确的，正是它让整段话听起来严谨。
+    ## 为什么这条闸不能写死「必须说算不出留存」
 
-    这条闸的边界要说明白，别让名字比覆盖面大：它是**关键词白名单**，不是"读懂了散文"。
-    一个既说"算不出"又同时下"留得住"结论的答案，它拦不住；换个说法表达同一个错误
-    结论（比如"用户黏性稳定"而不提数据缺陷），只要一个白名单词都没命中就会被拦下——
-    拦得住是因为白名单在**要求**一句话存在，不是在**禁止**某句话存在。禁止型的写法
-    这里刻意没用：正确答案里就写着『别当成"留存好"的正面结论』，任何以「留存好」
-    为特征的黑名单都会把它误杀。
+    第一版就是写死的，然后数据被换掉了：新生成器给用户配了活跃半衰期
+    （`scripts/gen/tables.py` 的 `ENGAGEMENT_HALFLIFE`），全量批次实测
+    `71.6 → 51.9 → 42.3 → 37.2`，是一条正常的前陡后平曲线。写死的闸于是开始
+    **要求 agent 说一句假话**：这一批数据是算得出留存的。判据钉在数据的性质上、
+    而数据可以换，就必然出现这种反转——所以形状改成**现从金标量**：
+
+    - 曲线不衰减（W_last/W_first ≥ `RETENTION_DECAY_MAX`）→ 结论闸生效，散文里必须
+      出现"这一批数据算不出留存"这个意思；
+    - 曲线正常衰减 → 闸不适用，只比数值（此时反过来照抄那句警告也是错的，但这里
+      **不做黑名单**，理由见下）。
+
+    量不出形状（金标里没有 pct 那一份）→ 按最严的口径走，即仍然要求声明。判据瞎了
+    就该从严，不该静默放行。
+
+    ## 边界，别让名字比覆盖面大
+
+    它是**关键词白名单**，不是"读懂了散文"。一个既说"算不出"又同时下"留得住"结论的
+    答案，它拦不住；换个说法表达同一个错误结论（比如"用户黏性稳定"而不提数据缺陷），
+    只要一个白名单词都没命中就会被拦下——拦得住是因为白名单在**要求**一句话存在，
+    不是在**禁止**某句话存在。禁止型的写法这里刻意没用：正确答案里就写着
+    『别当成"留存好"的正面结论』，任何以「留存好」为特征的黑名单都会把它误杀。
+
+    还有一件事值得写下来：在**当前**这批数据上，结论闸这一路是走不到的（曲线在衰减）。
+    所以它的两个分支都由 `--selftest` 里的固定夹具覆盖（平坦曲线 → 必须拦；衰减曲线 →
+    必须放行），不靠"湖里正好装着哪一批"来体检——否则换一批数据就等于悄悄少了一道闸。
     """
     prose = _delivered_prose(evidence)
-    if not any(k in prose for k in _RETENTION_CREDIBILITY):
-        return False, ("结论里没有声明「这份数据算不出留存」：曲线平坦是活跃度与注册"
-                       "生命周期独立抽样的结果（项目 P0），把它答成「留得住/粘性好」"
-                       "就是把数据缺陷报成了业务发现。右删失说明不能替代这一条，"
+    ratio, n_cohorts = _retention_shape(goldens)
+    if ratio is None:
+        shape = "量不出曲线形状（金标里没有 pct 那一份），按最严口径要求声明"
+        decaying = False
+    else:
+        decaying = ratio < RETENTION_DECAY_MAX
+        shape = (f"金标实测 {n_cohorts} 个 cohort 的末周/首周 ≈ {ratio:.2f}"
+                 f"（{'衰减' if decaying else '不衰减'}，阈值 {RETENTION_DECAY_MAX}）")
+
+    if not decaying and not any(k in prose for k in _RETENTION_CREDIBILITY):
+        return False, (f"结论里没有声明「这一批数据算不出留存」：{shape}——曲线平坦是"
+                       "活跃度与注册生命周期独立抽样的结果（v1 种子样本的 P0），"
+                       "把它答成「留得住/粘性好」就是把数据缺陷报成了业务发现。"
+                       "右删失说明不能替代这一条，"
                        "见 knowledge/analysis/retention_curve.md 顶部那节")
     tol = case["judge"].get("tolerance_pct", defaults["tolerance_pct"])
     min_hit = case["judge"].get("min_hit", 6)
     nums = agent_numbers(evidence)
+    prefix = ("曲线在衰减，结论闸不适用" if decaying else "结论已声明数据限制")
     for g in goldens:
         vals = [float(v) for v in _flat_values(g["rows"]) if isinstance(v, (int, float))]
         if not vals:
             continue
         hit = sum(1 for v in vals if any(_close(n, v, tol) for n in nums))
         if hit >= min_hit:
-            return True, f"结论已声明数据限制；命中 golden[{g['label']}] {hit}/{len(vals)} 个数值"
-    return False, f"结论合格但留存矩阵数值命中不足 {min_hit} 个"
+            return True, (f"{prefix}（{shape}）；"
+                          f"命中 golden[{g['label']}] {hit}/{len(vals)} 个数值")
+    return False, f"{prefix}（{shape}），但留存矩阵数值命中不足 {min_hit} 个"
 
 
 JUDGES = {"scalar": judge_scalar, "set": judge_set, "toplist": judge_toplist,
@@ -727,15 +784,17 @@ def selftest() -> int:
                              f"不是 cohort 成员 `{coh_alias}.user_id`："
                              f"实测这么写第 1 周是 219/43 = 509%")
 
-    # 8d) 数字对了、结论仍可以是错的。这一组是 Q3 的窟窿：留存曲线在这份数据上
+    # 8d) 数字对了、结论仍可以是错的。这一组是 Q3 的窟窿：留存曲线在 v1 种子样本上
     # 平坦（45.0/43.0/42.1/41.1/43.0），agent 把它答成「曲线平稳、留得住」，
     # 还配了一句完全正确的右删失说明——听起来很严谨，而结论是把项目自己的 P0
     # 数据缺陷报成了正面业务发现。这条事实此前只写在 `docs/`，agent 从不读。
+    # 两份文档现在写的是**判据**（W4/W1 ≥ 0.8 算不衰减）而不是结论，因为全量批次的
+    # 曲线已经衰减了；这里钉的三个串是判据那段话的锚，删掉就等于把这一节抽空。
     for rel, musts in [
         ("knowledge/analysis/retention_curve.md",
-         ["算不出留存", "act.user_id = coh.user_id"]),
+         ["算不出留存", "act.user_id = coh.user_id", "W4/W1"]),
         ("knowledge/metrics/core_metrics.md",
-         ["留存结论不可用", "analysis/retention_curve.md"]),
+         ["留存结论不可用", "analysis/retention_curve.md", "W4/W1"]),
         ("knowledge/domains/behavior/_index.md", ["analysis/retention_curve.md"]),
     ]:
         p = HERE.parent / rel
@@ -745,14 +804,60 @@ def selftest() -> int:
                 fails.append(f"{rel} 不存在，无法核留存口径/路由")
             elif must not in p.read_text():
                 fails.append(f"{rel} 里找不到 `{must}`：留存题会读不到"
-                             f"「这份数据算不出留存」这条约束，"
+                             f"「曲线不衰减时算不出留存」这条判据，"
                              f"平坦曲线会被答成「留得住」")
+
+    # 8e) 上面那一路的**前提**：agent 在常规模式下真的会去读那份 `analysis/` 文档。
+    #
+    # 这是 L5-retention-cohort 那道红的另一半原因。域索引里写的是「两个都要读，
+    # **哪怕只是取数**」，而 `LITE_SUFFIX`（普通题的系统提示后缀）原文写着
+    # 「**不要**读 analysis/ 方法库」——两句话直接对冲，而系统提示赢。于是常规模式下
+    # 那份文档从来没被打开过：留存题的分子约束（写错出 509%）和曲线可信度判据
+    # 一起消失，而 eval 又按"该说的话没说"判它红。deep 模式只有 4 个预设按钮能进，
+    # 用户手打的问题一律走 lite，所以这不只是 eval 的保真度问题。
+    #
+    # 判据用同一句话做锚：知识库标了「哪怕只是取数」，提示词里就必须出现同一句，
+    # 并且是围绕 `analysis/` 说的。这样"重新写成一刀切"会红，而正常改写不会。
+    LITE_ANCHOR = "哪怕只是取数"
+    forced = sorted(md.relative_to(KB.parent) for md in KB.rglob("*.md")
+                    if LITE_ANCHOR in md.read_text())
+    ran += 1
+    ap = HERE.parent / "backend" / "agent.py"
+    m = re.search(r"LITE_SUFFIX\s*=\s*\"\"\"(.*?)\"\"\"", ap.read_text(), re.S)
+    if m is None:
+        fails.append("backend/agent.py 里找不到 LITE_SUFFIX：常规模式的提示后缀"
+                     "改名或删了，这条路由检查已经瞎了")
+    elif forced:
+        lite = m.group(1)
+        ran += 1
+        if LITE_ANCHOR not in lite:
+            fails.append(
+                f"LITE_SUFFIX 里没有「{LITE_ANCHOR}」这个例外，而 "
+                f"{', '.join(str(f) for f in forced)} 里写着这句话要求"
+                f"「哪怕只是取数也要读 analysis/」：两边对冲，系统提示赢，"
+                f"常规模式下那份口径硬约束/可信度判据永远读不到")
+        elif "analysis/" not in lite:
+            fails.append("LITE_SUFFIX 里的例外没有点名 `analysis/`："
+                         "写得太泛，agent 不知道例外指的是哪一类文档")
 
     # 9) 留存判分器的结论闸。这一组和第 1–5 组对称,但盯的维度相反:
     # 漏斗那次错在**数值**(结算 > 浏览),留存这次数值**全对**、分子也对、
     # 右删失说明也对,错的只有结论那五个字「曲线平稳、留得住」。纯数值判分会判 PASS。
+    #
+    # 夹具是**两条曲线**，不是一条：结论闸只在"曲线不衰减"时生效，而当前这批数据的
+    # 曲线是衰减的（见 judge_retention 的 docstring）。两个分支都得有固定夹具，
+    # 否则换一批数据就等于悄悄少了一道闸、或者反过来开始要求 agent 说假话。
     r_case = {"judge": {"mode": "retention", "tolerance_pct": 5.0, "min_hit": 3}}
-    r_goldens = [{"label": "matrix", "rows": [[41, 18, 19, 19, 17], [37, 18, 16, 18, 14]]}]
+    # 平坦（v1 种子样本实测量级）：末周/首周 ≈ 0.95，判为不衰减 → 结论闸生效
+    r_goldens = [{"label": "matrix counts", "rows": [[41, 18, 19, 19, 17],
+                                                    [37, 18, 16, 18, 14]]},
+                 {"label": "matrix pct", "rows": [[43.9, 46.3, 46.3, 41.5],
+                                                  [48.6, 43.2, 48.6, 37.8]]}]
+    # 衰减（全量批次实测量级）：末周/首周 ≈ 0.52 → 结论闸不适用
+    d_goldens = [{"label": "matrix counts", "rows": [[41, 18, 19, 19, 17],
+                                                    [37, 18, 16, 18, 14]]},
+                 {"label": "matrix pct", "rows": [[71.6, 51.9, 42.3, 37.2],
+                                                  [70.0, 50.1, 41.9, 32.9]]}]
 
     def r_ev(prose: str, nums=(41, 18, 19, 19, 17, 37, 18, 16, 18, 14)):
         return {"result": {"interpreted": "按注册周分 cohort", "insight": prose,
@@ -789,7 +894,23 @@ def selftest() -> int:
     if "算不出留存" in why:
         fails.append(f"数值不命中不该被报成结论问题: {why}")
 
-    # 9e) 金标自己的口径(同第 6 组对金标做的事):留存金标必须按 registered_at 分 cohort、
+    # 9e) 另一个分支:曲线**确实在衰减**时,结论闸必须让路。写死"必须说算不出留存"的
+    # 那一版在数据换成全量批次后开始要求 agent 说假话——这一批是算得出留存的
+    # （71.6 → 37.2，前陡后平）。判据钉在数据的性质上而数据会换，就必然有这种反转。
+    PLAIN = ("满窗的 4 个 cohort，W1 约 71.6% 一路降到 W4 的 37.2%，前陡后平，"
+             "是正常的留存衰减形态。末周那几个 0 是右删失。")
+    ok, why = judge_retention(r_case, d_goldens, r_ev(PLAIN), defaults)
+    check("曲线在衰减时不该再要求声明「算不出留存」", ok, True)
+    if "衰减" not in why:
+        fails.append(f"判对的理由里应写明是按曲线形状放行的，实际: {why}")
+    # 同一段散文放到平坦曲线上必须被拦下——证明放行确实来自形状,不是白名单变松了
+    ok, _ = judge_retention(r_case, r_goldens, r_ev(PLAIN), defaults)
+    check("同一段散文在平坦曲线上仍应判错", ok, False)
+    # 9f) 量不出形状(金标里没有 pct 那份)要**从严**:判据瞎了不能静默放行
+    ok, _ = judge_retention(r_case, [d_goldens[0]], r_ev(PLAIN), defaults)
+    check("量不出曲线形状时应回到最严口径", ok, False)
+
+    # 9g) 金标自己的口径(同第 6 组对金标做的事):留存金标必须按 registered_at 分 cohort、
     # 且分子 JOIN 回 cohort 名单。真源错了下游全错。
     rc = next((c for c in spec["cases"] if c["id"] == "L5-retention-cohort"), None)
     ran += 1
@@ -799,6 +920,12 @@ def selftest() -> int:
         if rc["judge"]["mode"] != "retention":
             fails.append(f"L5-retention-cohort 的判分 mode 是 {rc['judge']['mode']}，"
                          f"不是 retention：结论闸不生效，答成「留得住」也会 PASS")
+        # 形状闸靠 label 里带 pct 的那份金标量曲线；那份被删掉/改名，闸不会报错，
+        # 只会静默退回"最严口径"，于是数据换成衰减的那一批之后开始要求 agent 说假话。
+        ran += 1
+        if not any("pct" in g["label"].lower() for g in rc["golden"]):
+            fails.append("L5-retention-cohort 的金标里没有 label 带 `pct` 的那一份："
+                         "judge_retention 量不出曲线形状，结论闸会退回最严口径")
         for g in rc["golden"]:
             ran += 1
             if "registered_at" not in g["sql"] or "created_at" in g["sql"]:
