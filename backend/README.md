@@ -71,7 +71,8 @@ cd backend
 | `CLAUDE_CODE_USE_BEDROCK` | `1` | 走 Bedrock |
 | `AWS_REGION` | `us-west-2`(athena)/ `us-east-1`(postgres) | athena 后端与表桶 / Glue / workgroup 同区 |
 | `ANTHROPIC_MODEL` | `global.anthropic.claude-opus-4-8` | 全局跨区推理 profile(禁裸 ID / `us.` / `eu.` 前缀) |
-| `ATHENA_WORKGROUP` | `analytics-agent-wg` | Athena workgroup(带查询结果位置) |
+| `ATHENA_WORKGROUP` | `analytics-agent-wg` | 管理侧 Athena workgroup(带查询结果位置)。**没设 `AGENT_ROLE_ARN` 时**走这个 |
+| `ATHENA_AGENT_WORKGROUP` | `analytics-agent-ro-wg` | 治理角色专用 workgroup,结果落在 `athena-staging/agent/` 子前缀下。**设了 `AGENT_ROLE_ARN` 时**自动走这个:查询结果 CSV 是明文行数据,共用一个 workgroup 等于让 agent 从管理侧的结果文件里读回 LF 已排除的 `users.email`。两个值**不要**设成同一个 |
 | `S3_TABLE_BUCKET` | `analytics-agent-tables` | S3 表桶名 |
 | `ICEBERG_NAMESPACE` | `app_analytics` | 表桶 namespace = Athena 里的 database 名 |
 | `ATHENA_CATALOG` | `s3tablescatalog/<表桶>` | Athena 侧目录名(**不带**账号前缀) |

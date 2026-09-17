@@ -49,6 +49,10 @@ if [[ "$DB_BACKEND" != "postgres" ]]; then
   # Athena 走 HTTPS + IAM：没有 host/port，不进 VPC，不需要连接池，没有密码落地。
   export AWS_REGION="${AWS_REGION:-us-west-2}"
   export ATHENA_WORKGROUP="${ATHENA_WORKGROUP:-analytics-agent-wg}"
+  # 两个 workgroup：管理侧那个的结果 CSV 里有明文 PII（治理探针自己就查 email），
+  # 所以治理角色（AGENT_ROLE_ARN）生效时 db.py 会切到这个，结果落在
+  # athena-staging/agent/ 子前缀下、管理侧那半边它读不到。见 scripts/lakehouse/athena.py。
+  export ATHENA_AGENT_WORKGROUP="${ATHENA_AGENT_WORKGROUP:-analytics-agent-ro-wg}"
   export ICEBERG_NAMESPACE="${ICEBERG_NAMESPACE:-app_analytics}"
   S3_TABLE_BUCKET="${S3_TABLE_BUCKET:-analytics-agent-tables}"
   # Athena 的 Catalog 参数用的是**不带账号前缀**的形式，Glue API 的 CatalogId 才带。
@@ -65,7 +69,13 @@ if [[ "$DB_BACKEND" != "postgres" ]]; then
   # 账号刚从 sts 拿到，不写死。不配也能跑，只是 /api/catalog 会降级到
   # information_schema 并在界面上标出来（少了「元数据来自统一目录」这个演示点）。
   export GLUE_CATALOG_ID="${GLUE_CATALOG_ID:-$ACCT:s3tablescatalog/$S3_TABLE_BUCKET}"
-  echo "[run] backend=athena  workgroup=$ATHENA_WORKGROUP  namespace=$ICEBERG_NAMESPACE"
+  # 打印**生效的那个**，不是管理侧那个：设了 AGENT_ROLE_ARN 时查询实际走 agent
+  # workgroup，这一行印错的话，「治理接上了没有」在启动日志上就看不出来了。
+  if [[ -n "${AGENT_ROLE_ARN:-}" ]]; then
+    echo "[run] backend=athena  workgroup=$ATHENA_AGENT_WORKGROUP（治理角色）  namespace=$ICEBERG_NAMESPACE"
+  else
+    echo "[run] backend=athena  workgroup=$ATHENA_WORKGROUP  namespace=$ICEBERG_NAMESPACE"
+  fi
   echo "[run] region=$AWS_REGION  catalog=$ATHENA_CATALOG"
 else
   PGBIN=/opt/homebrew/opt/postgresql@16/bin

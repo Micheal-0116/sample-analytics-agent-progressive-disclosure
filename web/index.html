@@ -1652,9 +1652,13 @@ async function askLive(question, deep){
 /* ================== BAKED (offline demo fallback) —— LEGACY，不再维护 ==================
    这一整块是"没有后端也能演示"的兜底：写死的问答、图表、KPI、SQL。
 
-   **已冻结在 v1 形态，且不打算跟进 v2。** 里面的数字全是 Aurora 时代的：DAU 1418、
-   7 日 GMV 124 万、日期 05/29–06/04，对应约 19 万行的旧数据集；现在真实规模是
-   48 张表 / 7992 万行 / Redshift Serverless。SQL 方言也还是 Postgres 的。
+   **已冻结在 v1 形态，后面两次换库都没跟。** 里面的数字全是 Aurora 时代的：DAU 1418、
+   7 日 GMV 124 万、日期 05/29–06/04。现行后端是 **Athena + S3 Tables / Iceberg**
+   （v2 的 Redshift Serverless 也已退役），Glue 目录 48 张表、约 22 万行，业务日历
+   止于 2026-01-24。这块里的每条 SQL 都还是 **Postgres 方言**、还在用
+   `current_date - interval '7 days'` 当"今天"——两样在现行后端上都是错的
+   （Trino 要 `interval '7' day`，"今天"要取 `meta_snapshot.as_of_date`）。
+   它们不进数据库、只是给观众看的字符串，所以没有任何检查会因此变红。
 
    为什么留着不删：它是 MODE==='baked' 的唯一落点，删了得连着改 boot() 的失败路径和
    一堆渲染分支，而线上根本走不到这里——线上 config.js 配了 askUrl，boot() 第一行就

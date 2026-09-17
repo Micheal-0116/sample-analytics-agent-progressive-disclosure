@@ -189,6 +189,24 @@ _ath_lock = threading.Lock()
 AGENT_ROLE_ARN = os.getenv("AGENT_ROLE_ARN", "")
 
 
+def _workgroup(athena) -> str:
+    """按身份选 workgroup：治理角色走 agent 那个，裸凭证走管理侧那个。
+
+    为什么不是一个 workgroup 加一个 `ATHENA_WORKGROUP` 环境变量了事：workgroup 的
+    `OutputLocation` 决定查询结果 CSV 落到哪个 S3 前缀，而结果 CSV 是**明文行数据**。
+    两侧共用一个前缀时，agent 角色对该前缀的 GetObject 让它能从管理侧查询的结果文件
+    里把 LF 已经排除掉的 `users.email` 读回来。完整说明在 `athena.py` 的
+    `AGENT_WORKGROUP` 上方，IAM 侧在 `scripts/lakehouse/governance.py`。
+
+    两个环境变量刻意**分开**（`ATHENA_AGENT_WORKGROUP` / `ATHENA_WORKGROUP`）：
+    共用一个的话，`.env.local` 里为了跑管理脚本设的那个值会把治理路径也拽回
+    管理侧 workgroup，而这件事从外面看不出来——查询照样成功。
+    """
+    if AGENT_ROLE_ARN:
+        return os.getenv("ATHENA_AGENT_WORKGROUP", athena.AGENT_WORKGROUP)
+    return os.getenv("ATHENA_WORKGROUP", athena.WORKGROUP)
+
+
 def _athena():
     """惰性拿 Athena 客户端（复用 scripts/lakehouse/athena.py，避免两份实现）。
 
@@ -250,7 +268,7 @@ def _athena():
         _ath_client = athena.Client(
             catalog=os.getenv("ATHENA_CATALOG", athena.ATHENA_CATALOG),
             database=os.getenv("ICEBERG_NAMESPACE", athena.NAMESPACE),
-            workgroup=os.getenv("ATHENA_WORKGROUP", athena.WORKGROUP),
+            workgroup=_workgroup(athena),
             region=region, session=session,
         )
     return _ath_client
@@ -341,7 +359,9 @@ def backend_info() -> dict:
         return {
             "engine": ENGINE_LABEL,
             "name": os.getenv("ICEBERG_NAMESPACE", athena.NAMESPACE),
-            "workgroup": os.getenv("ATHENA_WORKGROUP", athena.WORKGROUP),
+            # 治理角色生效时这里是 agent 专属 workgroup（结果集落在它自己的 S3
+            # 子前缀下，读不到管理侧的结果文件）。见 `_workgroup()`。
+            "workgroup": _workgroup(athena),
             "catalog": os.getenv("ATHENA_CATALOG", athena.ATHENA_CATALOG),
             "region": os.getenv("AWS_REGION", athena.REGION),
             "transport": "Athena API",                # 没有 host/port：HTTPS + IAM

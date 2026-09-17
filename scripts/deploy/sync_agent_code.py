@@ -46,6 +46,14 @@
 `meta_snapshot` 锚点之后，云上那份还在教「用该表自身的 max(dt)」——同一个问题，
 本地答 GMV 100.8 万，云上答 0。
 
+**按 kwarg 比值**（`ClaudeAgentOptions`）：`max_turns` / `disallowed_tools` /
+`permission_mode` 这些不在节点清单里——它们写在两侧各自的驱动里，整段拷不了。
+但节点清单只保证 `DENIED_BUILTINS` 的**定义**同步，不保证它**被传进去了**：
+一侧收紧了边界、另一侧漏传，节点检查照样绿。所以选项逐 kwarg 比字面值
+（`ast.unparse` 归一化后），名字或值不一致都红，**新加的 kwarg 只加一侧也红**。
+刻意不同的只有 `system_prompt` 和 `cli_path`，见 `OPTS_DIFFER_OK`。这几条
+`--apply` 修不了（驱动不同），只能手工对齐。
+
 ## 这个检查器**不覆盖**什么（名字别比覆盖面大）
 
 - **`knowledge/` 那棵文档树。** 云上不烤进镜像，冷启动从 S3 同步
@@ -98,6 +106,22 @@ AGENT_NODES = [
     "_cls", "_metric_sig", "_fmt_num", "_stats_summary", "_as_text",
     "_as_list", "_as_dict", "_norm_method", "_make_gate",
 ]
+
+# `ClaudeAgentOptions` 的 kwargs **不在**上面那份节点清单里，也进不去：它写在
+# 两侧各自的驱动里（本地 `_run_agent_once` 的 `ClaudeAgentOptions(...)`，云上
+# `build_options()` 的 `kwargs = dict(...)`），整段不能对拷。但**装的是什么**必须一样：
+# `max_turns` / `disallowed_tools` / `permission_mode` 各写一份、无人比对的话，
+# 一侧收紧了边界另一侧不会红——`DENIED_BUILTINS` 的定义同步了，可"有没有传进去"
+# 没同步，等于同步面对着一个能绕开它的洞。所以这里逐 kwarg 比字面值。
+#
+# 刻意不同的只有这两个，其余任何名字/值不一致都算漂移（**包括新加的 kwarg 只加了一侧**）：
+OPTS_DIFFER_OK = {
+    # 本地是 `SYSTEM + (DEEP_SUFFIX|LITE_SUFFIX)`（每次调用拼）；云上暖客户端的选项是
+    # 静态的，只放 `SYSTEM`，深度/常规差异走 per-turn 前缀。`SYSTEM` 本身在节点清单里。
+    "system_prompt",
+    # 云上镜像用系统装的 claude CLI（条件塞进 kwargs），本地用 SDK 内置那份。
+    "cli_path",
+}
 
 
 def banner(src_rel: str) -> str:
@@ -212,6 +236,65 @@ def apply_nodes(src: Path, dst: Path, names: list[str]) -> tuple[bool, list[str]
     return True, []
 
 
+# -------------------------------------------------- ClaudeAgentOptions 的 kwargs
+
+def _option_kwargs(text: str, who: str) -> tuple[dict[str, str], list[str]]:
+    """找到构选项的那次调用，返回 `kwarg 名 -> 值的源码`。
+
+    认的是**带 `permission_mode` 的调用**，不是写死函数名 `ClaudeAgentOptions`：
+    云上那份是 `kwargs = dict(...)` 再 `ClaudeAgentOptions(**kwargs)`，按函数名找会在
+    云上那一侧静默漏检——而云上正是没人手测的那一侧。（`backend/agent.py --selftest`
+    里的工具边界自测用的是同一个认法，两处别分叉。）
+
+    值用 `ast.unparse` 归一化，比的是**表达式**不是文本，所以换行/缩进/注释的差异不算漂移。
+    """
+    tree = ast.parse(text)
+    sites = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+             and any(kw.arg == "permission_mode" for kw in n.keywords)]
+    if not sites:
+        return {}, [f"{who}：找不到构 ClaudeAgentOptions 的调用（没有带 permission_mode 的"
+                    f"调用）——要么选项没了，要么认法过期了，两种都得人看"]
+    if len(sites) > 1:
+        return {}, [f"{who}：有 {len(sites)} 处带 permission_mode 的调用，认不出该比哪个；"
+                    f"选项应当只构一次"]
+    site = sites[0]
+    got = {kw.arg: ast.unparse(kw.value) for kw in site.keywords if kw.arg}
+    # 云上是 `kwargs = dict(...)` 之后 `if _CLI_PATH: kwargs["cli_path"] = ...`——那一项
+    # 不是 keyword，补上，否则会被当成"云上少传了一个"。只认装选项那个变量的下标赋值，
+    # 别把函数里别的字典（本地的 toolmap 之类）也当成选项。
+    holder = next((t.id for m in ast.walk(tree) if isinstance(m, ast.Assign)
+                   and m.value is site and len(m.targets) == 1
+                   and isinstance(t := m.targets[0], ast.Name)), None)
+    if holder:
+        for m in ast.walk(tree):
+            if (isinstance(m, ast.Assign) and len(m.targets) == 1
+                    and isinstance(t := m.targets[0], ast.Subscript)
+                    and isinstance(t.value, ast.Name) and t.value.id == holder
+                    and isinstance(t.slice, ast.Constant) and isinstance(t.slice.value, str)):
+                got.setdefault(t.slice.value, ast.unparse(m.value))
+    return got, []
+
+
+def check_options(src: Path, dst: Path) -> list[str]:
+    s, bad = _option_kwargs(src.read_text(encoding="utf-8"), src.name)
+    d, bad2 = _option_kwargs(dst.read_text(encoding="utf-8"), dst.name)
+    bad = bad + bad2
+    if bad:
+        return bad
+    for name in sorted(set(s) | set(d)):
+        if name in OPTS_DIFFER_OK:
+            continue
+        if name not in d:
+            bad.append(f"{dst.name}：选项少了 `{name}={s[name]}`——本地传了云上没传，"
+                       f"两侧的行为/边界不一样宽")
+        elif name not in s:
+            bad.append(f"{dst.name}：选项多了 `{name}={d[name]}`——云上传了本地没传")
+        elif s[name] != d[name]:
+            bad.append(f"{dst.name}：选项 `{name}` 值不同（源 `{s[name]}` ⟷ "
+                       f"云上 `{d[name]}`）")
+    return bad
+
+
 # ---------------------------------------------------------------- 命令
 
 def run_check(root: Path = ROOT, cloud: Path | None = None) -> int:
@@ -224,6 +307,8 @@ def run_check(root: Path = ROOT, cloud: Path | None = None) -> int:
         bad.append(f"{AGENT_DST}：云上这份不存在")
     else:
         bad += check_nodes(root / AGENT_SRC, agent_dst, AGENT_NODES)
+        opt_bad = check_options(root / AGENT_SRC, agent_dst)
+        bad += opt_bad
 
     if bad:
         print(f"云上副本与 backend/ 漂移了 {len(bad)} 处 ❌")
@@ -231,8 +316,12 @@ def run_check(root: Path = ROOT, cloud: Path | None = None) -> int:
             print(f"  - {b}")
         print("\n改的是 backend/ 就跑：python3 scripts/deploy/sync_agent_code.py --apply")
         print("改的是云上那份 → 那是生成物，改动会被覆盖；请把改动搬回 backend/ 再同步。")
+        if opt_bad:
+            print("选项 kwargs 那几条 **`--apply` 修不了**：两侧的驱动不一样，整段不能对拷，"
+                  "得手工把 build_options() 的 kwargs 对齐（刻意不同的见 OPTS_DIFFER_OK）。")
         return 1
-    print(f"同步面一致 ✅（{len(COPIES)} 份整拷 + agent.py 的 {len(AGENT_NODES)} 个节点逐字相同）")
+    print(f"同步面一致 ✅（{len(COPIES)} 份整拷 + agent.py 的 {len(AGENT_NODES)} 个节点逐字相同"
+          f" + ClaudeAgentOptions 的 kwargs 等值）")
     return 0
 
 
@@ -281,6 +370,37 @@ def f(a):
 
 def only_cloud():
     return "驱动层，刻意不同，不在同步面里"
+'''
+
+
+# 选项 kwargs 的样板：形状照真实两侧来——本地直接构 `ClaudeAgentOptions(...)`，
+# 云上先 `kwargs = dict(...)` 再 `**kwargs`，且带一个条件塞进去的 cli_path。
+_OPTS_SRC = '''def _run_agent_once(q):
+    toolmap = {}
+    toolmap["不是选项"] = "别把它当 kwarg"
+    opts = ClaudeAgentOptions(
+        system_prompt=SYSTEM + LITE_SUFFIX,
+        allowed_tools=ALLOWED,
+        disallowed_tools=DENIED_BUILTINS,
+        permission_mode="bypassPermissions",
+        max_turns=14,
+    )
+    opts.resume = None
+    return opts
+'''
+
+_OPTS_DST_OK = '''def build_options():
+    kwargs = dict(
+        system_prompt=SYSTEM,
+        allowed_tools=ALLOWED,
+        # 注释和换行不算漂移：比的是表达式
+        disallowed_tools=DENIED_BUILTINS,
+        permission_mode="bypassPermissions",
+        max_turns=14,
+    )
+    if _CLI_PATH:
+        kwargs["cli_path"] = _CLI_PATH
+    return ClaudeAgentOptions(**kwargs)
 '''
 
 
@@ -347,10 +467,42 @@ def _selftest() -> int:
         if changed or not blocked:
             fail("目标缺节点时 apply 没被挡住——它会猜位置乱插")
 
+        # 5) 选项 kwargs：干净时说一致（含刻意不同的两个 + 注释/换行差异）
+        osrc, odst = tmp / "osrc.py", tmp / "odst.py"
+        osrc.write_text(_OPTS_SRC, encoding="utf-8")
+        odst.write_text(_OPTS_DST_OK, encoding="utf-8")
+        msgs = check_options(osrc, odst)
+        if msgs:
+            fail(f"两侧选项本来是等值的（system_prompt/cli_path 刻意不同），却报了：{msgs}")
+
+        # 6) 三种真实的漂法都要红：值变了 / 少传一个 / 只在一侧新加一个
+        for label, text, want in [
+            ("max_turns 被改成 6", _OPTS_DST_OK.replace("max_turns=14", "max_turns=6"),
+             "max_turns"),
+            ("disallowed_tools 整条漏传",
+             _OPTS_DST_OK.replace("        disallowed_tools=DENIED_BUILTINS,\n", ""),
+             "disallowed_tools"),
+            ("云上偷偷多传一个 kwarg",
+             _OPTS_DST_OK.replace("max_turns=14,", "max_turns=14,\n        extra_knob=True,"),
+             "extra_knob"),
+        ]:
+            odst.write_text(text, encoding="utf-8")
+            msgs = check_options(osrc, odst)
+            if not any(want in m for m in msgs):
+                fail(f"{label}，选项检查没报到 `{want}`（假阴性）：{msgs}")
+
+        # 7) 认不出选项调用时必须显式失败，不能"没找到就算一致"——那正是最坏的假绿
+        odst.write_text(_OPTS_DST_OK.replace('permission_mode="bypassPermissions",', ""),
+                        encoding="utf-8")
+        msgs = check_options(osrc, odst)
+        if not msgs or "找不到" not in msgs[0]:
+            fail(f"认不出选项调用时没显式失败：{msgs}")
+
     if bad:
         print(f"\n{bad} 项失败 ❌")
         return 1
     print("  整份拷 3 类漂移全部报红、节点拷只动同步面、清单过期显式失败")
+    print("  选项 kwargs：改值/漏传/单侧新增全部报红，认不出调用时显式失败")
     print("全部通过 ✅")
     return 0
 

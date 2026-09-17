@@ -91,7 +91,21 @@ import boto3
 from botocore.exceptions import ClientError
 
 REGION = os.environ.get("AWS_REGION", "us-west-2")
+
+# **两个 workgroup，不是一个。** 管理侧（建表、灌数、对账、L0–L6 的各类核查）走
+# `WORKGROUP`；agent 那个最小权限角色走 `AGENT_WORKGROUP`。
+#
+# 分开的理由不是配额也不是计费口径，是**结果集**：workgroup 的 OutputLocation 决定
+# 查询结果写到哪个 S3 前缀，而结果集是**明文行数据的 CSV**。共用一个 workgroup 时
+# 两侧的结果落在同一个前缀下，而 agent 角色对那个前缀有 GetObject / PutObject ——
+# 于是 LF 在目录层排除掉的 `users.email`，agent 可以从**管理侧的结果文件**里读回来
+# （治理探针自己就会跑 `SELECT email FROM users LIMIT 1`，那一行明文就落在那儿），
+# 顺带还能覆盖管理侧的结果对象。列级排除挡的是"查得到吗"，挡不了"结果放哪儿"。
+#
+# 拆成两个 workgroup + 两个子前缀之后，agent 的 S3 授权面只到
+# `AGENT_STAGING_PREFIX`，管理侧那半边它既读不到也写不到。
 WORKGROUP = os.environ.get("ATHENA_WORKGROUP", "analytics-agent-wg")
+AGENT_WORKGROUP = os.environ.get("ATHENA_AGENT_WORKGROUP", "analytics-agent-ro-wg")
 
 # S3 表桶名。catalog 名由它派生，两处形式不同，见下面两个常量。
 TABLE_BUCKET = os.environ.get("S3_TABLE_BUCKET", "analytics-agent-tables")
@@ -106,6 +120,14 @@ ATHENA_CATALOG = os.environ.get("ATHENA_CATALOG",
 
 # 原始 CSV 落地桶 + Athena 结果暂存前缀。CSV 外部表建在这里，灌完可删。
 RAW_BUCKET = os.environ.get("RAW_BUCKET", "analytics-agent-raw")
+
+# 结果暂存前缀，**只在这里定义一次**。setup.py（建 workgroup 时的 OutputLocation）
+# 和 governance.py（写进 IAM 策略 Resource 的那一串）原来各写一份同样的字面量，
+# 两边漂了的表现是"策略文本上看着给了、查询照样报拿不到结果桶"——报错指向桶，
+# 不指向两个常量不一致。agent 那半边是它的**子前缀**，于是一条 s3:GetObject 的
+# Resource 就能把两侧隔开，不用再开第二个桶。
+STAGING_PREFIX = "athena-staging/"
+AGENT_STAGING_PREFIX = STAGING_PREFIX + "agent/"
 
 POLL_INITIAL = 0.15
 POLL_MAX = 2.0
@@ -319,15 +341,81 @@ def _scalar(field: dict, type_name: str = ""):
 # ---------------------------------------------------------------- SQL 拆分
 
 def split_statements(sql: str) -> list[str]:
-    """按分号拆分 SQL，尊重字符串字面量、标识符引号和注释。
+    """按分号拆分 SQL，**尊重字符串字面量、标识符引号和注释**。
 
-    直接复用 rsql.py 的实现，避免两份。理由跟那边一样：朴素的 `split(";")` 会在
-    `COMMENT ON ... IS '粒度=dt;归因=last_touch'` 这类语句上把字符串截断。
+    朴素的 `sql.split(";")` 会在这类语句上炸掉：
+
+        COMMENT ON TABLE t IS '粒度=dt;归因=last_touch';
+
+    注释文本里的 ASCII 分号被当成语句结束符，字符串被截断，报
+    "Unterminated string literal"。这里做一遍字符级扫描：单引号内（含 '' 转义）、
+    双引号标识符内、`--` 行注释和 `/* */` 块注释内的分号都不算分隔符。
+
+    这段实现原来是 `sys.path.insert(.../redshift)` + `import rsql.split_statements`。
+    那条路径有两个问题，第二个是硬故障：(1) `scripts/redshift/` 是 Redshift 退役后的
+    死路径（见 AGENTS.md），活代码不该反过来依赖它；(2) 本文件会被
+    `scripts/deploy/sync_agent_code.py` 逐字节拷进 `analyticsagent/app/analytics/`，
+    容器里**没有** `/app/redshift`，所以那个 import 在云上必然 ImportError。它一直没炸
+    只是因为拆语句只走 `--file` 那条仓库侧 CLI 路径。行为与 rsql 那份一致；那份留在
+    死路径里不动，作为 v2 的历史记录。
     """
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    sys.path.insert(0, os.path.join(root, "redshift"))
-    import rsql
-    return rsql.split_statements(sql)
+    out: list[str] = []
+    cur: list[str] = []
+    i, n = 0, len(sql)
+    in_s = in_d = in_line = in_block = False
+    while i < n:
+        ch = sql[i]
+        nxt = sql[i + 1] if i + 1 < n else ""
+        if in_line:
+            cur.append(ch)
+            if ch == "\n":
+                in_line = False
+        elif in_block:
+            cur.append(ch)
+            if ch == "*" and nxt == "/":
+                cur.append(nxt)
+                i += 1
+                in_block = False
+        elif in_s:
+            cur.append(ch)
+            if ch == "'":
+                if nxt == "'":          # '' 是转义的单引号，不结束字面量
+                    cur.append(nxt)
+                    i += 1
+                else:
+                    in_s = False
+        elif in_d:
+            cur.append(ch)
+            if ch == '"':
+                in_d = False
+        elif ch == "-" and nxt == "-":
+            cur.append(ch)
+            in_line = True
+        elif ch == "/" and nxt == "*":
+            cur.append(ch)
+            in_block = True
+        elif ch == "'":
+            cur.append(ch)
+            in_s = True
+        elif ch == '"':
+            cur.append(ch)
+            in_d = True
+        elif ch == ";":
+            out.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+        i += 1
+    out.append("".join(cur))
+
+    # 丢掉纯注释/空白的片段
+    res = []
+    for s in out:
+        body = re.sub(r"--[^\n]*", "", s)
+        body = re.sub(r"/\*.*?\*/", "", body, flags=re.DOTALL).strip()
+        if body:
+            res.append(s.strip())
+    return res
 
 
 def line_comment_lines(sql: str) -> list[int]:

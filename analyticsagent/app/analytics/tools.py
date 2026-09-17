@@ -65,8 +65,16 @@ async def read_doc(args):
 
 @tool(
     "run_sql",
-    "对 app_analytics 库执行一条只读 SQL（仅 SELECT/WITH）。返回 JSON：columns/rows/rowcount/truncated。"
-    "执行前必须已通过 read_doc 读过相关表的文档。",
+    "对 app_analytics 库执行一条只读 SQL（仅 SELECT/WITH）。"
+    "返回 JSON：columns/rows/rowcount/truncated/exec_ms/bytes_scanned"
+    "（bytes_scanned = 这条查询扫描的字节数，Athena 按它计费，是成本读数）。"
+    "执行前必须已通过 read_doc 读过相关表的文档。"
+    "注意：查询走的是最小权限只读角色，有一小块数据不在授权面里——"
+    "`users.email` / `users.phone` / `user_profiles.birth_date` 被 Lake Formation "
+    "**列级排除**（点名查报 `COLUMN_NOT_FOUND`，`SELECT *` 里也没有），"
+    "`user_messages` 整表未授权（报表不存在）。这类拒绝**不要重试、不要换写法绕**，"
+    "改写 SQL 也拿不到；直接告诉用户这条边界并给可用的替代维度。"
+    "这是列级排除而非脱敏：库里是明文，别在输出里说「已脱敏」。",
     {"sql": str},
     annotations={"readOnlyHint": True},
 )
