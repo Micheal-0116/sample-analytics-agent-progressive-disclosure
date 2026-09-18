@@ -1,11 +1,12 @@
 {
   "meta": {
-    "ts": "2026-09-17 20:29:09",
+    "ts": "2026-09-18 11:22:03",
     "model": "global.anthropic.claude-opus-4-8",
     "cases": "cases.json",
-    "avg_s": 55.0,
+    "arm": "athena",
+    "avg_s": 50.0,
     "avg_docs": 2.4,
-    "avg_sql": 0.7
+    "avg_sql": 0.8
   },
   "records": [
     {
@@ -22,8 +23,13 @@
           ]
         }
       ],
-      "elapsed_s": 70.4,
+      "elapsed_s": 36.2,
       "n_docs": 3,
+      "agent_docs": [
+        "domains/_index.md",
+        "domains/user/_index.md",
+        "domains/user/users.md"
+      ],
       "n_sql": 1,
       "agent_sqls": [
         "SELECT status, COUNT(*) AS user_count FROM users GROUP BY status ORDER BY user_count DESC"
@@ -47,11 +53,16 @@
           ]
         }
       ],
-      "elapsed_s": 33.0,
+      "elapsed_s": 32.3,
       "n_docs": 3,
+      "agent_docs": [
+        "domains/_index.md",
+        "domains/transaction/_index.md",
+        "domains/transaction/orders.md"
+      ],
       "n_sql": 1,
       "agent_sqls": [
-        "SELECT\n  COUNT(*) AS total_orders,\n  COUNT(CASE WHEN status <> 'cancelled' THEN 1 END) AS non_cancelled_orders,\n  COUNT(CASE WHEN status IN ('paid','shipped','delivered') THEN 1 END) AS valid_orders\nFROM orders"
+        "SELECT status, count(*) AS cnt FROM orders GROUP BY status ORDER BY cnt DESC"
       ],
       "agent_errors": [],
       "has_result": true,
@@ -80,8 +91,13 @@
           ]
         }
       ],
-      "elapsed_s": 48.3,
+      "elapsed_s": 33.8,
       "n_docs": 3,
+      "agent_docs": [
+        "domains/_index.md",
+        "domains/social/_index.md",
+        "domains/social/posts.md"
+      ],
       "n_sql": 1,
       "agent_sqls": [
         "SELECT status, COUNT(*) AS post_count FROM posts GROUP BY status ORDER BY post_count DESC"
@@ -113,9 +129,13 @@
           ]
         }
       ],
-      "retried_infra": true,
-      "elapsed_s": 111.6,
+      "elapsed_s": 40.2,
       "n_docs": 3,
+      "agent_docs": [
+        "domains/_index.md",
+        "domains/marketing/_index.md",
+        "domains/marketing/campaigns.md"
+      ],
       "n_sql": 1,
       "agent_sqls": [
         "SELECT status, COUNT(*) AS campaign_count FROM campaigns GROUP BY status ORDER BY campaign_count DESC"
@@ -147,10 +167,15 @@
           ]
         }
       ],
-      "elapsed_s": 39.0,
-      "n_docs": 0,
-      "n_sql": 0,
-      "agent_sqls": [],
+      "elapsed_s": 41.1,
+      "n_docs": 1,
+      "agent_docs": [
+        "domains/mart/mart_daily_kpi.md"
+      ],
+      "n_sql": 1,
+      "agent_sqls": [
+        "SELECT dt, dau FROM mart_daily_kpi WHERE dt = (SELECT max(as_of_date) FROM meta_snapshot)"
+      ],
       "agent_errors": [],
       "has_result": true,
       "status": "pass",
@@ -179,11 +204,16 @@
           ]
         }
       ],
-      "elapsed_s": 49.9,
+      "elapsed_s": 46.6,
       "n_docs": 3,
+      "agent_docs": [
+        "domains/_index.md",
+        "domains/experiment/_index.md",
+        "domains/experiment/ab_tests.md"
+      ],
       "n_sql": 1,
       "agent_sqls": [
-        "SELECT test_id, test_name, primary_metric, traffic_percentage, start_date, end_date, owner\nFROM ab_tests\nWHERE status = 'running'\nORDER BY start_date DESC"
+        "SELECT test_id, test_name, primary_metric, traffic_percentage, start_date, owner\nFROM ab_tests\nWHERE status = 'running'\nORDER BY start_date DESC"
       ],
       "agent_errors": [],
       "has_result": true,
@@ -237,11 +267,16 @@
           ]
         }
       ],
-      "elapsed_s": 36.4,
+      "elapsed_s": 44.8,
       "n_docs": 3,
+      "agent_docs": [
+        "domains/_index.md",
+        "domains/attribution/_index.md",
+        "domains/attribution/channels.md"
+      ],
       "n_sql": 1,
       "agent_sqls": [
-        "SELECT channel_id, channel_name, channel_type, platform, is_active\nFROM channels\nORDER BY channel_type, channel_id"
+        "SELECT channel_id, channel_name, channel_type, platform, is_active\nFROM channels\nORDER BY channel_type, channel_name"
       ],
       "agent_errors": [],
       "has_result": true,
@@ -257,18 +292,23 @@
           "label": "group by gender",
           "rows": [
             [
-              "female",
-              110011
-            ],
-            [
               "male",
               103524
+            ],
+            [
+              "female",
+              110011
             ]
           ]
         }
       ],
-      "elapsed_s": 31.9,
+      "elapsed_s": 35.8,
       "n_docs": 3,
+      "agent_docs": [
+        "domains/_index.md",
+        "domains/user/_index.md",
+        "domains/user/user_profiles.md"
+      ],
       "n_sql": 1,
       "agent_sqls": [
         "SELECT gender, COUNT(*) AS user_count, ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(), 2) AS pct FROM user_profiles GROUP BY gender ORDER BY user_count DESC"
@@ -287,16 +327,16 @@
           "label": "device rows",
           "rows": [
             [
-              "android",
-              158570
-            ],
-            [
               "ios",
               104745
             ],
             [
               "mini_program",
               18686
+            ],
+            [
+              "android",
+              158570
             ],
             [
               "web",
@@ -312,25 +352,30 @@
               28379
             ],
             [
-              "android",
-              81928
-            ],
-            [
               "ios",
               63396
             ],
             [
               "mini_program",
               16363
+            ],
+            [
+              "android",
+              81928
             ]
           ]
         }
       ],
-      "elapsed_s": 46.9,
+      "elapsed_s": 41.4,
       "n_docs": 3,
+      "agent_docs": [
+        "domains/_index.md",
+        "domains/user/_index.md",
+        "domains/user/user_devices.md"
+      ],
       "n_sql": 1,
       "agent_sqls": [
-        "SELECT\n    device_type,\n    COUNT(*) AS device_count,\n    COUNT(DISTINCT user_id) AS user_count,\n    ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER(), 2) AS device_pct\nFROM user_devices\nGROUP BY device_type\nORDER BY device_count DESC;"
+        "SELECT device_type,\n       COUNT(*) AS device_count,\n       COUNT(DISTINCT user_id) AS user_count,\n       ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER(), 2) AS pct\nFROM user_devices\nGROUP BY device_type\nORDER BY device_count DESC"
       ],
       "agent_errors": [],
       "has_result": true,
@@ -346,16 +391,16 @@
           "label": "group by status",
           "rows": [
             [
-              "delivered",
-              217456
+              "pending",
+              89279
             ],
             [
               "paid",
               232643
             ],
             [
-              "pending",
-              89279
+              "shipped",
+              197296
             ],
             [
               "cancelled",
@@ -366,17 +411,22 @@
               41995
             ],
             [
-              "shipped",
-              197296
+              "delivered",
+              217456
             ]
           ]
         }
       ],
-      "elapsed_s": 44.9,
+      "elapsed_s": 33.4,
       "n_docs": 3,
+      "agent_docs": [
+        "domains/_index.md",
+        "domains/transaction/_index.md",
+        "domains/transaction/orders.md"
+      ],
       "n_sql": 1,
       "agent_sqls": [
-        "SELECT status, COUNT(*) AS order_count,\n       ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(), 2) AS pct\nFROM orders\nGROUP BY status\nORDER BY order_count DESC"
+        "SELECT status,\n       COUNT(*) AS order_count,\n       ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(), 2) AS pct\nFROM orders\nGROUP BY status\nORDER BY order_count DESC"
       ],
       "agent_errors": [],
       "has_result": true,
@@ -424,11 +474,16 @@
           ]
         }
       ],
-      "elapsed_s": 51.1,
+      "elapsed_s": 38.2,
       "n_docs": 3,
+      "agent_docs": [
+        "domains/_index.md",
+        "domains/behavior/_index.md",
+        "domains/behavior/page_views.md"
+      ],
       "n_sql": 1,
       "agent_sqls": [
-        "SELECT page_name, COUNT(*) AS pv, COUNT(DISTINCT user_id) AS uv, AVG(duration_seconds) AS avg_duration\nFROM page_views\nWHERE view_time >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '7' day\n  AND view_time <= (SELECT max(as_of_date) FROM meta_snapshot)\nGROUP BY page_name\nORDER BY pv DESC\nLIMIT 10;"
+        "SELECT page_name, COUNT(*) AS pv, COUNT(DISTINCT user_id) AS uv\nFROM page_views\nWHERE view_time >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '7' day\n  AND view_time <= (SELECT max(as_of_date) FROM meta_snapshot)\nGROUP BY page_name\nORDER BY pv DESC\nLIMIT 10;"
       ],
       "agent_errors": [],
       "has_result": true,
@@ -481,11 +536,16 @@
           ]
         }
       ],
-      "elapsed_s": 41.0,
+      "elapsed_s": 49.5,
       "n_docs": 3,
+      "agent_docs": [
+        "domains/_index.md",
+        "domains/social/_index.md",
+        "domains/social/posts.md"
+      ],
       "n_sql": 1,
       "agent_sqls": [
-        "SELECT post_id, user_id, content_type, title, like_count, view_count, comment_count, share_count\nFROM posts\nWHERE status = 'published'\nORDER BY like_count DESC\nLIMIT 5"
+        "SELECT post_id, user_id, content_type, title, like_count, view_count, comment_count, share_count\nFROM posts\nORDER BY like_count DESC\nLIMIT 5"
       ],
       "agent_errors": [],
       "has_result": true,
@@ -506,11 +566,16 @@
           ]
         }
       ],
-      "elapsed_s": 46.5,
+      "elapsed_s": 51.7,
       "n_docs": 3,
+      "agent_docs": [
+        "domains/_index.md",
+        "domains/marketing/_index.md",
+        "domains/marketing/user_coupons.md"
+      ],
       "n_sql": 1,
       "agent_sqls": [
-        "SELECT\n  count(*) AS total_coupons,\n  count(*) FILTER (WHERE status = 'used') AS used_count,\n  count(*) FILTER (WHERE status = 'unused') AS unused_count,\n  count(*) FILTER (WHERE status = 'expired') AS expired_count,\n  round(count(*) FILTER (WHERE status = 'used') * 100.0 / nullif(count(*), 0), 2) AS usage_rate\nFROM user_coupons"
+        "SELECT\n  COUNT(*) AS total_received,\n  COUNT(CASE WHEN status = 'used' THEN 1 END) AS used_count,\n  COUNT(CASE WHEN status = 'unused' THEN 1 END) AS unused_count,\n  COUNT(CASE WHEN status = 'expired' THEN 1 END) AS expired_count,\n  ROUND(COUNT(CASE WHEN status = 'used' THEN 1 END) * 100.0 / NULLIF(COUNT(*), 0), 2) AS usage_rate\nFROM user_coupons"
       ],
       "agent_errors": [],
       "has_result": true,
@@ -547,8 +612,9 @@
           ]
         }
       ],
-      "elapsed_s": 45.6,
+      "elapsed_s": 24.9,
       "n_docs": 0,
+      "agent_docs": [],
       "n_sql": 0,
       "agent_sqls": [],
       "agent_errors": [],
@@ -597,12 +663,16 @@
           ]
         }
       ],
-      "retried_infra": true,
-      "elapsed_s": 120.0,
-      "n_docs": 4,
+      "elapsed_s": 44.0,
+      "n_docs": 3,
+      "agent_docs": [
+        "domains/_index.md",
+        "domains/transaction/_index.md",
+        "domains/transaction/order_items.md"
+      ],
       "n_sql": 1,
       "agent_sqls": [
-        "SELECT\n    oi.product_id,\n    oi.product_name,\n    SUM(oi.actual_amount) AS total_revenue,\n    SUM(oi.quantity) AS total_quantity\nFROM order_items oi\nJOIN orders o ON oi.order_id = o.order_id\nWHERE o.status IN ('paid', 'shipped', 'delivered')\nGROUP BY oi.product_id, oi.product_name\nORDER BY total_revenue DESC\nLIMIT 10;"
+        "SELECT\n    oi.product_id,\n    oi.product_name,\n    SUM(oi.actual_amount) AS gmv,\n    SUM(oi.quantity) AS total_quantity\nFROM order_items oi\nJOIN orders o ON oi.order_id = o.order_id\nWHERE o.status IN ('paid', 'shipped', 'delivered')\nGROUP BY oi.product_id, oi.product_name\nORDER BY gmv DESC\nLIMIT 10;"
       ],
       "agent_errors": [],
       "has_result": true,
@@ -631,11 +701,18 @@
           ]
         }
       ],
-      "elapsed_s": 56.2,
+      "elapsed_s": 91.1,
       "n_docs": 5,
+      "agent_docs": [
+        "domains/_index.md",
+        "domains/behavior/_index.md",
+        "domains/behavior/sessions.md",
+        "domains/user/_index.md",
+        "domains/user/users.md"
+      ],
       "n_sql": 1,
       "agent_sqls": [
-        "WITH anchor AS (SELECT max(as_of_date) AS d FROM meta_snapshot),\nactive_30d AS (\n  SELECT DISTINCT user_id\n  FROM sessions\n  WHERE user_id IS NOT NULL\n    AND start_time >  (SELECT d FROM anchor) - interval '30' day\n    AND start_time <= (SELECT d FROM anchor)\n)\nSELECT\n  (SELECT COUNT(*) FROM users) AS total_users,\n  (SELECT COUNT(*) FROM active_30d) AS active_users_30d,\n  (SELECT COUNT(*) FROM users u WHERE u.user_id NOT IN (SELECT user_id FROM active_30d)) AS churned_users\n"
+        "WITH active AS (\n  SELECT DISTINCT user_id\n  FROM sessions\n  WHERE user_id IS NOT NULL\n    AND start_time >= (SELECT max(as_of_date) FROM meta_snapshot) - interval '30' day\n)\nSELECT\n  count(*) AS total_users,\n  count(*) FILTER (WHERE a.user_id IS NOT NULL) AS active_30d,\n  count(*) FILTER (WHERE a.user_id IS NULL) AS churned_users,\n  round(count(*) FILTER (WHERE a.user_id IS NULL) * 100.0 / count(*), 1) AS churn_rate\nFROM users u\nLEFT JOIN active a ON u.user_id = a.user_id;"
       ],
       "agent_errors": [],
       "has_result": true,
@@ -666,11 +743,16 @@
           ]
         }
       ],
-      "elapsed_s": 42.2,
+      "elapsed_s": 50.1,
       "n_docs": 3,
+      "agent_docs": [
+        "domains/_index.md",
+        "domains/transaction/_index.md",
+        "domains/transaction/orders.md"
+      ],
       "n_sql": 1,
       "agent_sqls": [
-        "SELECT\n  CASE WHEN coupon_id IS NOT NULL THEN '用券' ELSE '未用券' END AS grp,\n  COUNT(*) AS order_cnt,\n  ROUND(AVG(actual_amount), 2) AS avg_order_value,\n  ROUND(SUM(actual_amount), 2) AS total_amount,\n  ROUND(AVG(discount_amount), 2) AS avg_discount\nFROM orders\nWHERE status IN ('paid','shipped','delivered')\nGROUP BY 1\nORDER BY 1;"
+        "SELECT\n  CASE WHEN coupon_id IS NOT NULL THEN '用了优惠券' ELSE '没用优惠券' END AS grp,\n  COUNT(*) AS order_cnt,\n  ROUND(AVG(actual_amount), 2) AS aov,\n  ROUND(SUM(actual_amount), 2) AS gmv,\n  ROUND(AVG(discount_amount), 2) AS avg_discount\nFROM orders\nWHERE status IN ('paid','shipped','delivered')\nGROUP BY 1\nORDER BY 1"
       ],
       "agent_errors": [],
       "has_result": true,
@@ -705,11 +787,17 @@
           ]
         }
       ],
-      "elapsed_s": 53.5,
+      "elapsed_s": 59.2,
       "n_docs": 4,
+      "agent_docs": [
+        "domains/_index.md",
+        "domains/behavior/_index.md",
+        "domains/behavior/events.md",
+        "analysis/funnel_analysis.md"
+      ],
       "n_sql": 1,
       "agent_sqls": [
-        "WITH w AS (\n  SELECT user_id, event_name\n  FROM events\n  WHERE event_name IN ('view_product','add_to_cart','begin_checkout','purchase')\n),\ns1 AS (SELECT DISTINCT user_id FROM w WHERE event_name = 'view_product'),\ns2 AS (SELECT DISTINCT user_id FROM w WHERE event_name = 'add_to_cart'\n       AND user_id IN (SELECT user_id FROM s1)),\ns3 AS (SELECT DISTINCT user_id FROM w WHERE event_name = 'begin_checkout'\n       AND user_id IN (SELECT user_id FROM s2)),\ns4 AS (SELECT DISTINCT user_id FROM w WHERE event_name = 'purchase'\n       AND user_id IN (SELECT user_id FROM s3))\nSELECT (SELECT count(*) FROM s1) AS step1_view,\n       (SELECT count(*) FROM s2) AS step2_cart,\n       (SELECT count(*) FROM s3) AS step3_checkout,\n       (SELECT count(*) FROM s4) AS step4_purchase"
+        "WITH w AS (\n  SELECT user_id, event_name\n  FROM events\n  WHERE event_name IN ('view_product','add_to_cart','begin_checkout','purchase')\n),\ns1 AS (SELECT DISTINCT user_id FROM w WHERE event_name='view_product'),\ns2 AS (SELECT DISTINCT user_id FROM w WHERE event_name='add_to_cart' AND user_id IN (SELECT user_id FROM s1)),\ns3 AS (SELECT DISTINCT user_id FROM w WHERE event_name='begin_checkout' AND user_id IN (SELECT user_id FROM s2)),\ns4 AS (SELECT DISTINCT user_id FROM w WHERE event_name='purchase' AND user_id IN (SELECT user_id FROM s3))\nSELECT (SELECT count(*) FROM s1) AS step1_view,\n       (SELECT count(*) FROM s2) AS step2_cart,\n       (SELECT count(*) FROM s3) AS step3_checkout,\n       (SELECT count(*) FROM s4) AS step4_purchase"
       ],
       "agent_errors": [],
       "has_result": true,
@@ -736,11 +824,17 @@
           ]
         }
       ],
-      "elapsed_s": 74.4,
-      "n_docs": 5,
+      "elapsed_s": 145.1,
+      "n_docs": 4,
+      "agent_docs": [
+        "domains/_index.md",
+        "metrics/governed_metrics.md",
+        "domains/mart/_index.md",
+        "domains/mart/mart_user_summary.md"
+      ],
       "n_sql": 1,
       "agent_sqls": [
-        "SELECT register_channel,\n       count(*) AS users,\n       count(*) FILTER (WHERE first_paid_date IS NOT NULL) AS buyers,\n       round(sum(coalesce(total_gmv,0)), 0) AS total_gmv,\n       round(sum(coalesce(total_gmv,0)) / nullif(count(*),0), 1) AS arpu\nFROM mart_user_summary\nGROUP BY 1\nORDER BY arpu DESC;"
+        "SELECT register_channel,\n       count(*) AS users,\n       count(*) FILTER (WHERE first_paid_date IS NOT NULL) AS buyers,\n       round(sum(total_gmv)/count(*), 2) AS arpu_all_user,\n       round(avg(total_gmv) FILTER (WHERE first_paid_date IS NOT NULL), 2) AS arpu_buyer\nFROM mart_user_summary\nWHERE register_channel <> '未归因'\nGROUP BY 1\nORDER BY arpu_all_user DESC"
       ],
       "agent_errors": [],
       "has_result": true,
@@ -828,16 +922,21 @@
           ]
         }
       ],
-      "elapsed_s": 88.2,
+      "elapsed_s": 88.9,
       "n_docs": 3,
+      "agent_docs": [
+        "domains/_index.md",
+        "metrics/core_metrics.md",
+        "analysis/retention_curve.md"
+      ],
       "n_sql": 1,
       "agent_sqls": [
-        "WITH a AS (SELECT max(as_of_date) AS d FROM meta_snapshot),\ncohort AS (\n    SELECT user_id, DATE_TRUNC('week', CAST(registered_at AS date)) AS cohort_week\n    FROM users, a\n    WHERE CAST(registered_at AS date) > a.d - interval '56' day\n),\nactivity AS (\n    SELECT DISTINCT user_id, DATE_TRUNC('week', CAST(event_time AS date)) AS activity_week\n    FROM events\n)\nSELECT\n    c.cohort_week,\n    COUNT(DISTINCT c.user_id) AS cohort_size,\n    COUNT(DISTINCT CASE WHEN date_diff('week', c.cohort_week, act.activity_week) = 1 THEN c.user_id END) AS w1,\n    COUNT(DISTINCT CASE WHEN date_diff('week', c.cohort_week, act.activity_week) = 2 THEN c.user_id END) AS w2,\n    COUNT(DISTINCT CASE WHEN date_diff('week', c.cohort_week, act.activity_week) = 3 THEN c.user_id END) AS w3,\n    COUNT(DISTINCT CASE WHEN date_diff('week', c.cohort_week, act.activity_week) = 4 THEN c.user_id END) AS w4,\n    COUNT(DISTINCT CASE WHEN date_diff('week', c.cohort_week, act.activity_week) = 5 THEN c.user_id END) AS w5,\n    COUNT(DISTINCT CASE WHEN date_diff('week', c.cohort_week, act.activity_week) = 6 THEN c.user_id END) AS w6,\n    COUNT(DISTINCT CASE WHEN date_diff('week', c.cohort_week, act.activity_week) = 7 THEN c.user_id END) AS w7\nFROM cohort c\nLEFT JOIN activity act ON act.user_id = c.user_id\nGROUP BY c.cohort_week\nORDER BY c.cohort_week\n"
+        "WITH a AS (SELECT max(as_of_date) AS d FROM meta_snapshot),\ncohort AS (\n    SELECT user_id, DATE_TRUNC('week', CAST(registered_at AS date)) AS cohort_week\n    FROM users, a\n    WHERE DATE_TRUNC('week', CAST(registered_at AS date)) >= DATE_TRUNC('week', a.d) - interval '49' day\n      AND CAST(registered_at AS date) <= a.d\n),\nactivity AS (\n    SELECT DISTINCT e.user_id, DATE_TRUNC('week', CAST(e.event_time AS date)) AS activity_week\n    FROM events e, a\n    WHERE CAST(e.event_time AS date) >= DATE_TRUNC('week', a.d) - interval '49' day\n      AND CAST(e.event_time AS date) <= a.d\n)\nSELECT\n    c.cohort_week,\n    COUNT(DISTINCT c.user_id) AS cohort_size,\n    ROUND(100.0 * COUNT(DISTINCT CASE WHEN date_diff('week', c.cohort_week, act.activity_week) = 0 THEN c.user_id END) / COUNT(DISTINCT c.user_id), 1) AS w0,\n    ROUND(100.0 * COUNT(DISTINCT CASE WHEN date_diff('week', c.cohort_week, act.activity_week) = 1 THEN c.user_id END) / COUNT(DISTINCT c.user_id), 1) AS w1,\n    ROUND(100.0 * COUNT(DISTINCT CASE WHEN date_diff('week', c.cohort_week, act.activity_week) = 2 THEN c.user_id END) / COUNT(DISTINCT c.user_id), 1) AS w2,\n    ROUND(100.0 * COUNT(DISTINCT CASE WHEN date_diff('week', c.cohort_week, act.activity_week) = 3 THEN c.user_id END) / COUNT(DISTINCT c.user_id), 1) AS w3,\n    ROUND(100.0 * COUNT(DISTINCT CASE WHEN date_diff('week', c.cohort_week, act.activity_week) = 4 THEN c.user_id END) / COUNT(DISTINCT c.user_id), 1) AS w4,\n    ROUND(100.0 * COUNT(DISTINCT CASE WHEN date_diff('week', c.cohort_week, act.activity_week) = 5 THEN c.user_id END) / COUNT(DISTINCT c.user_id), 1) AS w5,\n    ROUND(100.0 * COUNT(DISTINCT CASE WHEN date_diff('week', c.cohort_week, act.activity_week) = 6 THEN c.user_id END) / COUNT(DISTINCT c.user_id), 1) AS w6,\n    ROUND(100.0 * COUNT(DISTINCT CASE WHEN date_diff('week', c.cohort_week, act.activity_week) = 7 THEN c.user_id END) / COUNT(DISTINCT c.user_id), 1) AS w7\nFROM cohort c\nLEFT JOIN activity act ON act.user_id = c.user_id\nGROUP BY c.cohort_week\nORDER BY c.cohort_week\n"
       ],
       "agent_errors": [],
       "has_result": true,
       "status": "pass",
-      "detail": "曲线在衰减，结论闸不适用（金标实测 5 个 cohort 的末周/首周 ≈ 0.50（衰减，阈值 0.8））；命中 golden[weekly matrix counts (full-window cohorts)] 25/25 个数值"
+      "detail": "曲线在衰减，形状闸不适用（金标实测 5 个 cohort 的末周/首周 ≈ 0.50（衰减，阈值 0.8））；命中 golden[weekly matrix pct (full-window cohorts)] 18/20 个数值"
     },
     {
       "id": "L5-repurchase-rate",
@@ -853,8 +952,9 @@
           ]
         }
       ],
-      "elapsed_s": 76.7,
+      "elapsed_s": 55.9,
       "n_docs": 0,
+      "agent_docs": [],
       "n_sql": 0,
       "agent_sqls": [],
       "agent_errors": [],
@@ -886,11 +986,15 @@
           ]
         }
       ],
-      "elapsed_s": 59.2,
-      "n_docs": 1,
+      "elapsed_s": 51.3,
+      "n_docs": 2,
+      "agent_docs": [
+        "domains/mart/mart_daily_revenue.md",
+        "metrics/governed_metrics.md"
+      ],
       "n_sql": 1,
       "agent_sqls": [
-        "WITH a AS (SELECT max(as_of_date) AS anchor FROM meta_snapshot)\nSELECT dt,\n       CAST(sum(gmv) AS decimal(14,2)) AS gmv,\n       CASE WHEN dt > (SELECT anchor FROM a) - interval '7' day THEN 'last7' ELSE 'prev7' END AS win\nFROM mart_daily_revenue\nWHERE dt > (SELECT anchor FROM a) - interval '14' day\n  AND dt <= (SELECT anchor FROM a)\nGROUP BY dt\nORDER BY dt"
+        "WITH anchor AS (SELECT max(as_of_date) AS d FROM meta_snapshot)\nSELECT\n  CAST(sum(gmv) FILTER (WHERE dt > (SELECT d FROM anchor) - interval '7' day AND dt <= (SELECT d FROM anchor)) AS decimal(14,2)) AS gmv_last7,\n  CAST(sum(gmv) FILTER (WHERE dt > (SELECT d FROM anchor) - interval '14' day AND dt <= (SELECT d FROM anchor) - interval '7' day) AS decimal(14,2)) AS gmv_prev7\nFROM mart_daily_revenue\nWHERE dt > (SELECT d FROM anchor) - interval '14' day AND dt <= (SELECT d FROM anchor)"
       ],
       "agent_errors": [],
       "has_result": true,
@@ -919,8 +1023,9 @@
           ]
         }
       ],
-      "elapsed_s": 39.7,
+      "elapsed_s": 28.2,
       "n_docs": 0,
+      "agent_docs": [],
       "n_sql": 0,
       "agent_sqls": [],
       "agent_errors": [],
@@ -950,11 +1055,17 @@
           ]
         }
       ],
-      "elapsed_s": 61.3,
+      "elapsed_s": 64.8,
       "n_docs": 4,
+      "agent_docs": [
+        "domains/_index.md",
+        "domains/attribution/_index.md",
+        "domains/attribution/channel_daily_costs.md",
+        "domains/attribution/channels.md"
+      ],
       "n_sql": 1,
       "agent_sqls": [
-        "SELECT ch.channel_name, ch.channel_type, ROUND(SUM(cdc.cost), 2) AS total_cost\nFROM channel_daily_costs cdc\nJOIN channels ch ON cdc.channel_id = ch.channel_id\nGROUP BY ch.channel_name, ch.channel_type\nORDER BY total_cost DESC"
+        "SELECT ch.channel_name, ch.channel_type,\n       CAST(SUM(c.cost) AS decimal(14,2)) AS total_cost\nFROM channel_daily_costs c\nJOIN channels ch ON c.channel_id = ch.channel_id\nGROUP BY ch.channel_name, ch.channel_type\nORDER BY total_cost DESC"
       ],
       "agent_errors": [],
       "has_result": true,
@@ -981,8 +1092,9 @@
           ]
         }
       ],
-      "elapsed_s": 38.8,
+      "elapsed_s": 34.6,
       "n_docs": 0,
+      "agent_docs": [],
       "n_sql": 0,
       "agent_sqls": [],
       "agent_errors": [],
@@ -1005,8 +1117,9 @@
           ]
         }
       ],
-      "elapsed_s": 40.6,
+      "elapsed_s": 42.5,
       "n_docs": 0,
+      "agent_docs": [],
       "n_sql": 0,
       "agent_sqls": [],
       "agent_errors": [],
@@ -1028,8 +1141,9 @@
           ]
         }
       ],
-      "elapsed_s": 36.8,
+      "elapsed_s": 44.4,
       "n_docs": 0,
+      "agent_docs": [],
       "n_sql": 0,
       "agent_sqls": [],
       "agent_errors": [],
