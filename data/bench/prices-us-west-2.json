@@ -1,7 +1,7 @@
 {
   "region": "us-west-2",
   "location": "US West (Oregon)",
-  "fetched_at": "2026-09-02T18:14:57+0800",
+  "fetched_at": "2026-10-05T15:20:34+0800",
   "source": "AWS Price List API (get_products, us-east-1 endpoint)",
   "items": {
     "athena_per_tb_scanned": {
@@ -59,6 +59,14 @@
       "usagetype": "USW2-TimedStorage-ByteHrs",
       "description": "$0.023 per GB - first 50 TB / month of storage used",
       "tiers": 3
+    },
+    "ec2_t3xlarge_per_hour": {
+      "usd": 0.1664,
+      "unit": "Hrs",
+      "service": "AmazonEC2",
+      "usagetype": "USW2-BoxUsage:t3.xlarge",
+      "description": "$0.1664 per On Demand Linux t3.xlarge Instance Hour",
+      "tiers": 1
     }
   }
 }

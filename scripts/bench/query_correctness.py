@@ -341,6 +341,14 @@ CASES: list[dict] = [
                        count(*) AS n
                 FROM orders GROUP BY 1 ORDER BY 1
             """,
+            # arm4 走 pg_duckdb 的内嵌 DuckDB，渲染写法与 duckdb 那条逐字相同。
+            # 这条 case 无共用 sql（三边 date_trunc 渲染本就不同），所以 aurora 必须
+            # 自己在 by_arm 里有一份——否则 main() 落到 case["sql"] 会 KeyError。
+            "aurora": """
+                SELECT strftime(date_trunc('month', placed_at), '%Y-%m') AS m,
+                       count(*) AS n
+                FROM orders GROUP BY 1 ORDER BY 1
+            """,
             "redshift": """
                 SELECT TO_CHAR(date_trunc('month', placed_at), 'YYYY-MM') AS m,
                        count(*) AS n

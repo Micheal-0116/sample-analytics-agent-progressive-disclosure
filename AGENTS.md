@@ -6,9 +6,9 @@
   the agent reads the `knowledge/` Markdown tree before writing SQL.
 - The backend the agent itself runs on is Athena over S3 Tables/Iceberg with Glue
   Data Catalog: `backend/run.sh`, `backend/db.py`, `scripts/lakehouse/`.
-- **Three query arms are live in parallel, for architecture comparison.** They are
+- **Four query arms are live in parallel, for architecture comparison.** They are
   not migration stages and none replaces another; each is measured against the
-  other two on correctness first, then time and cost.
+  others on correctness first, then time and cost.
   1. **Athena + S3 Tables** — `scripts/lakehouse/`. Deployed. 35 base tables plus
      13 derived, 79,943,758 rows in namespace `app_analytics`.
   2. **DuckDB + S3 Tables** — `scripts/duckdb/`. Reads the **same** Iceberg tables
@@ -29,6 +29,16 @@
      cache is turned off by `scripts/bench/arms.py: configure_for_timing()`.
      Region is not a preference: Parquet `COPY` goes through Spectrum, Spectrum
      rejects `REGION`, so the bucket and the workgroup must share a region.
+  4. **Aurora/pg_duckdb + S3 Tables** — `scripts/aurora/`. A unified PostgreSQL entry
+     (PG wire protocol) that embeds DuckDB via `pg_duckdb` and reads the **same** Iceberg
+     tables as arms 1–2, so like DuckDB it needs no storage of its own, only compute.
+     Deployed on **self-managed EC2** (t3.xlarge, 4 vCPU/16 GB, matching the Fargate task)
+     running `pgduckdb/pgduckdb:17-v1.1.1` — not managed RDS/Aurora, because `pg_duckdb`
+     is not in the RDS extension allowlist (see the Aurora bullet below). Idle by default:
+     `scripts/aurora/provision.py up` before a run, `down` after. First measured live
+     2026-10-05 (results below). It is the one arm whose compute is a separate box the
+     bench task reaches over PG wire, so its residual vs arm 2 is the **entry path**, not
+     the engine.
   Storage is shared as far down as possible on purpose: arms 1 and 2 read the same
   physical files, so a difference between them is a difference in the engine.
   `scripts/bench/` holds the shared harness: `arms.py` (one adapter per arm — the
@@ -70,25 +80,34 @@
   whole-column blind spot. Without this, both gates were red with no defect present —
   the mirror image of a green light hiding one, and the reason a real divergence would
   have been buried under the same two lines.
-- **Measured dialect divergences (from `query_correctness.py`, all reproducible).** These
-  are comparison findings, not bugs, and they are what an agent trips over when the same
-  question is asked on a different arm:
+- **Measured dialect divergences (from `query_correctness.py`, all reproducible; four arms
+  as of 2026-10-07).** These are comparison findings, not bugs, and they are what an agent
+  trips over when the same question is asked on a different arm. **arm4 (Aurora/pg_duckdb)
+  sides with DuckDB on every probe** — it runs the same embedded DuckDB engine, so it reads
+  the shared DuckDB-dialect SQL and answers identically, with one sub-ULP exception in #4:
   1. **Redshift has no `RANGE` window frame** (`RANGE clause of window functions not yet
      implemented`) *and* rejects an aggregate window function that has `ORDER BY` but no
      frame. Since `RANGE ... CURRENT ROW` **is** the SQL standard default frame, the
      standard default is inexpressible on Redshift: a running total over a key with ties
-     has no portable spelling. Only the `ROWS` form works on all three.
-  2. `7/2` is `3` on Athena and Redshift, `3.5` on DuckDB.
+     has no portable spelling. The `ROWS` form works on all four; Redshift is the lone
+     holdout on both window probes (Athena/DuckDB/Aurora agree).
+  2. `7/2` is `3` on Athena and Redshift, `3.5` on DuckDB and Aurora.
   3. Division by zero raises on Athena (`DIVISION_BY_ZERO`) and Redshift, but returns
-     `Infinity` on DuckDB — so the same bad query costs a retry on two arms and silently
-     poisons a report on the third.
+     `Infinity` on DuckDB and Aurora — so the same bad query costs a retry on two arms and
+     silently poisons a report on the other two.
   4. `DECIMAL / INTEGER` with no cast diverges: `SUM(actual_amount / item_count)` gives
-     140681679 on Athena vs 140681100.354 on DuckDB/Redshift. Ratio metrics need an
+     140681679 on Athena vs ~140681100.354 on DuckDB/Redshift/Aurora. Ratio metrics need an
      explicit `CAST(... AS DOUBLE)`; and even then float sums differ past ~12 significant
      digits because accumulation order follows each engine's parallel plan, which is why
-     that one gate case compares to 12 significant digits instead of bit-for-bit.
+     that one gate case compares to 12 significant digits instead of bit-for-bit. **The
+     arm4-specific finding lives here:** DuckDB in-process gives `…35400814` but Aurora
+     gives `…35400802` — the *same engine*, differing at ~1e-7, because the double crosses
+     the PG wire and pg_duckdb re-formats it on the way out. So the entry path alone can
+     perturb a float even when the engine is identical; the 12-sig-digit tolerance absorbs
+     it (this is a probe, not a gate), but it is the one place arm4's extra network hop is
+     visible in a *value* rather than only in latency.
   `ROUND` half-up behaviour, CJK MIN/MAX ordering and `date_trunc` month bucketing all
-  agree across the three, which is worth knowing because all three were suspected.
+  agree across all four, which is worth knowing because all were suspected.
 - **Governance, in one sentence** (verified on our own workgroup, not from docs):
   Redshift Serverless is the finest-grained of the three — table and column `GRANT`,
   row-level security (`svv_rls_policy`) and value-level dynamic masking
@@ -97,9 +116,10 @@
   has no governance layer of its own at all, since it runs in-process as whatever
   principal invoked it, so any boundary has to live in the surrounding application.
   (An earlier draft had this backwards, ranking Redshift as table-level only.)
-- **The agent itself can run on any of the three arms**: `DB_BACKEND` selects one of
-  `athena` / `duckdb` / `redshift` (plus `postgres`, the legacy local path), and an
-  unrecognized value raises at import rather than falling through to a default.
+- **The agent itself can run on any of the four arms**: `DB_BACKEND` selects one of
+  `athena` / `duckdb` / `redshift` / `aurora` (plus `postgres`, the legacy local path),
+  and an unrecognized value raises at import rather than falling
+  through to a default.
   Switching arms changes exactly two things — the connection, and the SQL dialect
   appended to the prompt tail (`db.DIALECT`, consumed by `agent.py: _dialect()`).
   Everything else — the `knowledge/` tree, metric definitions, the eval questions,
@@ -110,15 +130,22 @@
   The appendix goes at the tail rather than into `SYSTEM` for the same reason.
   Two consequences to know: `duckdb` and `redshift` have **no** column-level
   governance boundary, so `backend_info()["identity"]` is empty for them (visibly,
-  not silently); and all three arms enforce a statement timeout but by three different
+  not silently); and all four arms enforce a statement timeout but by four different
   mechanisms — Athena polls and calls `StopQueryExecution`, Redshift relies on the Data
-  API polling timeout, and DuckDB needs a **client-side watchdog**: it has no session
+  API polling timeout, DuckDB needs a **client-side watchdog**: it has no session
   `statement_timeout` (`duckdb_settings()` has no such entry) but it does have
   `conn.interrupt()`, which `scripts/duckdb/conn.py: Client.execute(timeout=...)` calls
-  from a `threading.Timer`. Measured on duckdb 1.5.5: a runaway query is killed at 2.0s
-  with `InterruptException`, and the connection stays usable afterwards. So the
-  difference between arms is implementation cost, not capability. (An earlier revision
-  of this file claimed DuckDB had "no cancellable handle" — that was wrong.)
+  from a `threading.Timer` (measured on duckdb 1.5.5: a runaway query is killed at 2.0s
+  with `InterruptException`, and the connection stays usable afterwards), and
+  **Aurora/pg_duckdb just uses PG `statement_timeout`** — no watchdog needed, because
+  it propagates into the embedded engine: measured 2026-10-07 (pg_duckdb v1.1.1), a 2s
+  timeout cancels a CPU-bound pushed-down DuckDB scan (`SELECT sum(i) FROM range(5e9)`)
+  at 2002ms with `Duckdb_ExecCustomScan_Cpp: Query cancelled`. This **refutes** the
+  earlier assumption (still worded that way in a prior draft) that PG `statement_timeout`
+  "can't kill a pushed-down DuckDB scan" — it can, at least for CPU-bound work; whether
+  an S3-I/O-bound scan is equally interruptible is untested. So the difference between
+  arms is implementation cost, not capability. (An earlier revision of this file claimed
+  DuckDB had "no cancellable handle" — that was wrong too.)
   The AgentCore copy runs the `athena` arm, and its warm client pins
   `system_prompt=SYSTEM` without the dialect tail; since the Athena appendix is the
   empty string, the two are equivalent today.
@@ -167,12 +194,46 @@
 - `docs/architecture-v2-redshift-glue.md` and `docs/legacy.md` describe the earlier
   Redshift-only architecture and carry a banner saying so. They are history, not the
   arm-3 spec — arm 3 reuses the DDL, not the topology those docs describe.
-- Aurora/Postgres is not one of the three arms; it stays a local-only convenience
+- **Aurora/pg_duckdb is the live 4th comparison arm, on self-managed EC2.**
+  The design (chosen with the mentor's "数据后台统一走 Aurora" direction) is
+  **PostgreSQL as a unified entry that embeds DuckDB via `pg_duckdb` and reads
+  the same shared S3 Tables/Iceberg files as the athena/duckdb arms** — i.e. the PG wire
+  protocol for transport, the DuckDB engine for execution, no materialization of its own.
+  This is deliberately **not** v1's shape (native rows stored in Aurora PG). `backend/db.py`
+  carries the full `aurora` backend (connection, `DIALECTS["aurora"]` = DuckDB appendix,
+  timeout, `backend_info`, selftest), and `scripts/aurora/` is the live wiring:
+  `provision.py` (EC2 instance + credentials secret + instance role + security group;
+  `setup`/`up`/`status`/`rotate`/`down`/`destroy`), `user-data.sh` (bootstraps the
+  `pgduckdb/pgduckdb:17-v1.1.1` container), and `aconn.py` (the PG-wire client, which
+  reuses `scripts/duckdb/conn.py` for the catalog and compute knobs so arm2/arm4 share one
+  yardstick). **Not managed RDS/Aurora:** `pg_duckdb` is not in the RDS extension allowlist
+  (RDS only permits AWS-curated extensions; pg_duckdb loads a custom shared library), so
+  the arm runs on self-managed PostgreSQL on EC2 (t3.xlarge, 4 vCPU/16 GB, matching the
+  Fargate task). **One gotcha, confirmed the hard way:** pg_duckdb v1.1.1 hard-denies
+  non-superusers `LocalFileSystem`, so external Iceberg reads require connecting as the
+  `postgres` superuser (`AURORA_PGUSER=postgres`), not the least-privilege
+  `analytics_agent_ro` role — the superuser and ro role share one password from the single
+  secret, so this is a username choice, not a second credential. The `duckdb.postgres_role`
+  GUC (set in `user-data.sh` so ro can *invoke* `duckdb.query()`) does **not** lift this:
+  ro runs `SELECT 1` fine, but any Iceberg read fails `File system LocalFileSystem has been
+  disabled by configuration` — so the agent path (`backend/db.py`, which defaults
+  `AURORA_PGUSER=analytics_agent_ro`) must also connect as `postgres`. The agent L7 eval was
+  verified 27/27 on `DB_BACKEND=aurora` only under the superuser (2026-10-07); under ro all
+  27 golden SQLs error at the LocalFileSystem gate. The bootstrap smoke test passing was
+  misleading — `SELECT 1` touches no filesystem. The arm is **idle by
+  default** to save money: `provision.py up` before a measurement run, `down` after (the
+  instance bills while running; the secret/role/SG persist for the next `up`).
+- The legacy local Postgres path (`DB_BACKEND=postgres`) stays a local-only convenience
   path (see `setup_local.sh` below).
-- **All three arms also run on Fargate**, from one task, via `scripts/bench/fargate.py`
+- **All four arms run from one Fargate task**, via `scripts/bench/fargate.py`
   (`--selftest` / `--setup` / `--build` / `--run -- <harness args>`). Not just DuckDB:
-  putting all three in the same task makes region, network position and machine
-  identical, so the residual difference is the engine. Correctness does not need the
+  putting the arms in the same task makes region, network position and machine
+  identical, so the residual difference is the engine. arm4 is opt-in — set `AURORA_PGHOST`
+  (plus `AURORA_SECRET_ARN`) and `fargate.py --setup` wires the 4th arm into the task
+  (env + secret injection, and a security-group ingress from the bench task to the EC2 on
+  5432); without those env vars the 3-arm task is byte-identical. arm4's engine runs on its
+  own EC2, which the task reaches over PG wire from that same network position, so its
+  compute cost is priced as EC2 instance-time, not Fargate task-time. Correctness does not need the
   cloud (same engine, same data, same answer), but **timing does** — DuckDB is
   in-process, so measuring it on a laptop while calling Athena and Redshift across
   the network measures three different things. It adds a task definition to the
@@ -257,9 +318,10 @@
   full-scale output. `--selftest` checks the Trino→DuckDB dialect mapping offline.
   The metric definitions come from `scripts/lakehouse/verify_load.py` — one definition
   shared by both arms, so a difference between arms is never a difference in yardstick.
-- `backend/.venv/bin/python scripts/bench/correctness.py --rows` runs the three-arm
-  correctness gate on row counts (~215s, needs `AWS_REGION` and
-  `REDSHIFT_SECRET_ARN`); `--full` compares every metric against the CSV source
+- `backend/.venv/bin/python scripts/bench/correctness.py --rows` runs the four-arm
+  correctness gate on row counts (~220s, needs `AWS_REGION` and `REDSHIFT_SECRET_ARN`;
+  the `aurora` arm also needs `AURORA_PGHOST` + `AURORA_SECRET_ARN`, else restrict with
+  `--arm`); `--full` compares every metric against the CSV source
   instead; `--arm athena --arm duckdb` restricts which arms run; `--selftest`
   checks the pass/fail logic offline. Each run writes per-arm-per-table spans to
   `data/bench/correctness-<timestamp>.jsonl` including the SQL actually sent, so a
@@ -268,10 +330,10 @@
   alone. (Concretely: two consecutive cloud `--rows` runs reported Redshift at 37.3s
   then 0.9s. Same data, same SQL — that is the result cache, and it is exactly why
   the number carries a warning.) `scripts/bench/arms.py` run directly checks that all
-  three arms' probes produce identical labels and that no arm's SQL contains
+  four arms' probes produce identical labels and that no arm's SQL contains
   another's dialect.
 - `backend/.venv/bin/python scripts/bench/query_correctness.py` runs the query-level
-  gate (17 cases: 9 gates + 8 probes) on all three arms; `--gate-only` skips the probes,
+  gate (17 cases: 9 gates + 8 probes) on all four arms; `--gate-only` skips the probes,
   `-k join -k null` filters by key substring, `--values` runs the text-column sweep
   instead (`--values-distinct` adds `COUNT(DISTINCT)`, much more expensive on the 80M-row
   tables), `--selftest` checks the voting/invariant/tolerance logic offline. Needs
@@ -287,8 +349,9 @@
   `--strict` makes the dialect and row-order notes fail too, `--selftest` checks the
   three-grade logic offline (24 assertions). Refuses to report success with fewer than
   two products present, since a one-arm cross-arm comparison is not one.
-- `backend/.venv/bin/python scripts/bench/prices.py --show` prints the seven unit
-  prices used by the cost column, fetched from the AWS Price List API (the `pricing`
+- `backend/.venv/bin/python scripts/bench/prices.py --show` prints the eight unit
+  prices used by the cost column (the eighth is `ec2_t3xlarge_per_hour` for arm4),
+  fetched from the AWS Price List API (the `pricing`
   endpoint only exists in us-east-1, regardless of the region being priced) and cached
   with provenance to `data/bench/prices-us-west-2.json`; `--refresh` re-fetches,
   `--selftest` checks the conversions offline. Prices are never hardcoded: a dollar
@@ -298,15 +361,16 @@
   items expose several `priceDimensions` (taking an arbitrary one returned S3's
   >500TB tier instead of the first tier). Billing *rules* are not in the API and live
   in this file as constants: Athena's 10MB-per-query minimum, Redshift Serverless's
-  60-second minimum, and Fargate having no minimum at all.
+  60-second minimum, Fargate's 60-second per-task minimum, and EC2's 60-second
+  per-instance minimum (arm4).
 - `backend/.venv/bin/python scripts/bench/timing.py` runs the 8-query time/cost sweep
-  on all three arms (`--reps N`, `-k <substr>`, `--list` to see the set and the
+  on all four arms (`--reps N`, `-k <substr>`, `--list` to see the set and the
   execution count without spending, `--selftest` offline, `--render <trace>` to
   re-print a report from a past run for free). Four things it does that are easy to
   get wrong:
-  1. **A query's timing is only reported when all three arms return identical results**
-     (same `rows_key` as `query_correctness.py`), and separately **empty result sets are
-     rejected** — three arms agreeing on zero rows passes the consistency gate while
+  1. **A query's timing is only reported when all participating arms return identical
+     results** (same `rows_key` as `query_correctness.py`), and separately **empty result
+     sets are rejected** — arms agreeing on zero rows passes the consistency gate while
      measuring nothing but metadata reads.
   2. **The client poll interval is tightened to 20ms during timing** via
      `ATHENA_POLL_INITIAL` / `REDSHIFT_POLL_INITIAL` (both now env-overridable, defaults
@@ -409,6 +473,30 @@
     05:34 and 05:35, plus 05:36 at `compute=0`). How many minutes a pass lands on is not
     derivable from a sum of durations, so `timing.py` reports the bound and says so.
     Billing-side truth comes from `cost_cold.py --settle`, which reads the usage view.
+- **arm4 (Aurora/pg_duckdb) first measured in-region 2026-10-05**
+  (`timing-20261005T072248Z.jsonl`, 8 queries × 4 arms × 5 reps). The row gate passed
+  first across all four arms (35 tables, 79,943,758 rows equal), and all 8 timed queries
+  returned identical results on all four. arm4 runs the **same DuckDB engine as arm2** with
+  the same `threads=4` / `memory_limit=3.7GiB`, so arm2-vs-arm4 isolates the **entry path**:
+  in-process vs PG wire + one network hop (bench task → EC2 pg_duckdb).
+  - **Latency (wall-clock medians).** aurora sits between duckdb and redshift. By wall
+    clock `duckdb < aurora < redshift < athena`; by engine self-report `redshift < duckdb
+    < aurora < athena` — same split-ranking caveat as the other arms. The entry-path
+    overhead is a near-constant **~100–140ms per query** (scan-agg 71.9→212.5, prune-1day
+    53→180, text-like 80→173, window-rows 93→229), rising to **~270–360ms on the two heavy
+    joins** (join-fanout 241→509, join-3way 217→576) where more result rows cost more
+    PG-wire serialization. aurora's engine self-report **cannot be split** from the one
+    network hop, because PG wire is synchronous — the round trip is inside the self-report.
+  - **Cost — two columns, same as the other arms.** Isolation (a lone query) **$0.00833**,
+    dominated by the ~180s EC2 boot a lone query must pay to start an instance; ranking
+    `athena < duckdb < aurora < redshift`. Amortized over the batch **$0.002773** (t3.xlarge
+    60s floor), which is **cheaper than duckdb's $0.00397** because the t3.xlarge
+    instance-hour ($0.1664) is below Fargate 4vCPU/16GB. arm4's compute is priced as EC2
+    instance-time (`prices.ec2_t3xlarge_per_hour`); S3 GET requests are server-side and
+    not counted (unlike DuckDB's, which the client can observe).
+  - **join-3way is the one query where duckdb's first place isn't clean** — its interval
+    (214–525ms) overlaps aurora's (509–609ms), i.e. on the heaviest join the entry path
+    overhead approaches duckdb's own run-to-run jitter.
 - `backend/.venv/bin/python scripts/lakehouse/load_parquet.py --probe` reloads Iceberg
   tables **from the fresh Parquet** instead of from CSV: it registers a Glue external
   table over `s3://analytics-agent-raw/parquet/<table>/` and `INSERT`s across catalogs.

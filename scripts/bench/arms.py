@@ -51,10 +51,14 @@ ROOT = Path(__file__).resolve().parents[2]
 _LAKE = ROOT / "scripts" / "lakehouse"
 _DUCK = ROOT / "scripts" / "duckdb"
 _RS = ROOT / "scripts" / "redshift"
-for p in (_LAKE, _DUCK, _RS):
+_AURORA = ROOT / "scripts" / "aurora"
+for p in (_LAKE, _DUCK, _RS, _AURORA):
     sys.path.insert(0, str(p))
 
-ARMS = ("athena", "duckdb", "redshift")
+# arm4（aurora）用 **DuckDB 方言**：它经 PG 线协议把只读 SQL 包进 pg_duckdb 的
+# duckdb.query() 交内嵌 DuckDB 执行，SQL 怎么写与 arm2 逐字相同——所以探针走
+# duck_vl().duckdb_probe，残差只落在「入口方式」（进程内 vs PG wire + 一跳网络）。
+ARMS = ("athena", "duckdb", "redshift", "aurora")
 
 # Redshift 关会话结果缓存要靠一个保持住的会话（见 rsql 的 docstring）。20 分钟够跑完
 # 一轮基准，又不会把连接占一整天。它只在 configure_for_timing() 里用，正确性对账不开。
@@ -133,6 +137,9 @@ class Arm:
             elif self.name == "duckdb":
                 import conn
                 self._client = conn.Client()
+            elif self.name == "aurora":
+                import aconn
+                self._client = aconn.Client()
             else:
                 import rsql
                 if not rsql.SECRET_ARN:
@@ -150,7 +157,8 @@ class Arm:
               want: set[str]) -> tuple[str, list[str]]:
         if self.name == "athena":
             return lake_vl().athena_probe(table, cols, want)
-        if self.name == "duckdb":
+        if self.name in ("duckdb", "aurora"):
+            # aurora 的 SQL 由内嵌 DuckDB 执行，方言与 arm2 逐字相同——同一个探针。
             return duck_vl().duckdb_probe(table, cols, want)
         return redshift_probe(table, cols, want)
 
@@ -317,6 +325,20 @@ class Arm:
                     "DUCKDB_THREADS 是空串，算力没钉住。DuckDB 会按机器核数定线程，"
                     "笔记本和 Fargate 上就不是同一把尺，而输出里看不出来。")
             done += [f"{k}={eff[k]}（引擎回读）" for k in conn.TIMING_SETTINGS]
+        elif self.name == "aurora":
+            # arm4 没有自己的「加速开关」要关：它的内嵌 DuckDB 不缓存结果（object_cache
+            # 只缓存列块元数据，与 arm2 热态同口径）。要确认的是**算力口径真的和 arm2 一致**——
+            # 从 pg_duckdb 的内嵌 DuckDB 回读 threads/memory_limit/temp_directory/object_cache，
+            # 写错参数名 pg_duckdb 会静默忽略，所以以回读值为准（与 duckdb 支同理）。
+            import conn
+            eff = self.client.effective_settings()
+            if eff.get("threads") != str(int(conn.THREADS)):
+                raise RuntimeError(
+                    f"arm4 内嵌 DuckDB 的 threads 回读 {eff.get('threads')!r}，"
+                    f"期望 {int(conn.THREADS)}（与 arm2 对齐）。算力不一致则 arm2 vs arm4 "
+                    "比的是两套执行计划而不是「入口方式」，这一条不能降级放过。")
+            done += [f"{k}={eff.get(k)}（内嵌 DuckDB 回读，经 PG wire）"
+                     for k in conn.TIMING_SETTINGS]
         elif self.name == "athena":
             # Athena 的 result reuse 是 workgroup 配置 + 每次调用可覆盖，
             # 不是会话状态。athena.py 从不传 ResultReuseConfiguration，所以是关的。
@@ -345,7 +367,9 @@ if __name__ == "__main__":
         print(f"  {a.name:<9} {len(labels)} 项标签 · SQL {len(sql)} 字符")
     for forbidden, wrong_arm in (("format_datetime", "duckdb"), ("format_datetime", "redshift"),
                                  ("strftime", "athena"), ("strftime", "redshift"),
-                                 ("TO_CHAR", "athena"), ("TO_CHAR", "duckdb")):
+                                 ("TO_CHAR", "athena"), ("TO_CHAR", "duckdb"),
+                                 # arm4 走 DuckDB 方言：该出现 strftime，不该出现另两家的写法。
+                                 ("format_datetime", "aurora"), ("TO_CHAR", "aurora")):
         sql, _ = Arm(wrong_arm).probe("t", cols, want)
         if forbidden in sql:
             bad += 1
@@ -353,4 +377,4 @@ if __name__ == "__main__":
     if bad:
         print(f"\n{bad} 项失败 ❌")
         raise SystemExit(1)
-    print(f"\n三条 arm 探针标签逐位相同（{len(ref)} 项），方言互不串味 ✅")
+    print(f"\n{len(ARMS)} 条 arm 探针标签逐位相同（{len(ref)} 项），方言互不串味 ✅")

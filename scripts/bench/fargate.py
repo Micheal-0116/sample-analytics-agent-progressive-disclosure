@@ -44,6 +44,13 @@ DuckDB 是进程内引擎，它的耗时就是跑它那台机器的耗时。在�
     python3 scripts/bench/fargate.py --all           # setup + build + run
 
 环境变量：`AWS_REGION`、`REDSHIFT_SECRET_ARN`（redshift arm 要）。
+
+arm4（aurora）是**选配**，默认不接：三条 arm 的接线一个字节都不动。只有显式设了
+`AURORA_PGHOST`（provision.py up 打印的实例私网 IP）才把第 4 条 arm 接进任务——注入
+`AURORA_*` 环境变量、经 ECS secret 注入 `AURORA_PGPASSWORD`（口令不落任务定义明文）、
+给执行角色发只读该 secret 的 GetSecretValue、并给 arm4 实例 SG 放通 bench 任务 SG →
+5432。相关环境变量：`AURORA_PGHOST`、`AURORA_SECRET_ARN`（provision.py setup 建的那个
+pg 凭证 secret）、可选 `AURORA_PGPORT`/`AURORA_PGDATABASE`/`AURORA_PGUSER`/`AURORA_SG`。
 """
 from __future__ import annotations
 
@@ -85,6 +92,24 @@ SECRET_ARN = os.environ.get("REDSHIFT_SECRET_ARN", "")
 #: trace 回传的前缀。刻意与 `athena-staging/` 和 `parquet/` 分开：这个前缀下没有
 #: 任何被查的数据，所以给它写权限不动「三条 arm 读的是同一份数据」这个前提。
 TRACE_PREFIX = "bench-traces/"
+
+# ---- arm4（aurora）选配接线。默认全空 → _aurora_enabled() 为假 → 三条 arm 的接线
+# 一个字节不变。只有设了 AURORA_PGHOST 才接。名字与 aconn.py / backend/db.py 的 aurora
+# 段共用同名环境变量（同一套接线不该有两份配置）。
+AURORA_PGHOST = os.environ.get("AURORA_PGHOST", "")
+AURORA_SECRET_ARN = os.environ.get("AURORA_SECRET_ARN", "")
+AURORA_PGPORT = os.environ.get("AURORA_PGPORT", "5432")
+AURORA_PGDATABASE = os.environ.get("AURORA_PGDATABASE", "app_analytics")
+# superuser：pg_duckdb v1.1.1 非超级用户读不了外部 Iceberg（见 aconn.py docstring）。
+AURORA_PGUSER = os.environ.get("AURORA_PGUSER", "postgres")
+# arm4 实例的安全组（provision.py 建的 analytics-agent-aurora-pg）。空则按名字查。
+AURORA_SG = os.environ.get("AURORA_SG", "")
+AURORA_SG_NAME = "analytics-agent-aurora-pg"
+
+
+def _aurora_enabled() -> bool:
+    """接不接第 4 条 arm：以 AURORA_PGHOST 是否给定为准（provision.py up 打印它）。"""
+    return bool(AURORA_PGHOST)
 
 
 def _acct() -> str:
@@ -222,6 +247,50 @@ def _policy(acct: str) -> dict:
     }
 
 
+def _exec_policy() -> dict | None:
+    """执行角色的内联策略。平时是 None（托管的 AmazonECSTaskExecutionRolePolicy 够用：
+    拉镜像、写日志）。接了 arm4 且给了 secret 时，多一条**只读该 secret**的
+    GetSecretValue——ECS 的 `secrets` 注入是**执行角色**做的（不是任务角色），没有这条
+    任务起不来、报的是拉不到 secret。限定到单个 ARN，不开通配。"""
+    if _aurora_enabled() and AURORA_SECRET_ARN:
+        return {"Version": "2012-10-17", "Statement": [{
+            "Sid": "AuroraPgSecretInject",
+            "Effect": "Allow",
+            "Action": ["secretsmanager:GetSecretValue"],
+            "Resource": AURORA_SECRET_ARN,
+        }]}
+    return None
+
+
+def _task_env() -> list[dict]:
+    """任务定义里的环境变量。三条 arm 的那几项恒在；arm4 的 AURORA_* 只在接了时追加。
+    口令**不在这里**（那会把密码写进任务定义明文），走 `_task_secrets()` 的 secret 注入。"""
+    env = [{"name": "AWS_REGION", "value": REGION},
+           # 不设的话 trace 只写在容器里，任务一退就没了（见 correctness.TRACE_S3）。
+           {"name": "BENCH_TRACE_S3",
+            "value": f"s3://{RAW_BUCKET}/{TRACE_PREFIX.rstrip('/')}"}]
+    if SECRET_ARN:
+        # 这是 secret 的 **ARN**，不是密码本身，放环境变量里没问题：真正取值要
+        # secretsmanager:GetSecretValue，那个权限在任务角色上。
+        env.append({"name": "REDSHIFT_SECRET_ARN", "value": SECRET_ARN})
+    if _aurora_enabled():
+        env += [{"name": "AURORA_PGHOST", "value": AURORA_PGHOST},
+                {"name": "AURORA_PGPORT", "value": AURORA_PGPORT},
+                {"name": "AURORA_PGDATABASE", "value": AURORA_PGDATABASE},
+                {"name": "AURORA_PGUSER", "value": AURORA_PGUSER}]
+    return env
+
+
+def _task_secrets() -> list[dict]:
+    """ECS secret 注入。只有 arm4 用：把 pg 凭证 secret 里的 `password` 字段注成
+    `AURORA_PGPASSWORD`。`:password::` 是 ECS 的 JSON-key 定位语法（secret 存的是
+    {"username","password"}）。口令永不进 `_task_env()`，所以任务定义里看不到明文。"""
+    if _aurora_enabled() and AURORA_SECRET_ARN:
+        return [{"name": "AURORA_PGPASSWORD",
+                 "valueFrom": f"{AURORA_SECRET_ARN}:password::"}]
+    return []
+
+
 # ---------------------------------------------------------------- Lake Formation
 
 def _lf_module():
@@ -344,6 +413,63 @@ def _ensure_role(iam, name: str, policy_doc: dict | None,
     return arn
 
 
+# ---------------------------------------------------------------- arm4 网络放行
+
+def _find_sg(ec2, name: str) -> str:
+    r = ec2.describe_security_groups(
+        Filters=[{"Name": "group-name", "Values": [name]}])["SecurityGroups"]
+    if not r:
+        raise RuntimeError(
+            f"找不到安全组 {name!r}——arm4 实例还没起？先 `provision.py up`，"
+            f"或用 AURORA_SG 显式给组 id。")
+    return r[0]["GroupId"]
+
+
+def ensure_aurora_ingress(apply: bool = True) -> int:
+    """给 arm4 实例 SG 放通 bench 任务 SG → 5432。**只在接了 arm4 时调。**
+
+    arm4 实例的 SG（provision.py 建的 `analytics-agent-aurora-pg`）默认只对问答 arms 的
+    任务 SG（sg-0123456789abcdef0）开 5432。bench 任务用的是 ask-relay 服务那套 SG
+    （见 `_network()`），是另一个组，所以要再放通一条——否则 arm4 的连接会卡到
+    `connect_timeout` 后报超时，而超时报错里看不出是「SG 没放行」。
+
+    只加这一条入站：tcp/5432，源是 bench 任务 SG，`UserIdGroupPairs` 按组引用（不开
+    CIDR）。幂等：规则已存在时 `InvalidPermission.Duplicate` 当成「已放行」，不报错。
+    不删任何现有规则，不碰问答 arms 的那条。
+    """
+    from botocore.exceptions import ClientError
+
+    ec2 = boto3.client("ec2", region_name=REGION)
+    aurora_sg = AURORA_SG or _find_sg(ec2, AURORA_SG_NAME)
+    bench_sgs = _network()["awsvpcConfiguration"]["securityGroups"]
+    if not bench_sgs:
+        print("  ❌ 取不到 bench 任务 SG，无法放行 arm4 入站")
+        return 1
+
+    if not apply:
+        print(f"  arm4 入站待放行：{aurora_sg} ← {bench_sgs} :5432（未执行）")
+        return 0
+    for src in bench_sgs:
+        try:
+            ec2.authorize_security_group_ingress(
+                GroupId=aurora_sg,
+                IpPermissions=[{
+                    "IpProtocol": "tcp", "FromPort": 5432, "ToPort": 5432,
+                    "UserIdGroupPairs": [{
+                        "GroupId": src,
+                        # EC2 规则描述的合法字符集是 a-zA-Z0-9 和 . _-:/()#,@[]+=&;{}!$*，
+                        # 不含 > 或箭头，所以直接用 "to"。
+                        "Description": "bench task to arm4 pg_duckdb (5432)"}],
+                }])
+            print(f"  放行 arm4 入站 {aurora_sg} ← {src} :5432")
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "InvalidPermission.Duplicate":
+                print(f"  arm4 入站 {aurora_sg} ← {src} :5432 已存在")
+            else:
+                raise
+    return 0
+
+
 # ---------------------------------------------------------------- setup
 
 def setup() -> int:
@@ -369,7 +495,7 @@ def setup() -> int:
 
     task_arn = _ensure_role(iam, TASK_ROLE, _policy(acct), [])
     exec_arn = _ensure_role(
-        iam, EXEC_ROLE, None,
+        iam, EXEC_ROLE, _exec_policy(),
         ["arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"])
     print("  等 IAM 传播 10s")
     time.sleep(10)
@@ -377,14 +503,27 @@ def setup() -> int:
     if (rc := ensure_lf_grants(task_arn)):
         return rc
 
-    env = [{"name": "AWS_REGION", "value": REGION},
-           # 不设的话 trace 只写在容器里，任务一退就没了（见 correctness.TRACE_S3）。
-           {"name": "BENCH_TRACE_S3",
-            "value": f"s3://{RAW_BUCKET}/{TRACE_PREFIX.rstrip('/')}"}]
-    if SECRET_ARN:
-        # 这是 secret 的 **ARN**，不是密码本身，放环境变量里没问题：真正取值要
-        # secretsmanager:GetSecretValue，那个权限在任务角色上。
-        env.append({"name": "REDSHIFT_SECRET_ARN", "value": SECRET_ARN})
+    if _aurora_enabled():
+        # arm4 接了：放通 bench 任务 SG → 实例 5432。只在接了时动网络，三条 arm 不受影响。
+        if (rc := ensure_aurora_ingress()):
+            return rc
+
+    env = _task_env()
+    secrets = _task_secrets()
+    container = {
+        "name": "bench",
+        "image": image_uri(),
+        "essential": True,
+        "logConfiguration": {
+            "logDriver": "awslogs",
+            "options": {"awslogs-group": LOG_GROUP,
+                        "awslogs-region": REGION,
+                        "awslogs-stream-prefix": "bench"},
+        },
+        "environment": env,
+    }
+    if secrets:                      # 空 secrets 别塞进去，保持三 arm 任务定义原样
+        container["secrets"] = secrets
 
     d = ecs.register_task_definition(
         family=FAMILY, networkMode="awsvpc",
@@ -393,21 +532,11 @@ def setup() -> int:
         ephemeralStorage={"sizeInGiB": EPHEMERAL_GB},
         runtimePlatform={"cpuArchitecture": "X86_64",
                          "operatingSystemFamily": "LINUX"},
-        containerDefinitions=[{
-            "name": "bench",
-            "image": image_uri(),
-            "essential": True,
-            "logConfiguration": {
-                "logDriver": "awslogs",
-                "options": {"awslogs-group": LOG_GROUP,
-                            "awslogs-region": REGION,
-                            "awslogs-stream-prefix": "bench"},
-            },
-            "environment": env,
-        }])
+        containerDefinitions=[container])
     rev = d["taskDefinition"]["revision"]
+    arms = "4 条 arm（含 arm4/aurora）" if _aurora_enabled() else "3 条 arm"
     print(f"  注册任务定义 {FAMILY}:{rev}  "
-          f"（{CPU} CPU 单位 / {MEMORY} MB / 溢写盘 {EPHEMERAL_GB} GB）")
+          f"（{CPU} CPU 单位 / {MEMORY} MB / 溢写盘 {EPHEMERAL_GB} GB · {arms}）")
     print(f"\n就绪。下一步 --build 推镜像，再 --run 跑。")
     return 0
 
@@ -422,6 +551,9 @@ def build(tag: str = "latest") -> int:
     acct = _acct()
     uri = image_uri(tag)
     reg = f"{acct}.dkr.ecr.{REGION}.amazonaws.com"
+    # DuckDB extension 现在在构建期直接 INSTALL（extensions.duckdb.org 可达，2026-10-05
+    # 实测 v1.4.3 的 httpfs 返回 200），所以不再需要「从上一版镜像 COPY ext」那套自举，
+    # 也就没有 EXT_SOURCE build-arg 了（见 Dockerfile 顶部注释）。
     steps = [
         f"aws ecr get-login-password --region {REGION} "
         f"| docker login --username AWS --password-stdin {reg}",
@@ -593,8 +725,10 @@ def selftest() -> int:
 
     # 4. 镜像必须把三条 arm 的客户端都拷进去。少一条的表现是 ModuleNotFoundError，
     #    而那时任务已经起来了、日志里只有一行 traceback。
+    # scripts/aurora/ 也在：镜像始终带全 4 条 arm 的客户端，这样接 arm4 不必重建镜像。
     for need in ("scripts/lakehouse/", "scripts/duckdb/", "scripts/redshift/",
-                 "scripts/bench/", "database/", "data/loaded_row_counts.json"):
+                 "scripts/aurora/", "scripts/bench/", "database/",
+                 "data/loaded_row_counts.json"):
         if f"COPY {need}" not in df and need not in df:
             bad += 1
             print(f"  FAIL Dockerfile 没拷 {need}")
@@ -662,9 +796,71 @@ def selftest() -> int:
         bad += 1
         print(f"  FAIL LF 计划漏了治理层拒绝的表 {missing}，但对账要读它")
 
+    # 9. arm4（aurora）选配接线：默认不接时三条 arm 的任务定义一个字节不变；接了时
+    #    env 多 4 个 AURORA_*、口令只走 secret 注入（不进 env 明文）、执行角色多一条
+    #    只读单个 secret 的 GetSecretValue。改模块级常量而不是 os.environ，直接比函数输出。
+    global AURORA_PGHOST, AURORA_SECRET_ARN
+    _save = (AURORA_PGHOST, AURORA_SECRET_ARN)
+    try:
+        # 9a. 关（默认）：三条 arm 原样。
+        AURORA_PGHOST, AURORA_SECRET_ARN = "", ""
+        if _aurora_enabled():
+            bad += 1
+            print("  FAIL AURORA_PGHOST 空时 _aurora_enabled() 竟为真")
+        if _exec_policy() is not None:
+            bad += 1
+            print("  FAIL 未接 arm4 时执行角色不该有内联策略")
+        if _task_secrets():
+            bad += 1
+            print("  FAIL 未接 arm4 时不该有 secret 注入")
+        off_env = {e["name"] for e in _task_env()}
+        if off_env & {"AURORA_PGHOST", "AURORA_PGUSER", "AURORA_PGPASSWORD"}:
+            bad += 1
+            print(f"  FAIL 未接 arm4 时 env 里出现了 AURORA_*：{off_env}")
+
+        # 9b. 开：AURORA_* 进 env，口令只在 secret 里。
+        AURORA_PGHOST = "10.0.0.9"
+        AURORA_SECRET_ARN = ("arn:aws:secretsmanager:us-west-2:111122223333:"
+                             "secret:analytics-agent-aurora-pg-credentials-abc123")
+        on_env = {e["name"]: e["value"] for e in _task_env()}
+        for k in ("AURORA_PGHOST", "AURORA_PGPORT", "AURORA_PGDATABASE", "AURORA_PGUSER"):
+            if k not in on_env:
+                bad += 1
+                print(f"  FAIL 接了 arm4 但 env 缺 {k}")
+        if "AURORA_PGPASSWORD" in on_env:
+            bad += 1
+            print("  FAIL 口令出现在 env 明文里——必须走 secret 注入")
+        if on_env.get("AURORA_PGUSER") != "postgres":
+            bad += 1
+            print("  FAIL AURORA_PGUSER 不是 superuser postgres（pg_duckdb 外部读要求）")
+        secs = _task_secrets()
+        if (len(secs) != 1 or secs[0]["name"] != "AURORA_PGPASSWORD"
+                or not secs[0]["valueFrom"].endswith(":password::")
+                or AURORA_SECRET_ARN not in secs[0]["valueFrom"]):
+            bad += 1
+            print(f"  FAIL secret 注入接得不对：{secs}")
+        ep = _exec_policy()
+        ep_acts = {a for st in ep["Statement"] for a in st["Action"]} if ep else set()
+        if ep_acts != {"secretsmanager:GetSecretValue"}:
+            bad += 1
+            print(f"  FAIL 执行角色策略动作应只有 GetSecretValue，得到 {ep_acts}")
+        if ep and ep["Statement"][0]["Resource"] != AURORA_SECRET_ARN:
+            bad += 1
+            print("  FAIL 执行角色的 GetSecretValue 没限定到单个 secret ARN")
+        for a in ep_acts:                       # 不许出现任何写/通配
+            if a.endswith(":*") or a == "*" or any(
+                    a.split(":", 1)[1].startswith(w)
+                    for w in ("Put", "Delete", "Update", "Create")):
+                bad += 1
+                print(f"  FAIL 执行角色策略里有写/通配动作 {a}")
+    finally:
+        AURORA_PGHOST, AURORA_SECRET_ARN = _save
+
     if bad:
         print(f"\n{bad} 项失败 ❌")
         return 1
+    print(f"  arm4 选配接线：关则三 arm 原样 · 开则 AURORA_* 入 env、口令只走 secret 注入、"
+          f"执行角色只读单个 secret")
     print(f"  策略 {len(pol['Statement'])} 条语句只读，两处写权限各限定在自己的前缀下"
           f"（{'、'.join(sorted(_WRITE_OK.values()))}，均不含被查数据）"
           f"· 无通配动作 · s3:prefix 只套在 ListBucket 上")

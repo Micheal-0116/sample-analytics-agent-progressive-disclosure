@@ -54,23 +54,37 @@ LOCATIONS = {
     "us-east-1": "US East (N. Virginia)",
 }
 
-#: 要取哪些价。键是本项目内部用的名字，值是 (ServiceCode, usagetype, 期望单位)。
+#: 要取哪些价。键是本项目内部用的名字，值是 (ServiceCode, usagetype, 期望单位,
+#: 额外属性过滤)。前三项必填；第四项是可选的 product-attribute 精确过滤 dict，只在
+#: `usagetype` 本身不足以唯一定位一行时才需要（见 EC2 那条）。
 #: `usagetype` 写全名而不是模糊匹配：模糊匹配会在 AWS 新增一个名字相近的项时
 #: 悄悄换掉我们读的那一行（例如 `Fargate-ARM-vCPU-Hours` 与 `Fargate-vCPU-Hours`）。
 WANT = {
     # Athena 按扫描字节计费。10MB 起步价不在价目里，是计费规则，写在 timing.py。
-    "athena_per_tb_scanned": ("AmazonAthena", "USW2-DataScannedInTB", "Terabytes"),
+    "athena_per_tb_scanned": ("AmazonAthena", "USW2-DataScannedInTB", "Terabytes", None),
     # Redshift Serverless 按 RPU-秒计费，60 秒起步价同样是规则不是价目。
-    "redshift_per_rpu_hour": ("AmazonRedshift", "USW2-Redshift:ServerlessUsage", "RPU-Hr"),
+    "redshift_per_rpu_hour": ("AmazonRedshift", "USW2-Redshift:ServerlessUsage", "RPU-Hr", None),
     # Redshift 多出来的那份物化要占托管存储——这是它比另两条 arm 多付的固定成本。
-    "redshift_storage_per_gb_month": ("AmazonRedshift", "USW2-RMS:Serverless", "GB-Mo"),
+    "redshift_storage_per_gb_month": ("AmazonRedshift", "USW2-RMS:Serverless", "GB-Mo", None),
     # DuckDB 自己不收费，收费的是跑它的那个 Fargate 任务。x86 Linux，
     # 与 `scripts/bench/fargate.py` 推的 `linux/amd64` 镜像对应。
-    "fargate_per_vcpu_hour": ("AmazonECS", "USW2-Fargate-vCPU-Hours:perCPU", "hours"),
-    "fargate_per_gb_hour": ("AmazonECS", "USW2-Fargate-GB-Hours", "hours"),
+    "fargate_per_vcpu_hour": ("AmazonECS", "USW2-Fargate-vCPU-Hours:perCPU", "hours", None),
+    "fargate_per_gb_hour": ("AmazonECS", "USW2-Fargate-GB-Hours", "hours", None),
     # DuckDB 直读 S3，GET 请求要单独付；Athena 的 $5/TB 里已经含了这部分。
-    "s3_per_get_request": ("AmazonS3", "USW2-Requests-Tier2", "Requests"),
-    "s3_storage_per_gb_month": ("AmazonS3", "USW2-TimedStorage-ByteHrs", "GB-Mo"),
+    "s3_per_get_request": ("AmazonS3", "USW2-Requests-Tier2", "Requests", None),
+    "s3_storage_per_gb_month": ("AmazonS3", "USW2-TimedStorage-ByteHrs", "GB-Mo", None),
+    # arm4（Aurora/pg_duckdb）跑在自管 EC2（t3.xlarge，4vCPU/16GB，与 Fargate 任务同规格）
+    # 上。它的算力成本按 **EC2 实例时长** 算（类比 DuckDB 按 Fargate 任务时长）。
+    # BoxUsage usagetype **跨操作系统/租期共享**：同一个 `USW2-BoxUsage:t3.xlarge` 下有
+    # Linux/Windows/RHEL…、Shared/Dedicated、各 licenseModel 好几行，不加过滤会随手取到
+    # Windows 价（量级就错了）。所以这里用 product-attribute 精确锁定按需 Linux/共享租期。
+    "ec2_t3xlarge_per_hour": ("AmazonEC2", "USW2-BoxUsage:t3.xlarge", "Hrs", {
+        "operatingSystem": "Linux",
+        "tenancy": "Shared",
+        "preInstalledSw": "NA",
+        "capacitystatus": "Used",
+        "licenseModel": "No License required",
+    }),
 }
 
 
@@ -104,11 +118,20 @@ def fetch(region: str = REGION) -> dict:
     cli = boto3.client("pricing", region_name="us-east-1")
 
     by_service: dict[str, dict] = {}
-    for svc in sorted({s for s, _, _ in WANT.values()}):
+    for svc in sorted({v[0] for v in WANT.values()}):
+        # 该服务下所有 WANT 条目的额外过滤的并集。一个服务里带过滤的条目必须共享兼容的
+        # 过滤（当前只有 EC2 一条带过滤、也只有一个 EC2 条目，所以并集就是它自己）；
+        # 将来若给同一服务加第二个 usagetype 且过滤不同，要改成按条目分别查询。
+        extra: dict[str, str] = {}
+        for v in WANT.values():
+            if v[0] == svc and len(v) > 3 and v[3]:
+                extra.update(v[3])
+        filters = [{"Type": "TERM_MATCH", "Field": "location", "Value": loc}]
+        filters += [{"Type": "TERM_MATCH", "Field": f, "Value": val}
+                    for f, val in extra.items()]
         rows: dict[str, dict] = {}
         for page in cli.get_paginator("get_products").paginate(
-            ServiceCode=svc,
-            Filters=[{"Type": "TERM_MATCH", "Field": "location", "Value": loc}],
+            ServiceCode=svc, Filters=filters,
         ):                                          # 见 docstring 第 2 条：必须分页
             for blob in page["PriceList"]:
                 d = json.loads(blob)
@@ -119,7 +142,7 @@ def fetch(region: str = REGION) -> dict:
 
     out: dict[str, dict] = {}
     missing = []
-    for key, (svc, ut, unit) in WANT.items():
+    for key, (svc, ut, unit, *_rest) in WANT.items():
         d = by_service[svc].get(ut)
         if d is None:
             missing.append(f"{key}: {svc} / {ut}")
@@ -229,6 +252,41 @@ FARGATE_MIN_SECONDS = 60
 DUCKDB_BOOT_SECONDS = float(os.environ.get("BENCH_DUCKDB_BOOT_SECONDS", "26.0"))
 
 
+#: EC2 的最小计费时长：60 秒。Linux 按需实例是**按秒计费**（2017 起），但有一个
+#: 每实例 60 秒的下限。单位是「实例」，不是「查询」——与 Fargate 的任务级起步价同理：
+#: arm4 的多条查询共用同一台常驻 EC2 时只碰一次下限；每条查询单独起停一台实例才是
+#: 每条一次。所以 `ec2_cost` 默认不套，由调用点按自己那一栏的前提显式传 `floor=True`。
+EC2_MIN_SECONDS = 60
+
+#: 起一台 EC2 到 pg_duckdb 能应答第一条查询的时长：实例启动 + user-data（装 docker、
+#: 拉 pg_duckdb 镜像、预热 extension）。**这是个约等值、不是账单结算值**：provision.py 的
+#: user-data 自己提示「约 2-3 分钟后才可连」，取 180s 作中值。类比 DUCKDB_BOOT_SECONDS
+#: 之于 Fargate，它只进「单条隔离」那一栏（每条查询单独来一次就得先起一台实例）。
+#: 换 AMI / 实例规格 / 镜像大小都会变，所以 env 可覆盖，报告里按量级读。
+EC2_BOOT_SECONDS = float(os.environ.get("BENCH_EC2_BOOT_SECONDS", "180.0"))
+
+
+def ec2_cost(seconds: float, prices: dict, floor: bool = False) -> tuple[float, str]:
+    """arm4（Aurora/pg_duckdb）的算力成本 → (美元, 口径说明)。
+
+    按**自管 EC2 实例的时长**算，类比 `fargate_cost` 之于 DuckDB：pg_duckdb 自己不另
+    收费，收费的是承载它的那台 t3.xlarge。价目取整实例小时价（`ec2_t3xlarge_per_hour`，
+    已含该规格的 vCPU+内存，不像 Fargate 按 vCPU/GB 两项拆开）。
+
+    `floor=True` 才套 60 秒下限，因为那条线是**每台实例**一次。传进来是一整台实例的
+    生命周期时才该套；是某条查询分到的那一段时不套，否则一台实例跑 8 条查询会被收 8 分钟。
+    （与 `fargate_cost` 的 floor 语义逐字一致，刻意对齐，让 arm2/arm4 两栏可比。）
+    """
+    billed = max(float(seconds), float(EC2_MIN_SECONDS)) if floor else float(seconds)
+    rate = usd(prices, "ec2_t3xlarge_per_hour")
+    c = billed / 3600 * rate
+    note = f"实例存活 {seconds:.1f}s × t3.xlarge"
+    if billed > seconds:
+        note += (f" → 计费 {billed:.0f}s（不足 {EC2_MIN_SECONDS}s 下限；"
+                 f"按秒计费但每实例至少一分钟）")
+    return c, note
+
+
 def athena_cost(bytes_scanned: int, prices: dict) -> tuple[float, str]:
     """→ (美元, 口径说明)。不足 10MB 按 10MB 算。"""
     billed = max(int(bytes_scanned), ATHENA_MIN_BYTES)
@@ -298,6 +356,7 @@ def selftest() -> int:
         "fargate_per_vcpu_hour": {"usd": 0.04048},
         "fargate_per_gb_hour": {"usd": 0.004445},
         "s3_per_get_request": {"usd": 4e-7},
+        "ec2_t3xlarge_per_hour": {"usd": 0.1664},
     }}
 
     # 1. Athena：整 TB 是干净的乘法
@@ -348,6 +407,16 @@ def selftest() -> int:
     # 6. S3 GET
     want("10000 次 GET", s3_get_cost(10000, P)[0], 10000 * 4e-7)
 
+    # 6b. EC2（arm4）：一整小时就是整实例小时价
+    want("EC2 1h t3.xlarge", ec2_cost(3600, P)[0], 0.1664)
+    # 6b-1. 默认不套下限，线性到底（对应「一条查询分到实例时长里的一段」）
+    want("EC2 1s 是 2s 的一半", ec2_cost(1, P)[0], ec2_cost(2, P)[0] / 2)
+    # 6b-2. floor=True 才套 60s（对应「一整台实例」这个单位），与 fargate 语义对齐
+    want("EC2 60s 下限", ec2_cost(1, P, floor=True)[0],
+         ec2_cost(EC2_MIN_SECONDS, P)[0])
+    want("EC2 跑满后按实际时长", ec2_cost(120, P, floor=True)[0], ec2_cost(120, P)[0])
+    want("EC2 下限不改默认档", ec2_cost(1, P)[0], ec2_cost(3600, P)[0] / 3600)
+
     # 7. 缺价要抛，不能当 0
     try:
         usd({"items": {}}, "athena_per_tb_scanned")
@@ -377,7 +446,7 @@ def selftest() -> int:
         pass
 
     # 9. 单位断言在 WANT 里都填了（空字符串等于没断言）
-    for k, (_, ut, unit) in WANT.items():
+    for k, (_, ut, unit, *_rest) in WANT.items():
         if not unit or not ut:
             bad += 1
             print(f"  FAIL {k} 的 usagetype 或期望单位是空的")
@@ -387,6 +456,7 @@ def selftest() -> int:
         return 1
     print(f"  Athena 3 项（含 10MB 起步）、Redshift 5 项（含 60s 起步与 RPU 线性）、"
           f"Fargate 5 项（含 60s 起步价按任务收、默认档不套）、"
+          f"EC2 5 项（arm4，含 60s 下限按实例收、默认档不套、与 Fargate 语义对齐）、"
           f"S3 1 项、缺价即抛 1 项、分档 2 项、"
           f"单位断言 {len(WANT)} 项")
     print("换算逻辑自测通过 ✅")
@@ -420,6 +490,8 @@ def main() -> int:
           f"容量钉住 {REDSHIFT_RPU} RPU")
     print(f"  Fargate  按任务存活时长，{FARGATE_VCPU:g}vCPU / {FARGATE_GB:g}GB，"
           f"每个任务最少按 {FARGATE_MIN_SECONDS}s 计费（单位是任务，不是查询）")
+    print(f"  EC2      arm4 按 t3.xlarge 实例存活时长，每实例最少按 {EC2_MIN_SECONDS}s 计费"
+          f"（单位是实例，不是查询）；开机约 {EC2_BOOT_SECONDS:.0f}s（约等值，非账单）")
     return 0
 
 

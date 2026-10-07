@@ -37,16 +37,18 @@ LOCAL_PORT=8000
 # 复用 ask-relay 的网络配置。assignPublicIp 必须 ENABLED:这些子网没挂 NAT,
 # 容器靠公网 IP 出网（要访问 Athena / Redshift Data API / Bedrock / S3）。
 SUBNETS='["subnet-0bac5e670766638dd","subnet-06a03383d4a1698bd"]'
-SGS='["sg-0a9ab97aa4da85e87"]'
+SGS='["sg-0123456789abcdef0"]'
 
 # arm 到远端端口。`DB_BACKEND` 是 db.py 在 import 时读一次的模块级常量,所以三条
-# arm 必须是三个独立进程 —— 镜像的 CMD 就是三个 uvicorn,分别监听这三个端口。
+# arm 必须是各自独立进程 —— 镜像的 CMD 就是四个 uvicorn,分别监听这四个端口
+# (athena 8000 / duckdb 8001 / redshift 8002 / aurora 8003)。
 arm_port() {
   case "$1" in
     athena)   echo 8000 ;;
     duckdb)   echo 8001 ;;
     redshift) echo 8002 ;;
-    *) echo "未知 arm: $1（可选 athena / duckdb / redshift）" >&2; return 1 ;;
+    aurora)   echo 8003 ;;
+    *) echo "未知 arm: $1（可选 athena / duckdb / redshift / aurora）" >&2; return 1 ;;
   esac
 }
 
@@ -144,14 +146,14 @@ cmd_health() {
   # 用 exec 从容器内部打 /health。这是从外面确认"哪个端口是哪条 arm"的唯一可靠办法:
   # 启动横幅对三条 arm 一律打印 backend=athena,不能用来辨认。
   aws ecs execute-command --cluster "$CLUSTER" --task "$task" --container "$CONTAINER" --interactive \
-    --command 'sh -c "for p in 8000 8001 8002; do printf \"%s -> \" $p; curl -s --max-time 25 http://127.0.0.1:$p/health || echo 起不来; echo; done"' \
-    2>/dev/null | grep -E '^(8000|8001|8002) ->' || {
+    --command 'sh -c "for p in 8000 8001 8002 8003; do printf \"%s -> \" $p; curl -s --max-time 25 http://127.0.0.1:$p/health || echo 起不来; echo; done"' \
+    2>/dev/null | grep -E '^(8000|8001|8002|8003) ->' || {
       echo "exec 没拿到输出。任务可能刚起、agent 还没就绪,过十几秒再试。" >&2; return 1; }
 }
 
 cmd_tunnel() {
   local arm="${1:-}"
-  [ -n "$arm" ] || { echo "用法:bash scripts/cloud_arms.sh tunnel <athena|duckdb|redshift>" >&2; return 1; }
+  [ -n "$arm" ] || { echo "用法:bash scripts/cloud_arms.sh tunnel <athena|duckdb|redshift|aurora>" >&2; return 1; }
   local port; port="$(arm_port "$arm")"
   local task; task="$(require_task)"
 
@@ -209,9 +211,9 @@ case "${1:-}" in
     cat <<'EOF'
 用法:bash scripts/cloud_arms.sh <命令>
 
-  up                              起云上任务(三条 arm 一次全起,约 1 分钟)
-  health                          三条 arm 各报自己的引擎,确认端口对应关系
-  tunnel <athena|duckdb|redshift> 开隧道,占住当前终端
+  up                              起云上任务(四条 arm 一次全起,约 1 分钟)
+  health                          四条 arm 各报自己的引擎,确认端口对应关系
+  tunnel <athena|duckdb|redshift|aurora> 开隧道,占住当前终端
   status                          在跑没有、跑了多久、多少钱
   down                            停任务
 

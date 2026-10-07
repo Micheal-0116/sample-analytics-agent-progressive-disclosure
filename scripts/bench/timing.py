@@ -259,6 +259,16 @@ def cost_of(arm: str, wall_s: float, engine_s: float,
         return PR.athena_cost(bytes_scanned, prices)
     if arm == "redshift":
         return PR.redshift_cost(engine_s or wall_s, prices)
+    if arm == "aurora":
+        # arm4 跑在自管 EC2 上，成本按**实例时长**算（类比 DuckDB 按 Fargate 任务时长）。
+        # 这一栏前提同样是「这条查询单独来一次」——单独来一次就得先起一台实例，所以含
+        # EC2_BOOT_SECONDS 开机 + 这条自己的执行时长，不足 60s 按 EC2 的一分钟下限收。
+        # S3 GET 请求由 EC2 上的内嵌 DuckDB **服务端**发出，bench 客户端观测不到（不像
+        # duckdb 那条进程内、能开 HTTP 日志数到），所以这一栏不含请求费，并在说明里讲明。
+        boot = PR.EC2_BOOT_SECONDS
+        c, note = PR.ec2_cost(boot + wall_s, prices, floor=True)
+        return c, (f"单独起一台 EC2：开机 {boot:.1f}s + 执行 {wall_s:.1f}s；" + note
+                   + "（S3 GET 服务端发出、客户端不可观测，未计入）")
     boot = PR.DUCKDB_BOOT_SECONDS
     c, note = PR.fargate_cost(boot + wall_s, prices, floor=True)
     note = f"单独起一个任务：开机 {boot:.1f}s + 执行 {wall_s:.1f}s；" + note
@@ -285,6 +295,12 @@ def poll_readback(arm: str) -> list[str]:
     报错，只会让间隔保持默认——而那正是「墙上时钟里掺了我们自己的 sleep」这个
     问题的原样复现，且从输出上看不出来。
     """
+    if arm == "aurora":
+        # arm4 经 PG 线协议同步执行，没有「提交→轮询→取结果」那种 sleep，所以没有
+        # 可收紧的轮询间隔；但它**不是进程内**——有一跳网络（bench 任务 → EC2 上的
+        # pg_duckdb），这一跳的往返已烘进引擎自报里、拆不开，别套 duckdb 那句「进程内」。
+        return ["轮询：PG 线协议同步执行，不轮询；但**非进程内**，有一跳网络"
+                "（bench 任务 → EC2 pg_duckdb），往返已含在自报里"]
     mod = {"athena": "athena", "redshift": "rsql"}.get(arm)
     if mod is None:
         return ["轮询：进程内执行，不轮询（这一条 arm 没有这项开销）"]
@@ -647,6 +663,18 @@ def amortized(ok: list[dict], prices: dict,
                         f"{PR.REDSHIFT_BILLED_OVER_MODEL:.1f}× "
                         f"（≈${amort[n] * PR.REDSHIFT_BILLED_OVER_MODEL:.6f}），"
                         f"账单侧真值走 cost_cold.py --settle")
+        elif n == "aurora":
+            # arm4 的整批成本按**一台常驻 EC2 实例的时长**算：一遍跑完这些查询，实例
+            # 自始至终在跑，所以 EC2 的 60s 下限整遍只落一次（与 Fargate 同理——单位是
+            # 实例不是查询）。请求费不计入：S3 GET 由实例上的内嵌 DuckDB 服务端发出，
+            # 客户端观测不到（不像 duckdb 那条进程内、能开 HTTP 日志数到）。
+            base = PR.ec2_cost(own_s[n], prices, floor=True)[0]
+            floored_ec2 = own_s[n] < PR.EC2_MIN_SECONDS
+            amort[n] = base
+            why[n] = (f"实例存活 {own_s[n]:.1f}s"
+                      + (f"，按 {PR.EC2_MIN_SECONDS}s 下限计费（实例跑不到更短的，"
+                         f"这一栏的时长成本就是那一次下限）" if floored_ec2 else "")
+                      + "（S3 GET 服务端发出、客户端不可观测，未计入）")
         else:
             # `floor=True`：一遍就是一个任务，而 Fargate 每个任务至少收 1 分钟。
             # 不套的话这一栏会报出「租 0.9 秒任务」的价，而那种任务租不到——同一类
@@ -827,8 +855,15 @@ def decomposition(ok: list[dict], armnames: list[str]) -> None:
         if max(eng) == 0:                       # 这条 arm 没自报引擎时间
             print(f"  {n:<10} 引擎自报缺失，拆不开")
             continue
-        path = ("进程内，无访问路径开销" if max(ov) < 5
-                else f"访问路径 {min(ov):.0f}–{max(ov):.0f}ms")
+        if n == "aurora":
+            # aurora 的自报就是 PG 线协议那次阻塞调用的墙钟，网络一跳已经烘进去了，
+            # 拆不出单独的访问路径段——但它**不是**进程内，别套下面那句 gap<5ms 的判定
+            # （否则会误报成 duckdb 那种 0 开销）。
+            path = "PG 线协议同步调用，网络一跳已含在自报里，拆不开"
+        elif max(ov) < 5:
+            path = "进程内，无访问路径开销"
+        else:
+            path = f"访问路径 {min(ov):.0f}–{max(ov):.0f}ms"
         print(f"  {n:<10} 引擎 {min(eng):.0f}–{max(eng):.0f}ms   {path}")
     # 名次会不会因为换一段而翻，是由数据算出来的，不是写死的结论。
     by_eng, by_wall = {}, {}
@@ -962,6 +997,7 @@ def selftest() -> int:
         "redshift_per_rpu_hour": {"usd": 0.36},
         "fargate_per_vcpu_hour": {"usd": 0.04048},
         "fargate_per_gb_hour": {"usd": 0.004445},
+        "ec2_t3xlarge_per_hour": {"usd": 0.1664},
     }}
     c_a, _ = cost_of("athena", 10.0, 9.0, 1024**4, P)
     want("athena 按字节", round(c_a, 6), 5.0)
@@ -1007,6 +1043,24 @@ def selftest() -> int:
         print("  FAIL 算了请求费却没在说明里给出请求次数——金额的出处就丢了")
     # 2e. 拿不到扫描字节时返回 None 而不是 0（0 会算出「免费」）
     want("athena 无字节数", cost_of("athena", 1.0, 1.0, None, P)[0], None)
+    # 2f. aurora（arm4）：按 **EC2 实例时长**，含单独起一台实例的开机，floored 到 EC2 下限。
+    #     与 duckdb 同构（隔离栏前提都是「单独来一次」），只是承载体是 EC2 不是 Fargate 任务。
+    c_au, note_au = cost_of("aurora", 3600.0, 0.0, None, P)
+    want("aurora 含开机的 1 小时", round(c_au, 6),
+         round((PR.EC2_BOOT_SECONDS + 3600.0) / 3600 * 0.1664, 6))
+    if "开机" not in note_au:
+        bad += 1
+        print("  FAIL aurora 成本说明里没有「开机」——金额构成看不出来")
+    # 2f-1. 一条 0 秒查询也不免费，至少是一分钟实例的价（EC2 60s 下限）
+    c_au0, _ = cost_of("aurora", 0.0, 0.0, None, P)
+    if c_au0 < PR.ec2_cost(PR.EC2_MIN_SECONDS, P)[0] - 1e-12:
+        bad += 1
+        print("  FAIL aurora 单条成本低于一分钟实例的价——开机或 60s 下限漏了")
+    # 2f-2. S3 请求费**不**计入 aurora（服务端发出、客户端观测不到），说明里要讲明，
+    #       否则这个漏算会悄悄偏向 aurora（与 duckdb 把请求费算进去正相反）。
+    if "未计入" not in note_au:
+        bad += 1
+        print("  FAIL aurora 没在说明里讲明请求费未计入——漏算方向会偏向 aurora")
 
     # 3. 查询集本身
     keys = [q["key"] for q in QUERIES]
@@ -1150,15 +1204,45 @@ def selftest() -> int:
         bad += 1
         print("  FAIL fargate 跑满 60s 之后金额没随时长涨——起步价被当成了定价")
 
+    # 5j. aurora 整批摊薄：按**一台常驻 EC2 的时长**，EC2 60s 下限整遍只落一次
+    #     （单位是实例，与 Fargate 同构）。另一条 arm 变慢不能改它的金额；跑满后按实际走。
+    def rows_au(au_ms):
+        return [{"key": f"q{i}", "arms": {
+            "aurora": {"median_ms": au_ms},
+            "duckdb": {"median_ms": 100.0},
+        }} for i in range(8)]
+
+    names_au = ["aurora", "duckdb"]
+    aa1, owna1, whya = amortized(rows_au(500.0), P3, names_au)
+    want("aurora 自身耗时各算各的", round(owna1["aurora"], 3), 4.0)
+    # 0.5s×8 = 4s，一遍没跑满 60s，整栏就是那一次 EC2 下限的价
+    want("aurora 60s 下限整遍一次", round(aa1["aurora"], 9),
+         round(PR.ec2_cost(PR.EC2_MIN_SECONDS, P3)[0], 9))
+    # 跑满 60s 之后（10s×8=80s）按实际时长涨
+    aa2, _, _ = amortized(rows_au(10_000.0), P3, names_au)
+    if aa2["aurora"] <= aa1["aurora"]:
+        bad += 1
+        print("  FAIL aurora 自身跑满 60s 后摊薄成本没涨——下限被当成了定价")
+    # duckdb 变慢不能改 aurora 的金额（两条 arm 各算各的）
+    aa3, _, _ = amortized([{"key": f"q{i}", "arms": {
+        "aurora": {"median_ms": 500.0},
+        "duckdb": {"median_ms": 99_999.0}}} for i in range(8)], P3, names_au)
+    want("duckdb 变慢不影响 aurora", aa3["aurora"], aa1["aurora"])
+    if "未计入" not in whya["aurora"]:
+        bad += 1
+        print("  FAIL aurora 摊薄说明没讲明请求费未计入（服务端发出、客户端看不到）")
+
     if bad:
         print(f"\n{bad} 项失败 ❌")
         return 1
-    print(f"  统计 5 项、成本分派 12 项（含隔离栏必须含开机、八条八个任务）、查询集 {len(QUERIES)} 条"
+    print(f"  统计 5 项、成本分派 16 项（含 duckdb/aurora 隔离栏必须含开机、"
+          f"八条八个任务/实例、aurora 按 EC2 实例时长且请求费未计入）、查询集 {len(QUERIES)} 条"
           f"（shape/方言/窗口帧/tiebreak 四类检查）、字节格式化 4 项、"
           f"轮询回读 3 项、结果集比法 2 项")
-    print("  整批摊薄 13 项：自身耗时各算各的 / 一条 arm 变慢不影响另两条（双向）/ "
+    print("  整批摊薄 16 项：自身耗时各算各的 / 一条 arm 变慢不影响另两条（双向）/ "
           "Athena 起步价按条收 / Redshift 按一段算且标明是下界 / 时长口径写进说明 / "
-          "Fargate 60s 起步价按任务收（默认不套、由调用点按任务数决定套几次、跑满后按实际时长）")
+          "Fargate 60s 起步价按任务收（默认不套、由调用点按任务数决定套几次、跑满后按实际时长）/ "
+          "aurora 按 EC2 实例时长（60s 下限整遍一次、跑满后按实际时长、请求费未计入）")
     print("耗时与成本逻辑自测通过 ✅")
     return 0
 

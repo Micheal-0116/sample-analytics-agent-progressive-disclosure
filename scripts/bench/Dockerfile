@@ -7,22 +7,15 @@
 #
 # 所以这个镜像不只装 DuckDB：它把三条 arm 的客户端都带上，三条一起在云上跑。
 #
-# DuckDB extension 的来源。**这一层是为了绕开一个网络封锁，不是为了省时间。**
-# 构建机所在的网络到 extensions.duckdb.org 不通（http 和 https 都是 Connection
-# timed out），所以 `INSTALL httpfs` 在构建时会失败。extension 是平台相关的
-# （linux_amd64），本机 macOS 上那份拿不过来用，于是从**上一个构建成功的镜像**里
-# 取——它是 ECR 里的，而 ECR 通。
+# DuckDB extension 在**构建期直接 INSTALL**（见文件下方第 86 行起那段 RUN）。
 #
-# 代价说清楚：这样一来镜像有了自举关系，第一个镜像必须在能连 extensions.duckdb.org
-# 的网络里构建。网络恢复之后要回到自己装，把下面那段 COPY --from=ext 换回
-#   RUN python -c "import duckdb; c=duckdb.connect(); ... INSTALL/LOAD ..."
-# 就行，版本校验那一步不用动——它对两种来源都成立。
-# 默认取本机上一次构建出来的同名 tag。推到 ECR 之后按自己的账号覆盖：
-#   docker build --build-arg \
-#     EXT_SOURCE=<account-id>.dkr.ecr.<region>.amazonaws.com/analytics-agent-bench:latest ...
-ARG EXT_SOURCE=analytics-agent-bench:latest
-# nosemgrep: dockerfile-source-not-pinned —— 上一版镜像，按 tag 取
-FROM ${EXT_SOURCE} AS ext
+# 历史：早先构建机到 extensions.duckdb.org 不通（Connection timed out），只能从
+# **上一个构建成功的镜像**（ECR 里，ECR 通）COPY 现成的 extension 进来，于是镜像有了
+# 自举关系。2026-10-05 实测该网络已恢复（`https://extensions.duckdb.org/v1.4.3/
+# linux_amd64/httpfs.duckdb_extension.gz` 返回 200），按原注释说的「网络恢复之后回到
+# 自己装」把 COPY --from=ext 换回了 INSTALL/LOAD。自举关系与 EXT_SOURCE build-arg
+# 一并取消——不再依赖上一版镜像，也就不会继承它里面旧版本号的 extension。
+# 若将来该网络又不通，可退回「从 ECR 上一版镜像 COPY」的老办法（git 历史里有）。
 
 # nosemgrep: dockerfile-source-not-pinned —— 与 backend/Dockerfile 同口径，按 tag 固定
 # 走 ECR Public 而不是 Docker Hub：这台机器所在的网络到 registry-1.docker.io 是断的
@@ -35,13 +28,22 @@ WORKDIR /app
 # 只装 harness 要的东西。这里**故意不装** claude-agent-sdk / node / claude CLI：
 # 这个镜像跑的是 SQL 对账和计时，不跑 agent。少一层 Node 就少一处版本漂移，
 # 而且镜像小拉起来快——Fargate 冷启动时间会算进第一条查询的墙钟里。
-RUN pip install --no-cache-dir duckdb>=1.1 boto3>=1.34 pyarrow>=17
+# duckdb 钉死 1.4.3，与 backend/Dockerfile.arms（arm2）和 arm4 的 pg_duckdb 内嵌引擎同版本。
+# 两处 pip 版本必须一致（改一处要改两处）——否则两条 DuckDB arm 的引擎又成了变量。
+# extension 由下方那段 RUN 在构建期按这个 duckdb 自己 INSTALL，所以版本天然对齐；
+# 改版本号只改这里即可，不再有「上一版镜像里 extension 是旧版」那种自举滞后问题。
+# psycopg[binary] 是 arm4（aurora）的 PG 线协议客户端（scripts/aurora/aconn.py）；带 binary
+# 轮子自带 libpq，slim 镜像不必再装系统 libpq。arm1/2/3 用不到它，多这一个依赖不影响它们。
+RUN pip install --no-cache-dir duckdb==1.4.3 boto3>=1.34 pyarrow>=17 "psycopg[binary]>=3.2"
 
 # 三条 arm 的客户端 + 共用 harness。lakehouse 里的 verify_load 是指标定义的唯一出处，
 # gen_ddl 是列定义的唯一出处，两个都必须在。
 COPY scripts/lakehouse/ /app/scripts/lakehouse/
 COPY scripts/duckdb/   /app/scripts/duckdb/
 COPY scripts/redshift/ /app/scripts/redshift/
+# arm4（aurora）的 PG 线协议客户端。aconn.py 复用 scripts/duckdb/conn.py 做 catalog/算力
+# 口径的唯一来源，所以上面那层 duckdb/ 必须也在（已在）。
+COPY scripts/aurora/   /app/scripts/aurora/
 COPY scripts/bench/    /app/scripts/bench/
 # gen_ddl.parse_source() 读 database/0[1-8]_*.sql，那是列名列序的真源。
 COPY database/ /app/database/
@@ -77,16 +79,18 @@ ENV HOME=/home/bench
 # 每次冷启动多几秒且这几秒会混进第一条查询的耗时，以及任务从此依赖出网到
 # extensions.duckdb.org——那条链路断了，报的是 extension 装不上，看起来像凭证问题。
 #
-# 两个目录都要：conn.py 把 home_directory 指到 DUCKDB_TEMP_DIR，httpfs/aws/iceberg
-# 在那儿；iceberg 运行时还会自己拉 avro，那份在默认的 $HOME/.duckdb 下。少拷一个
-# 就变成运行时出网，也就是上面说的那种误导性报错。
-COPY --from=ext --chown=bench:bench /tmp/duckdb-spill/.duckdb /tmp/duckdb-spill/.duckdb
-COPY --from=ext --chown=bench:bench /home/bench/.duckdb /home/bench/.duckdb
-
-# 只 LOAD 不 INSTALL：这一步是**版本校验**。pip 装的 duckdb 和拷进来的 extension
-# 必须是同一个版本号，否则 LOAD 会在这里就报错，而不是等到跑基准时才现形。
-RUN python -c "import duckdb; c=duckdb.connect(); \
-c.execute(\"SET home_directory='/tmp/duckdb-spill'\"); \
+# 两个 home_directory 都要装：conn.py 把 home_directory 指到 DUCKDB_TEMP_DIR
+# （=/tmp/duckdb-spill），httpfs/aws/iceberg/avro 装在那儿；但 iceberg 运行时若在
+# home_directory 尚未改过的瞬间拉 avro，用的是默认 $HOME/.duckdb，所以那边也装一份。
+# 少装一个目录就变成运行时出网，也就是上面说的那种误导性报错。
+# avro 显式装：iceberg 依赖它、运行时才按需拉，预装进来免得冷启动出网。
+#
+# INSTALL 之后紧跟 LOAD 还兼做**版本校验**：pip 装的 duckdb 与 INSTALL 下来的 extension
+# 必然同版本（都由这个 duckdb 自己拉），LOAD 不该失败——失败即说明环境不对，当场暴露。
+RUN python -c "import duckdb; exts=('httpfs','aws','iceberg','avro'); \
+c=duckdb.connect(); c.execute(\"SET home_directory='/tmp/duckdb-spill'\"); \
+[c.execute(f'INSTALL {e};') for e in exts]; \
+d=duckdb.connect(); [d.execute(f'INSTALL {e};') for e in exts]; \
 [c.execute(f'LOAD {e};') for e in ('httpfs','aws','iceberg')]; \
 print('预装 extension：', duckdb.__version__, [r[0] for r in c.execute('SELECT extension_name FROM duckdb_extensions() WHERE loaded').fetchall()])"
 
